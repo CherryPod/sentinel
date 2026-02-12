@@ -109,17 +109,22 @@ Every data item tagged with:
 │   ├── Dockerfile
 │   ├── requirements.txt
 │   └── app/
-│       ├── main.py                  # FastAPI entry, /health, /validate/*, /scan, /process
+│       ├── main.py                  # FastAPI entry, all endpoints (see API Endpoints below)
 │       ├── config.py                # Environment config (pydantic-settings)
 │       ├── policy_engine.py         # YAML policy loader + path/command validators
 │       ├── scanner.py               # Credential + sensitive path regex scanners
 │       ├── provenance.py            # TaggedData + trust inheritance + chain walking
 │       ├── audit.py                 # Structured JSON logging (daily rotation)
-│       ├── models.py                # Pydantic models (TrustLevel, ScanResult, TaggedData, etc.)
+│       ├── models.py                # Pydantic models (TrustLevel, ScanResult, TaggedData, Plan, etc.)
 │       ├── spotlighting.py          # Datamarking preprocessor (Phase 2)
 │       ├── worker.py                # Ollama/Qwen async client (Phase 2)
 │       ├── prompt_guard.py          # Prompt Guard 2 ML scanner (Phase 2)
-│       └── pipeline.py              # Security scan pipeline orchestrator (Phase 2)
+│       ├── pipeline.py              # Security scan pipeline orchestrator (Phase 2)
+│       ├── planner.py               # Claude API client + JSON plan generation (Phase 3)
+│       ├── orchestrator.py          # CaMeL execution loop: plan → execute → scan (Phase 3)
+│       ├── tools.py                 # Tool executor with policy checks (Phase 3)
+│       ├── codeshield.py            # LlamaFirewall CodeShield wrapper (Phase 3)
+│       └── approval.py              # HTTP approval manager with TTL queue (Phase 3)
 ├── controller/tests/
 │   ├── conftest.py                  # Shared fixtures (engine, scanners)
 │   ├── test_policy_engine.py        # Policy rule unit tests
@@ -129,7 +134,12 @@ Every data item tagged with:
 │   ├── test_worker.py               # Ollama client tests, mocked (Phase 2)
 │   ├── test_prompt_guard.py         # Prompt Guard scan tests, mocked (Phase 2)
 │   ├── test_pipeline.py             # Full pipeline integration tests (Phase 2)
-│   └── test_hostile.py              # Mock hostile Qwen attack simulations (Phase 2)
+│   ├── test_hostile.py              # Mock hostile Qwen attack simulations (Phase 2)
+│   ├── test_planner.py              # Claude planner tests, mocked API (Phase 3)
+│   ├── test_orchestrator.py         # Orchestrator CaMeL loop tests (Phase 3)
+│   ├── test_tools.py                # Tool executor + policy check tests (Phase 3)
+│   ├── test_codeshield.py           # CodeShield scanner tests (Phase 3)
+│   └── test_approval.py             # Approval flow + integration tests (Phase 3)
 ├── docs/
 │   ├── PROJECT_DOCS.md              # This file
 │   ├── project-sentinel-build-plan.md
@@ -142,17 +152,17 @@ Every data item tagged with:
 ## Key Dependencies
 
 ```
-# Installed (Phase 1 + 2)
+# Installed (Phase 1-3)
 fastapi>=0.115.0          uvicorn>=0.34.0
 httpx>=0.28.0             pyyaml>=6.0
 pydantic>=2.10.0          pydantic-settings>=2.7.0
 python-json-logger>=3.0.0
 transformers>=4.47.0      torch>=2.5.0 (CPU-only index)
+anthropic>=0.42.0         llamafirewall>=0.1.0
 pytest>=8.3.0             pytest-asyncio>=0.25.0
 
 # Not yet installed (future phases)
-anthropic>=0.42.0         paho-mqtt>=2.1.0
-llamafirewall>=0.1.0
+paho-mqtt>=2.1.0
 ```
 
 ---
@@ -167,7 +177,7 @@ llamafirewall>=0.1.0
 | **4** | Interfaces | Signal + WebUI integration, conversational approval |
 | **5** | Hardening | Llama Guard 4, red teaming, tuning, performance benchmarks |
 
-**Current status:** Phase 2 COMPLETE — 193 tests passing, both containers deployed and verified
+**Current status:** Phase 3 COMPLETE — 259 tests passing, full CaMeL pipeline deployed and verified end-to-end
 
 ---
 
@@ -193,6 +203,33 @@ llamafirewall>=0.1.0
 
 ---
 
+## API Endpoints
+
+| Method | Path | Phase | Purpose |
+|--------|------|-------|---------|
+| `GET` | `/health` | 1 | Status check — policy, Prompt Guard, planner availability |
+| `GET` | `/validate/path?path=...&operation=read` | 1 | Policy check for file path |
+| `GET` | `/validate/command?command=...` | 1 | Policy check for shell command |
+| `POST` | `/scan` | 2 | Run all scanners on text `{"text": "..."}` |
+| `POST` | `/process` | 2 | Full Qwen pipeline: scan → spotlight → Qwen → scan |
+| `POST` | `/task` | 3 | **Full CaMeL pipeline**: Claude plans → approve → Qwen executes → scanned |
+| `GET` | `/approval/{id}` | 3 | Check approval status (pending/approved/denied/expired) |
+| `POST` | `/approve/{id}` | 3 | Submit decision `{"granted": true/false, "reason": "..."}` |
+
+### CaMeL Task Flow (POST /task)
+
+```
+User request → Prompt Guard scan → Claude plans → Approval gate
+  → For each step:
+      llm_task: resolve vars → Qwen generates → CodeShield (if code) → output scan
+      tool_call: resolve vars → policy check → execute → tag as TRUSTED
+  → TaskResult returned
+```
+
+In `full` approval mode, `/task` returns `{"status": "awaiting_approval", "approval_id": "..."}`. Poll `/approval/{id}` then submit via `/approve/{id}`.
+
+---
+
 ## Quick Commands
 
 ```bash
@@ -204,6 +241,17 @@ podman exec sentinel-controller pytest /app/tests/ -v
 
 # Health check
 curl http://localhost:8000/health
+
+# Full CaMeL pipeline (Phase 3) — returns approval_id in full mode
+curl -X POST http://localhost:8000/task -H 'Content-Type: application/json' \
+  -d '{"request": "Write me a hello world page in HTML"}'
+
+# Check approval status
+curl http://localhost:8000/approval/<approval_id>
+
+# Approve and execute
+curl -X POST http://localhost:8000/approve/<approval_id> \
+  -H 'Content-Type: application/json' -d '{"granted": true, "reason": "Looks good"}'
 
 # Scan text (Phase 2)
 curl -X POST http://localhost:8000/scan -H 'Content-Type: application/json' \
@@ -217,13 +265,7 @@ curl -X POST http://localhost:8000/process -H 'Content-Type: application/json' \
 podman exec sentinel-qwen ping -c1 8.8.8.8        # should FAIL
 podman exec sentinel-qwen curl https://google.com  # should FAIL
 
-# Pull Qwen model
-podman exec sentinel-qwen ollama pull qwen3:14b
-
-# Check GPU
-podman exec sentinel-qwen nvidia-smi
-
 # Build controller with Prompt Guard model
-podman build --secret id=hf_token,src=$HOME/.secrets/hf_token.txt \
+podman build --secret id=hf_token,src=/home/kifterz/.secrets/hf_token.txt \
   -t sentinel_sentinel-controller controller/
 ```
