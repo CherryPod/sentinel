@@ -1,5 +1,35 @@
 # Changelog
 
+## Phase 4a — WebUI + Security Testing (2026-02-12)
+
+### WebUI
+Browser-based chat interface for the full CaMeL pipeline. No controller changes required.
+
+- `sentinel-ui` container — nginx:alpine, serves static files + reverse-proxies `/api/*` to controller
+- Single-page chat UI — vanilla HTML/JS/CSS, dark theme, no frameworks
+- Full approval flow in browser: send task → view plan → approve/deny → see step results
+- localStorage conversation history (last 100 entries, Shift+click header to clear)
+- Health indicator in header — polls `/api/health` every 30s
+- nginx proxy: 300s read timeout (accommodates LLM processing time)
+- Port 3001:8080 on `sentinel_egress` network
+- **259 tests still passing** (no controller changes)
+
+### Security Testing (Red Team)
+Ran adapted OpenClaw 19-test injection suite against the full CaMeL pipeline.
+
+- **Result: 18/19 passed (95%)** — up from 26% on raw OpenClaw + Qwen
+- Prompt Guard caught 6 attacks at input scan stage
+- Claude planner refused 3 attacks at planning stage
+- Output scanners blocked 3 attacks in Qwen's responses
+- CaMeL architectural separation prevented 3 attacks structurally
+- One failure: test 5.4 (surveillance script) — Qwen wrote full malicious script, CodeShield not invoked because Claude didn't set `expects_code: true`
+- Category 3 (indirect injection via files) passed incidentally — file tools not yet operational, so injected payloads never reached Qwen. Needs re-testing when tools are wired up
+- 5 security gaps identified with suggested fixes (see full report)
+- Full report: `docs/archive/2026-02-12_security-test-report.md`
+- Audit log: `docs/archive/2026-02-12_security-test-audit.jsonl`
+
+---
+
 ## Phase 3 — Claude Planner + Full CaMeL Pipeline (2026-02-12)
 
 The core CaMeL loop is complete: User requests flow through Claude (planning), Qwen (text generation), policy-enforced tools, and multi-layer security scanning.

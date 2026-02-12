@@ -24,7 +24,7 @@
 |-----------|-------|----------|---------|
 | `sentinel-controller` | Custom (Python 3.12/FastAPI) | sentinel_internal + sentinel_egress | Security gateway, orchestrator, policy engine |
 | `sentinel-qwen` | `ollama/ollama:latest` | sentinel_internal ONLY | Air-gapped LLM worker (Qwen 3 14B Q4_K_M) |
-| `sentinel-ui` | Custom (Phase 4) | sentinel_egress | WebUI frontend on port 3001 |
+| `sentinel-ui` | nginx:alpine | sentinel_egress | WebUI chat interface on port 3001 |
 
 ### Container Config
 
@@ -42,9 +42,12 @@
 - Podman socket: `/run/podman/podman.sock:ro`
 - Secrets: `claude_api_key` via Podman secrets (from `~/.secrets/`)
 
-**sentinel-ui (Phase 4):**
+**sentinel-ui:**
+- Image: nginx:alpine, static files + reverse proxy
 - Port: `3001:8080` (avoids conflict with existing Open WebUI on 3000)
-- Proxies to `http://sentinel-controller:8000`
+- Proxies `/api/*` to `http://sentinel-controller:8000/` (strips `/api` prefix)
+- 300s proxy read timeout (LLM calls take time)
+- Network: `sentinel_egress` only (needs to reach controller)
 
 ---
 
@@ -140,6 +143,13 @@ Every data item tagged with:
 │   ├── test_tools.py                # Tool executor + policy check tests (Phase 3)
 │   ├── test_codeshield.py           # CodeShield scanner tests (Phase 3)
 │   └── test_approval.py             # Approval flow + integration tests (Phase 3)
+├── gateway/
+│   ├── Dockerfile                   # nginx:alpine + static files
+│   ├── nginx.conf                   # Static serving + /api proxy to controller
+│   └── static/
+│       ├── index.html               # Chat interface (single page)
+│       ├── style.css                # Dark theme styling
+│       └── app.js                   # Chat logic, API calls, approval flow
 ├── docs/
 │   ├── PROJECT_DOCS.md              # This file
 │   ├── project-sentinel-build-plan.md
@@ -177,7 +187,9 @@ paho-mqtt>=2.1.0
 | **4** | Interfaces | Signal + WebUI integration, conversational approval |
 | **5** | Hardening | Llama Guard 4, red teaming, tuning, performance benchmarks |
 
-**Current status:** Phase 3 COMPLETE — 259 tests passing, full CaMeL pipeline deployed and verified end-to-end
+**Current status:** Phase 4a COMPLETE — WebUI deployed, full pipeline accessible from browser
+
+> Signal integration planned but paused. Plan archived: `docs/archive/2026-02-12_phase4a-signal-mqtt-plan.md`.
 
 ---
 
@@ -239,8 +251,14 @@ PYTHONPATH=controller .venv/bin/python -m pytest controller/tests/ -v
 # Container tests
 podman exec sentinel-controller pytest /app/tests/ -v
 
-# Health check
+# Health check (direct)
 curl http://localhost:8000/health
+
+# Health check (via WebUI proxy)
+curl http://localhost:3001/api/health
+
+# WebUI
+# Open http://thebeast:3001 in browser
 
 # Full CaMeL pipeline (Phase 3) — returns approval_id in full mode
 curl -X POST http://localhost:8000/task -H 'Content-Type: application/json' \
