@@ -1,0 +1,36 @@
+services:
+  sentinel-controller:
+    build:
+      context: ./controller
+      dockerfile: Dockerfile
+    container_name: sentinel-controller
+    networks:
+      - sentinel_internal
+      - sentinel_egress
+    environment:
+      - SENTINEL_POLICY_FILE=/policies/sentinel-policy.yaml
+      - SENTINEL_WORKSPACE_PATH=/workspace
+      - SENTINEL_LOG_DIR=/logs
+      - SENTINEL_LOG_LEVEL=INFO
+      - SENTINEL_APPROVAL_MODE=full
+    volumes:
+      - ./policies:/policies:ro
+      - sentinel-workspace:/workspace
+      - sentinel-logs:/logs
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+
+networks:
+  sentinel_internal:
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
+  sentinel_egress:
+    driver: bridge
+
+volumes:
+  sentinel-workspace:
+  sentinel-logs:

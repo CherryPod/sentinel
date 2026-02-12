@@ -22,6 +22,9 @@ ollama-data/
 # Logs (stored in container volume)
 logs/
 
+# Claude Code
+.claude/
+
 # IDE
 .vscode/
 .idea/

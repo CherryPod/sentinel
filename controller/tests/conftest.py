@@ -1,0 +1,33 @@
+import os
+from pathlib import Path
+
+import pytest
+
+from app.policy_engine import PolicyEngine
+from app.scanner import CredentialScanner, SensitivePathScanner
+
+# Locate the real policy YAML — works both locally and in container
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+_POLICY_PATH = _PROJECT_ROOT / "policies" / "sentinel-policy.yaml"
+
+# Fallback for container layout (/policies/sentinel-policy.yaml)
+if not _POLICY_PATH.exists():
+    _POLICY_PATH = Path("/policies/sentinel-policy.yaml")
+
+
+@pytest.fixture
+def engine() -> PolicyEngine:
+    """PolicyEngine loaded with the real sentinel-policy.yaml."""
+    return PolicyEngine(str(_POLICY_PATH))
+
+
+@pytest.fixture
+def cred_scanner(engine: PolicyEngine) -> CredentialScanner:
+    """CredentialScanner with patterns from real policy."""
+    return CredentialScanner(engine.policy.get("credential_patterns", []))
+
+
+@pytest.fixture
+def path_scanner(engine: PolicyEngine) -> SensitivePathScanner:
+    """SensitivePathScanner with patterns from real policy."""
+    return SensitivePathScanner(engine.policy.get("sensitive_path_patterns", []))
