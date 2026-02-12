@@ -13,12 +13,30 @@ services:
       - SENTINEL_LOG_DIR=/logs
       - SENTINEL_LOG_LEVEL=INFO
       - SENTINEL_APPROVAL_MODE=full
+      - SENTINEL_OLLAMA_URL=http://sentinel-qwen:11434
+      - SENTINEL_OLLAMA_MODEL=qwen3:14b
     volumes:
       - ./policies:/policies:ro
       - sentinel-workspace:/workspace
       - sentinel-logs:/logs
     ports:
       - "8000:8000"
+    restart: unless-stopped
+    depends_on:
+      - sentinel-qwen
+
+  sentinel-qwen:
+    image: docker.io/ollama/ollama:latest
+    container_name: sentinel-qwen
+    networks:
+      - sentinel_internal
+    environment:
+      - OLLAMA_HOST=0.0.0.0:11434
+      - OLLAMA_KEEP_ALIVE=5m
+    volumes:
+      - sentinel-ollama-data:/root/.ollama
+    devices:
+      - nvidia.com/gpu=all
     restart: unless-stopped
 
 networks:
@@ -34,3 +52,4 @@ networks:
 volumes:
   sentinel-workspace:
   sentinel-logs:
+  sentinel-ollama-data:

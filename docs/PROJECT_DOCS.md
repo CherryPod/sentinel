@@ -109,30 +109,27 @@ Every data item tagged with:
 │   ├── Dockerfile
 │   ├── requirements.txt
 │   └── app/
-│       ├── main.py                  # FastAPI entry + MQTT listener
-│       ├── config.py                # Environment config loader
-│       ├── planner.py               # Claude API client + plan parser
-│       ├── worker.py                # Ollama/Qwen client + spotlighting
-│       ├── orchestrator.py          # Main execution loop
-│       ├── policy_engine.py         # YAML policy loader + validators
-│       ├── scanner.py               # Prompt Guard 2 + credential regex
-│       ├── codeshield.py            # LlamaFirewall CodeShield
-│       ├── provenance.py            # TaggedData + trust tracking
-│       ├── tools.py                 # Tool executor (file, shell, podman)
-│       ├── approval.py              # Human approval via MQTT/Signal
-│       ├── audit.py                 # Structured JSON logging
-│       └── models.py                # Pydantic models
+│       ├── main.py                  # FastAPI entry, /health, /validate/*, /scan, /process
+│       ├── config.py                # Environment config (pydantic-settings)
+│       ├── policy_engine.py         # YAML policy loader + path/command validators
+│       ├── scanner.py               # Credential + sensitive path regex scanners
+│       ├── provenance.py            # TaggedData + trust inheritance + chain walking
+│       ├── audit.py                 # Structured JSON logging (daily rotation)
+│       ├── models.py                # Pydantic models (TrustLevel, ScanResult, TaggedData, etc.)
+│       ├── spotlighting.py          # Datamarking preprocessor (Phase 2)
+│       ├── worker.py                # Ollama/Qwen async client (Phase 2)
+│       ├── prompt_guard.py          # Prompt Guard 2 ML scanner (Phase 2)
+│       └── pipeline.py              # Security scan pipeline orchestrator (Phase 2)
 ├── controller/tests/
+│   ├── conftest.py                  # Shared fixtures (engine, scanners)
 │   ├── test_policy_engine.py        # Policy rule unit tests
-│   ├── test_scanner.py              # Security scanner tests
-│   ├── test_provenance.py           # Trust tagging tests
-│   ├── test_tools.py                # Tool validation tests
-│   ├── test_hostile.py              # Mock hostile Qwen integration tests
-│   ├── test_spotlighting.py         # Datamarking tests
-│   └── conftest.py                  # Shared fixtures
-├── gateway/                         # Phase 4
-│   └── app/main.py                  # OpenAI-compatible proxy
-├── secrets/                         # gitignored, but prefer ~/.secrets/
+│   ├── test_scanner.py              # Credential + path scanner tests
+│   ├── test_provenance.py           # Trust tagging + chain tests
+│   ├── test_spotlighting.py         # Datamarking round-trip tests (Phase 2)
+│   ├── test_worker.py               # Ollama client tests, mocked (Phase 2)
+│   ├── test_prompt_guard.py         # Prompt Guard scan tests, mocked (Phase 2)
+│   ├── test_pipeline.py             # Full pipeline integration tests (Phase 2)
+│   └── test_hostile.py              # Mock hostile Qwen attack simulations (Phase 2)
 ├── docs/
 │   ├── PROJECT_DOCS.md              # This file
 │   ├── project-sentinel-build-plan.md
@@ -145,13 +142,17 @@ Every data item tagged with:
 ## Key Dependencies
 
 ```
+# Installed (Phase 1 + 2)
 fastapi>=0.115.0          uvicorn>=0.34.0
-httpx>=0.28.0             anthropic>=0.42.0
-paho-mqtt>=2.1.0          pyyaml>=6.0
-transformers>=4.47.0      torch>=2.5.0 (CPU only)
-llamafirewall>=0.1.0      pydantic>=2.10.0
+httpx>=0.28.0             pyyaml>=6.0
+pydantic>=2.10.0          pydantic-settings>=2.7.0
 python-json-logger>=3.0.0
+transformers>=4.47.0      torch>=2.5.0 (CPU-only index)
 pytest>=8.3.0             pytest-asyncio>=0.25.0
+
+# Not yet installed (future phases)
+anthropic>=0.42.0         paho-mqtt>=2.1.0
+llamafirewall>=0.1.0
 ```
 
 ---
@@ -166,7 +167,7 @@ pytest>=8.3.0             pytest-asyncio>=0.25.0
 | **4** | Interfaces | Signal + WebUI integration, conversational approval |
 | **5** | Hardening | Llama Guard 4, red teaming, tuning, performance benchmarks |
 
-**Current status:** Pre-Phase 1 (directory structure created, no code yet)
+**Current status:** Phase 2 COMPLETE — 193 tests passing, both containers deployed and verified
 
 ---
 
@@ -195,8 +196,22 @@ pytest>=8.3.0             pytest-asyncio>=0.25.0
 ## Quick Commands
 
 ```bash
-# Testing
-podman exec sentinel-controller pytest /app/tests/
+# Local tests (all phases, mocked deps)
+PYTHONPATH=controller .venv/bin/python -m pytest controller/tests/ -v
+
+# Container tests
+podman exec sentinel-controller pytest /app/tests/ -v
+
+# Health check
+curl http://localhost:8000/health
+
+# Scan text (Phase 2)
+curl -X POST http://localhost:8000/scan -H 'Content-Type: application/json' \
+  -d '{"text": "check this text for problems"}'
+
+# Process via Qwen pipeline (Phase 2)
+curl -X POST http://localhost:8000/process -H 'Content-Type: application/json' \
+  -d '{"text": "Write hello world in HTML"}'
 
 # Verify air gap
 podman exec sentinel-qwen ping -c1 8.8.8.8        # should FAIL
@@ -207,4 +222,8 @@ podman exec sentinel-qwen ollama pull qwen3:14b
 
 # Check GPU
 podman exec sentinel-qwen nvidia-smi
+
+# Build controller with Prompt Guard model
+podman build --secret id=hf_token,src=$HOME/.secrets/hf_token.txt \
+  -t sentinel_sentinel-controller controller/
 ```

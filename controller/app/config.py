@@ -20,6 +20,16 @@ class Settings(BaseSettings):
     # Qwen worker (Phase 2)
     ollama_url: str = "http://sentinel-qwen:11434"
     ollama_model: str = "qwen3:14b"
+    ollama_timeout: int = 120
+
+    # Spotlighting (Phase 2)
+    spotlighting_enabled: bool = True
+    spotlighting_marker: str = "^"
+
+    # Prompt Guard (Phase 2)
+    prompt_guard_enabled: bool = True
+    prompt_guard_model: str = "meta-llama/Llama-Prompt-Guard-2-86M"
+    prompt_guard_threshold: float = 0.9
 
     # Claude planner (Phase 3)
     claude_api_key_file: str = "/run/secrets/claude_api_key"

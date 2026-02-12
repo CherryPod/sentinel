@@ -2,8 +2,21 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
+# Build deps for torch/transformers native extensions
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc g++ \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+
+# Install torch CPU-only first (separate index), then the rest
+RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu \
+    && pip install --no-cache-dir -r requirements.txt
+
+# Pre-download Prompt Guard model at build time (uses HF token via build secret)
+RUN --mount=type=secret,id=hf_token \
+    HF_TOKEN=$(cat /run/secrets/hf_token) \
+    python -c "from transformers import pipeline; pipeline('text-classification', model='meta-llama/Llama-Prompt-Guard-2-86M')"
 
 COPY app/ ./app/
 COPY tests/ ./tests/
