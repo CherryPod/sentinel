@@ -4,10 +4,13 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Query
 from pydantic import BaseModel
 
+from .approval import ApprovalManager
 from .audit import setup_audit_logger
 from .config import settings
 from .models import PolicyResult, ValidationResult
+from .orchestrator import Orchestrator
 from .pipeline import ScanPipeline, SecurityViolation
+from .planner import ClaudePlanner, PlannerError
 from .policy_engine import PolicyEngine
 from . import prompt_guard
 from .scanner import CredentialScanner, SensitivePathScanner
@@ -17,7 +20,9 @@ _engine: PolicyEngine | None = None
 _cred_scanner: CredentialScanner | None = None
 _path_scanner: SensitivePathScanner | None = None
 _pipeline: ScanPipeline | None = None
+_orchestrator: Orchestrator | None = None
 _prompt_guard_loaded: bool = False
+_planner_available: bool = False
 _audit = None
 
 
@@ -62,6 +67,29 @@ async def lifespan(app: FastAPI):
         path_scanner=_path_scanner,
     )
 
+    # Initialize Claude planner + orchestrator (Phase 3)
+    global _orchestrator, _planner_available
+    try:
+        planner = ClaudePlanner()
+        approval_mgr = ApprovalManager()
+        _orchestrator = Orchestrator(
+            planner=planner,
+            pipeline=_pipeline,
+            approval_manager=approval_mgr,
+        )
+        _planner_available = True
+        _audit.info(
+            "Claude planner initialized",
+            extra={"event": "planner_init", "model": settings.claude_model},
+        )
+    except PlannerError as exc:
+        _audit.warning(
+            "Claude planner not available: %s",
+            exc,
+            extra={"event": "planner_init_failed", "error": str(exc)},
+        )
+        _planner_available = False
+
     yield
 
     _audit.info("Shutting down sentinel-controller", extra={"event": "shutdown"})
@@ -76,6 +104,7 @@ async def health():
         "status": "ok",
         "policy_loaded": _engine is not None,
         "prompt_guard_loaded": _prompt_guard_loaded,
+        "planner_available": _planner_available,
     }
 
 
@@ -203,3 +232,60 @@ async def process_text(req: ProcessRequest):
                 for name, sr in exc.scan_results.items()
             },
         }
+
+
+# ── Phase 3 endpoints ────────────────────────────────────────────
+
+
+class TaskRequest(BaseModel):
+    request: str
+    source: str = "api"
+
+
+@app.post("/task")
+async def handle_task(req: TaskRequest):
+    """Full CaMeL pipeline: user request → Claude plans → Qwen executes → scanned result."""
+    if _orchestrator is None:
+        return {"status": "error", "reason": "Orchestrator not initialized"}
+
+    result = await _orchestrator.handle_task(
+        user_request=req.request,
+        source=req.source,
+        approval_mode=settings.approval_mode,
+    )
+    return result.model_dump()
+
+
+@app.get("/approval/{approval_id}")
+async def check_approval(approval_id: str):
+    """Check the status of an approval request."""
+    if _orchestrator is None or _orchestrator._approval_manager is None:
+        return {"status": "error", "reason": "Approval manager not available"}
+
+    return _orchestrator._approval_manager.check_approval(approval_id)
+
+
+class ApprovalDecision(BaseModel):
+    granted: bool
+    reason: str = ""
+
+
+@app.post("/approve/{approval_id}")
+async def submit_approval(approval_id: str, decision: ApprovalDecision):
+    """Submit an approval decision, then execute the plan if approved."""
+    if _orchestrator is None or _orchestrator._approval_manager is None:
+        return {"status": "error", "reason": "Approval manager not available"}
+
+    accepted = _orchestrator._approval_manager.submit_approval(
+        approval_id=approval_id,
+        granted=decision.granted,
+        reason=decision.reason,
+    )
+    if not accepted:
+        return {"status": "error", "reason": "Invalid, expired, or duplicate approval"}
+
+    if decision.granted:
+        result = await _orchestrator.execute_approved_plan(approval_id)
+        return result.model_dump()
+
+    return {"status": "denied", "reason": decision.reason}

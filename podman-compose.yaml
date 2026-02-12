@@ -19,9 +19,11 @@ services:
       - ./policies:/policies:ro
       - sentinel-workspace:/workspace
       - sentinel-logs:/logs
+    secrets:
+      - claude_api_key
     ports:
       - "8000:8000"
-    restart: unless-stopped
+    restart: always
     depends_on:
       - sentinel-qwen
 
@@ -37,7 +39,7 @@ services:
       - sentinel-ollama-data:/root/.ollama
     devices:
       - nvidia.com/gpu=all
-    restart: unless-stopped
+    restart: always
 
 networks:
   sentinel_internal:
@@ -48,6 +50,10 @@ networks:
         - subnet: 172.30.0.0/24
   sentinel_egress:
     driver: bridge
+
+secrets:
+  claude_api_key:
+    file: /home/kifterz/.secrets/claude_api_key.txt
 
 volumes:
   sentinel-workspace:

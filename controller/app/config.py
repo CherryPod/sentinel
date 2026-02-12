@@ -33,6 +33,12 @@ class Settings(BaseSettings):
 
     # Claude planner (Phase 3)
     claude_api_key_file: str = "/run/secrets/claude_api_key"
+    claude_model: str = "claude-sonnet-4-5-20250929"
+    claude_max_tokens: int = 4096
+    claude_timeout: int = 60
+
+    # Approval (Phase 3)
+    approval_timeout: int = 300
 
     # MQTT (Phase 3)
     mqtt_broker: str = "host.containers.internal"
