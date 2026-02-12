@@ -137,9 +137,19 @@ class ClaudePlanner:
         if not raw_text.strip():
             raise PlannerError("Claude returned empty response")
 
+        # Strip markdown code fences if present
+        cleaned = raw_text.strip()
+        if cleaned.startswith("```"):
+            # Remove opening fence (```json or ```)
+            first_newline = cleaned.index("\n")
+            cleaned = cleaned[first_newline + 1:]
+            # Remove closing fence
+            if cleaned.rstrip().endswith("```"):
+                cleaned = cleaned.rstrip()[:-3].rstrip()
+
         # Parse JSON
         try:
-            plan_data = json.loads(raw_text.strip())
+            plan_data = json.loads(cleaned)
         except json.JSONDecodeError as exc:
             raise PlannerError(f"Claude returned invalid JSON: {exc}") from exc
 
