@@ -60,16 +60,17 @@
 
 ---
 
-## Security Layers (6 total)
+## Security Layers (7 total)
 
 | # | Layer | Type | What It Catches | Phase |
 |---|-------|------|-----------------|-------|
 | 1 | **Policy Engine** | Deterministic YAML | File paths, commands, credentials, network — cannot be bypassed by prompt injection | 1 |
 | 2 | **Spotlighting** | String manipulation | Prompt injection (~50% -> <3% success rate) — zero compute cost | 2 |
 | 3 | **Prompt Guard 2** | 86M BERT classifier (CPU) | Injection detection (~67% catch rate) — 512 token window | 2 |
-| 4 | **Llama Guard 4** | 12B content safety model | Harmful content (violence, hate, weapons) — GPU or CPU | 5 |
-| 5 | **CodeShield** | Static analysis (LlamaFirewall) | Malicious code patterns (injection, traversal, shells, weak crypto) | 3 |
-| 6 | **CaMeL Provenance** | Data tagging | Untrusted data reaching dangerous destinations — architectural guarantee | 1 |
+| 4 | **Llama Guard 4** | 12B content safety model | Harmful content (violence, hate, weapons) — GPU or CPU | 5 (skipped) |
+| 5 | **CodeShield** | Semgrep static analysis (codeshield pkg) | Malicious code patterns (os.system, eval, SQL injection, traversal, shells, weak crypto) — scans ALL Qwen output | 3+5 |
+| 6 | **CommandPatternScanner** | Regex patterns | Dangerous shell patterns in prose (pipe-to-shell, reverse shells, nohup, base64 decode+exec) | 5 |
+| 7 | **CaMeL Provenance** | Data tagging | Untrusted data reaching dangerous destinations — architectural guarantee | 1 |
 
 ---
 
@@ -126,7 +127,7 @@ Every data item tagged with:
 │       ├── planner.py               # Claude API client + JSON plan generation (Phase 3)
 │       ├── orchestrator.py          # CaMeL execution loop: plan → execute → scan (Phase 3)
 │       ├── tools.py                 # Tool executor with policy checks (Phase 3)
-│       ├── codeshield.py            # LlamaFirewall CodeShield wrapper (Phase 3)
+│       ├── codeshield.py            # CodeShield async wrapper + semgrep patch (Phase 3+5)
 │       └── approval.py              # HTTP approval manager with TTL queue (Phase 3)
 ├── controller/tests/
 │   ├── conftest.py                  # Shared fixtures (engine, scanners)
@@ -141,8 +142,9 @@ Every data item tagged with:
 │   ├── test_planner.py              # Claude planner tests, mocked API (Phase 3)
 │   ├── test_orchestrator.py         # Orchestrator CaMeL loop tests (Phase 3)
 │   ├── test_tools.py                # Tool executor + policy check tests (Phase 3)
-│   ├── test_codeshield.py           # CodeShield scanner tests (Phase 3)
-│   └── test_approval.py             # Approval flow + integration tests (Phase 3)
+│   ├── test_codeshield.py           # CodeShield scanner tests (Phase 3+5)
+│   ├── test_approval.py             # Approval flow + integration tests (Phase 3)
+│   └── test_hardening.py            # Phase 5 hardening regression tests
 ├── gateway/
 │   ├── Dockerfile                   # nginx:alpine + static files
 │   ├── nginx.conf                   # Static serving + /api proxy to controller
@@ -168,7 +170,7 @@ httpx>=0.28.0             pyyaml>=6.0
 pydantic>=2.10.0          pydantic-settings>=2.7.0
 python-json-logger>=3.0.0
 transformers>=4.47.0      torch>=2.5.0 (CPU-only index)
-anthropic>=0.42.0         llamafirewall>=0.1.0
+anthropic>=0.42.0         codeshield>=0.1.0 (includes semgrep)
 pytest>=8.3.0             pytest-asyncio>=0.25.0
 
 # Not yet installed (future phases)
@@ -187,9 +189,10 @@ paho-mqtt>=2.1.0
 | **4** | Interfaces | Signal + WebUI integration, conversational approval |
 | **5** | Hardening | Llama Guard 4, red teaming, tuning, performance benchmarks |
 
-**Current status:** Phase 4a COMPLETE — WebUI deployed, full pipeline accessible from browser
+**Current status:** Phase 5 COMPLETE — Hardening deployed, CodeShield working, 315 tests passing
 
 > Signal integration planned but paused. Plan archived: `docs/archive/2026-02-12_phase4a-signal-mqtt-plan.md`.
+> CodeShield fix details: `docs/archive/2026-02-13_codeshield-fix.md`
 
 ---
 
@@ -209,7 +212,7 @@ paho-mqtt>=2.1.0
 
 - **CPU:** Ryzen 7 5700X (8c/16t) | **RAM:** 64GB (43GB available) | **GPU:** RTX 3060 12GB
 - **Storage:** 915GB NVMe, 492GB free | **Swap:** 8GB
-- **Existing:** 27 containers — do NOT touch. GPU shared via Ollama load/unload
+- **Existing:** 27 other containers — do NOT touch. GPU shared via Ollama load/unload
 - **MQTT:** mosquitto on port 1883 (integration point for Signal)
 - **VRAM note:** Qwen 14B Q4 (~10GB) + Llama Guard 12B Q4 (~8GB) = 18GB > 12GB VRAM. Cannot coexist. Options: sequential GPU loading, CPU-only Guard, or defer Guard to Phase 5 (recommended)
 
@@ -219,7 +222,7 @@ paho-mqtt>=2.1.0
 
 | Method | Path | Phase | Purpose |
 |--------|------|-------|---------|
-| `GET` | `/health` | 1 | Status check — policy, Prompt Guard, planner availability |
+| `GET` | `/health` | 1 | Status check — policy, Prompt Guard, CodeShield, planner availability |
 | `GET` | `/validate/path?path=...&operation=read` | 1 | Policy check for file path |
 | `GET` | `/validate/command?command=...` | 1 | Policy check for shell command |
 | `POST` | `/scan` | 2 | Run all scanners on text `{"text": "..."}` |
@@ -233,7 +236,7 @@ paho-mqtt>=2.1.0
 ```
 User request → Prompt Guard scan → Claude plans → Approval gate
   → For each step:
-      llm_task: resolve vars → Qwen generates → CodeShield (if code) → output scan
+      llm_task: resolve vars → Qwen generates → CodeShield (all output) → output scan
       tool_call: resolve vars → policy check → execute → tag as TRUSTED
   → TaskResult returned
 ```

@@ -1,5 +1,31 @@
 # Changelog
 
+## Phase 5 — Hardening + CodeShield Fix (2026-02-13)
+
+Security hardening based on red team findings, plus fixing CodeShield to actually work.
+
+### Hardening (4 red team gaps fixed)
+- **Gap 1: CodeShield on all output** — CodeShield now scans ALL Qwen output, not just `expects_code=True` steps. Prevents surveillance scripts/malicious code in prose responses
+- **Gap 2: CommandPatternScanner** — new scanner detects dangerous shell patterns (pipe-to-shell, reverse shells, base64 decode+exec, nohup, etc.) in text, not just explicit commands
+- **Gap 3: Planner prompt hardening** — system prompt now contains explicit security constraints (workspace boundaries, credential prohibition, exfiltration rules, expects_code guidance)
+- **Gap 4: ToolExecutor wired** — `tool_call` plan steps now execute via policy-checked ToolExecutor instead of being silently skipped
+
+### CodeShield Fix
+The `codeshield` package was installed but never worked. Two issues found and fixed:
+1. **Wrong API**: Code used non-existent `llamafirewall.CodeShieldScanner`. Correct API is `codeshield.cs.CodeShield.scan_code()` (async)
+2. **osemgrep bug**: Package uses `osemgrep --experimental` internally, which has a bug where `patterns` + `pattern-not` Semgrep rules return zero results. Fixed by patching `SEMGREP_COMMAND` to use regular `semgrep` at init time
+
+> Full investigation details: `docs/archive/2026-02-13_codeshield-fix.md`
+
+### Other
+- Llama Guard 4 deliberately skipped (content moderation, not our threat model)
+- `codeshield_loaded` added to `/health` endpoint
+- CodeShield initialization with timing logged at startup
+- Regression test suite: `controller/tests/test_hardening.py`
+- **315 total tests passing** (123 Phase 1 + 70 Phase 2 + 66 Phase 3 + 56 Phase 5)
+
+---
+
 ## Phase 4a — WebUI + Security Testing (2026-02-12)
 
 ### WebUI

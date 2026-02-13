@@ -235,9 +235,9 @@ class Orchestrator:
         try:
             tagged = await self._pipeline.process_with_qwen(prompt=resolved_prompt)
 
-            # CodeShield scan for code-generating steps
-            if step.expects_code and codeshield.is_loaded():
-                cs_result = codeshield.scan(tagged.content)
+            # CodeShield scan on ALL Qwen output (not just expects_code steps)
+            if codeshield.is_loaded():
+                cs_result = await codeshield.scan(tagged.content)
                 if cs_result.found:
                     logger.warning(
                         "CodeShield blocked generated code",

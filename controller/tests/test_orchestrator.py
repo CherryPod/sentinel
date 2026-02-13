@@ -394,6 +394,85 @@ class TestHandleTask:
         assert "approval-123" in result.reason
 
     @pytest.mark.asyncio
+    async def test_codeshield_runs_without_expects_code(self, mock_planner, mock_pipeline):
+        """CodeShield should scan ALL Qwen output, not just expects_code=True steps."""
+        plan = _make_plan([
+            {
+                "id": "step_1",
+                "type": "llm_task",
+                "description": "Generate prose",
+                "prompt": "Describe a recipe",
+                "expects_code": False,
+            }
+        ])
+        mock_planner.create_plan.return_value = plan
+
+        tagged = create_tagged_data(
+            content="#!/bin/bash\nrm -rf /",
+            source=DataSource.QWEN,
+            trust_level=TrustLevel.UNTRUSTED,
+        )
+        mock_pipeline.process_with_qwen.return_value = tagged
+
+        with patch("app.orchestrator.codeshield") as mock_cs:
+            mock_cs.is_loaded.return_value = True
+            mock_cs.scan = AsyncMock(return_value=ScanResult(
+                found=True,
+                matches=[ScanMatch(
+                    pattern_name="codeshield_insecure",
+                    matched_text="dangerous code",
+                    position=0,
+                )],
+                scanner_name="codeshield",
+            ))
+
+            orch = Orchestrator(planner=mock_planner, pipeline=mock_pipeline)
+            result = await orch.handle_task("Describe a recipe")
+
+            assert result.status == "blocked"
+            assert "CodeShield" in result.step_results[0].error
+            mock_cs.scan.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_codeshield_runs_with_expects_code(self, mock_planner, mock_pipeline):
+        """CodeShield should still run when expects_code=True (regression)."""
+        plan = _make_plan([
+            {
+                "id": "step_1",
+                "type": "llm_task",
+                "description": "Generate code",
+                "prompt": "Write a script",
+                "expects_code": True,
+            }
+        ])
+        mock_planner.create_plan.return_value = plan
+
+        tagged = create_tagged_data(
+            content="import os; os.system('rm -rf /')",
+            source=DataSource.QWEN,
+            trust_level=TrustLevel.UNTRUSTED,
+        )
+        mock_pipeline.process_with_qwen.return_value = tagged
+
+        with patch("app.orchestrator.codeshield") as mock_cs:
+            mock_cs.is_loaded.return_value = True
+            mock_cs.scan = AsyncMock(return_value=ScanResult(
+                found=True,
+                matches=[ScanMatch(
+                    pattern_name="codeshield_insecure",
+                    matched_text="dangerous code",
+                    position=0,
+                )],
+                scanner_name="codeshield",
+            ))
+
+            orch = Orchestrator(planner=mock_planner, pipeline=mock_pipeline)
+            result = await orch.handle_task("Write a script")
+
+            assert result.status == "blocked"
+            mock_cs.scan.assert_called_once()
+
+    @pytest.mark.asyncio
     async def test_plan_summary_in_result(self, mock_planner, mock_pipeline):
         """Plan summary is included in the TaskResult."""
         plan = _make_plan(

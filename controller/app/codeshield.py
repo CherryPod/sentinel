@@ -4,7 +4,7 @@ from .models import ScanMatch, ScanResult
 
 logger = logging.getLogger("sentinel.audit")
 
-_scanner = None
+_cs_class = None
 _loaded = False
 
 
@@ -13,23 +13,41 @@ class CodeShieldError(Exception):
 
 
 def initialize() -> bool:
-    """Load the CodeShield scanner. Returns True on success."""
-    global _scanner, _loaded
+    """Load the CodeShield scanner, patching semgrep to fix osemgrep bug.
+
+    The codeshield package ships with osemgrep --experimental as default,
+    which has a bug where patterns + pattern-not rules return zero results.
+    We patch SEMGREP_COMMAND to use regular semgrep instead.
+    """
+    global _cs_class, _loaded
 
     try:
-        from llamafirewall import CodeShieldScanner
+        # Patch the semgrep command BEFORE any scanning happens
+        from codeshield.insecure_code_detector import oss
 
-        _scanner = CodeShieldScanner()
+        oss.SEMGREP_COMMAND = [
+            "semgrep", "--json", "--quiet", "--metrics", "off", "--config",
+        ]
+        logger.info(
+            "Patched SEMGREP_COMMAND to use semgrep instead of osemgrep",
+            extra={"event": "codeshield_semgrep_patched"},
+        )
+
+        from codeshield.cs import CodeShield
+
+        _cs_class = CodeShield
         _loaded = True
         logger.info(
             "CodeShield loaded",
             extra={"event": "codeshield_loaded"},
         )
+
         return True
-    except ImportError:
+    except ImportError as exc:
         logger.warning(
-            "llamafirewall not installed — CodeShield disabled",
-            extra={"event": "codeshield_import_failed"},
+            "codeshield package not installed — CodeShield disabled: %s",
+            exc,
+            extra={"event": "codeshield_import_failed", "error": str(exc)},
         )
         _loaded = False
         return False
@@ -47,13 +65,13 @@ def is_loaded() -> bool:
     return _loaded
 
 
-def scan(code: str) -> ScanResult:
+async def scan(code: str) -> ScanResult:
     """Scan code for security issues using CodeShield.
 
     If not loaded, returns a clean result (graceful degradation —
     deterministic scanners still protect the pipeline).
     """
-    if not _loaded or _scanner is None:
+    if not _loaded or _cs_class is None:
         return ScanResult(
             found=False,
             matches=[],
@@ -61,14 +79,14 @@ def scan(code: str) -> ScanResult:
         )
 
     try:
-        result = _scanner.scan(code)
+        result = await _cs_class.scan_code(code)
         matches = []
 
         if result.is_insecure:
-            for issue in getattr(result, "issues", []):
+            for issue in result.issues_found or []:
                 matches.append(
                     ScanMatch(
-                        pattern_name=f"codeshield_{getattr(issue, 'rule', 'unknown')}",
+                        pattern_name=f"codeshield_{getattr(issue, 'cwe_id', 'unknown')}",
                         matched_text=getattr(issue, "description", "security issue detected"),
                         position=getattr(issue, "line", 0),
                     )

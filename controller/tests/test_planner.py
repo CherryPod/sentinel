@@ -181,6 +181,41 @@ class TestCreatePlan:
         assert "file_write" in call_kwargs["system"]
 
 
+class TestPlannerSystemPrompt:
+    """Verify the hardened system prompt contains critical security rules."""
+
+    def test_prompt_contains_expects_code_rules(self, planner):
+        from app.planner import _PLANNER_SYSTEM_PROMPT_TEMPLATE
+        assert "expects_code" in _PLANNER_SYSTEM_PROMPT_TEMPLATE
+        assert "shell scripts" in _PLANNER_SYSTEM_PROMPT_TEMPLATE
+        assert "Dockerfiles" in _PLANNER_SYSTEM_PROMPT_TEMPLATE
+
+    def test_prompt_contains_workspace_constraint(self, planner):
+        from app.planner import _PLANNER_SYSTEM_PROMPT_TEMPLATE
+        assert "/workspace/" in _PLANNER_SYSTEM_PROMPT_TEMPLATE
+
+    def test_prompt_prohibits_system_prompt_access(self, planner):
+        from app.planner import _PLANNER_SYSTEM_PROMPT_TEMPLATE
+        assert "system prompt" in _PLANNER_SYSTEM_PROMPT_TEMPLATE
+
+    def test_prompt_prohibits_credential_access(self, planner):
+        from app.planner import _PLANNER_SYSTEM_PROMPT_TEMPLATE
+        assert "credentials" in _PLANNER_SYSTEM_PROMPT_TEMPLATE
+        assert "API keys" in _PLANNER_SYSTEM_PROMPT_TEMPLATE
+
+    def test_prompt_prohibits_exfiltration(self, planner):
+        from app.planner import _PLANNER_SYSTEM_PROMPT_TEMPLATE
+        assert "exfiltrate" in _PLANNER_SYSTEM_PROMPT_TEMPLATE
+
+    def test_prompt_marks_worker_untrusted(self, planner):
+        from app.planner import _PLANNER_SYSTEM_PROMPT_TEMPLATE
+        assert "UNTRUSTED" in _PLANNER_SYSTEM_PROMPT_TEMPLATE
+
+    def test_prompt_has_refusal_instructions(self, planner):
+        from app.planner import _PLANNER_SYSTEM_PROMPT_TEMPLATE
+        assert "Request refused" in _PLANNER_SYSTEM_PROMPT_TEMPLATE
+
+
 class TestAPIKeyLoading:
     def test_api_key_not_found(self):
         with patch("app.planner.settings") as mock_settings:

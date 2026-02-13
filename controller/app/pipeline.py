@@ -3,7 +3,7 @@ import logging
 from .config import settings
 from .models import DataSource, ScanResult, TaggedData, TrustLevel
 from .provenance import create_tagged_data
-from .scanner import CredentialScanner, SensitivePathScanner
+from .scanner import CommandPatternScanner, CredentialScanner, SensitivePathScanner
 from . import prompt_guard
 from .spotlighting import apply_datamarking
 from .worker import OllamaWorker
@@ -41,10 +41,12 @@ class ScanPipeline:
         self,
         cred_scanner: CredentialScanner,
         path_scanner: SensitivePathScanner,
+        cmd_scanner: CommandPatternScanner | None = None,
         worker: OllamaWorker | None = None,
     ):
         self._cred_scanner = cred_scanner
         self._path_scanner = path_scanner
+        self._cmd_scanner = cmd_scanner or CommandPatternScanner()
         self._worker = worker or OllamaWorker(
             base_url=settings.ollama_url,
             timeout=settings.ollama_timeout,
@@ -80,6 +82,7 @@ class ScanPipeline:
 
         result.results["credential_scanner"] = self._cred_scanner.scan(text)
         result.results["sensitive_path_scanner"] = self._path_scanner.scan(text)
+        result.results["command_pattern_scanner"] = self._cmd_scanner.scan(text)
 
         logger.info(
             "Output scan complete",

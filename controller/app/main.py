@@ -12,24 +12,27 @@ from .orchestrator import Orchestrator
 from .pipeline import ScanPipeline, SecurityViolation
 from .planner import ClaudePlanner, PlannerError
 from .policy_engine import PolicyEngine
-from . import prompt_guard
-from .scanner import CredentialScanner, SensitivePathScanner
+from . import codeshield, prompt_guard
+from .scanner import CommandPatternScanner, CredentialScanner, SensitivePathScanner
+from .tools import ToolExecutor
 
 # Module-level references populated at startup
 _engine: PolicyEngine | None = None
 _cred_scanner: CredentialScanner | None = None
 _path_scanner: SensitivePathScanner | None = None
+_cmd_scanner: CommandPatternScanner | None = None
 _pipeline: ScanPipeline | None = None
 _orchestrator: Orchestrator | None = None
 _prompt_guard_loaded: bool = False
+_codeshield_loaded: bool = False
 _planner_available: bool = False
 _audit = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _engine, _cred_scanner, _path_scanner, _pipeline
-    global _prompt_guard_loaded, _audit
+    global _engine, _cred_scanner, _path_scanner, _cmd_scanner, _pipeline
+    global _prompt_guard_loaded, _codeshield_loaded, _audit
 
     _audit = setup_audit_logger(
         log_dir=settings.log_dir,
@@ -46,6 +49,7 @@ async def lifespan(app: FastAPI):
 
     _cred_scanner = CredentialScanner(_engine.policy.get("credential_patterns", []))
     _path_scanner = SensitivePathScanner(_engine.policy.get("sensitive_path_patterns", []))
+    _cmd_scanner = CommandPatternScanner()
 
     # Initialize Prompt Guard (Phase 2)
     if settings.prompt_guard_enabled:
@@ -65,6 +69,20 @@ async def lifespan(app: FastAPI):
     _pipeline = ScanPipeline(
         cred_scanner=_cred_scanner,
         path_scanner=_path_scanner,
+        cmd_scanner=_cmd_scanner,
+    )
+
+    # Initialize CodeShield (Phase 5)
+    t0 = time.monotonic()
+    _codeshield_loaded = codeshield.initialize()
+    elapsed = time.monotonic() - t0
+    _audit.info(
+        "CodeShield init",
+        extra={
+            "event": "codeshield_init",
+            "loaded": _codeshield_loaded,
+            "elapsed_s": round(elapsed, 2),
+        },
     )
 
     # Initialize Claude planner + orchestrator (Phase 3)
@@ -72,9 +90,11 @@ async def lifespan(app: FastAPI):
     try:
         planner = ClaudePlanner()
         approval_mgr = ApprovalManager()
+        tool_executor = ToolExecutor(policy_engine=_engine)
         _orchestrator = Orchestrator(
             planner=planner,
             pipeline=_pipeline,
+            tool_executor=tool_executor,
             approval_manager=approval_mgr,
         )
         _planner_available = True
@@ -104,6 +124,7 @@ async def health():
         "status": "ok",
         "policy_loaded": _engine is not None,
         "prompt_guard_loaded": _prompt_guard_loaded,
+        "codeshield_loaded": _codeshield_loaded,
         "planner_available": _planner_available,
     }
 

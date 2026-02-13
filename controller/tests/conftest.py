@@ -4,7 +4,7 @@ from pathlib import Path
 import pytest
 
 from app.policy_engine import PolicyEngine
-from app.scanner import CredentialScanner, SensitivePathScanner
+from app.scanner import CommandPatternScanner, CredentialScanner, SensitivePathScanner
 
 # Locate the real policy YAML — works both locally and in container
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -31,3 +31,9 @@ def cred_scanner(engine: PolicyEngine) -> CredentialScanner:
 def path_scanner(engine: PolicyEngine) -> SensitivePathScanner:
     """SensitivePathScanner with patterns from real policy."""
     return SensitivePathScanner(engine.policy.get("sensitive_path_patterns", []))
+
+
+@pytest.fixture
+def cmd_scanner() -> CommandPatternScanner:
+    """CommandPatternScanner with default patterns."""
+    return CommandPatternScanner()
