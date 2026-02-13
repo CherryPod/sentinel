@@ -2,6 +2,7 @@ import logging
 import re
 
 from .models import (
+    ConversationInfo,
     DataSource,
     Plan,
     PlanStep,
@@ -11,9 +12,12 @@ from .models import (
     TrustLevel,
 )
 from . import codeshield
+from .config import settings
+from .conversation import ConversationAnalyzer
 from .pipeline import ScanPipeline, SecurityViolation
 from .planner import ClaudePlanner, PlannerError
 from .provenance import create_tagged_data
+from .session import ConversationTurn, SessionStore
 
 logger = logging.getLogger("sentinel.audit")
 
@@ -64,27 +68,88 @@ class Orchestrator:
         pipeline: ScanPipeline,
         tool_executor=None,
         approval_manager=None,
+        session_store: SessionStore | None = None,
+        conversation_analyzer: ConversationAnalyzer | None = None,
     ):
         self._planner = planner
         self._pipeline = pipeline
         self._tool_executor = tool_executor
         self._approval_manager = approval_manager
+        self._session_store = session_store
+        self._conversation_analyzer = conversation_analyzer
 
     async def handle_task(
         self,
         user_request: str,
         source: str = "api",
         approval_mode: str = "auto",
+        session_id: str | None = None,
     ) -> TaskResult:
-        """Full CaMeL pipeline: scan → plan → validate → execute → return."""
+        """Full CaMeL pipeline: conversation check → scan → plan → execute → return."""
         logger.info(
             "Task received",
             extra={
                 "event": "task_received",
                 "source": source,
+                "session_id": session_id,
                 "request_preview": user_request[:200],
             },
         )
+
+        # 0. Conversation analysis (multi-turn attack detection)
+        conv_info = None
+        session = None
+        if (
+            settings.conversation_enabled
+            and self._session_store is not None
+            and self._conversation_analyzer is not None
+        ):
+            session = self._session_store.get_or_create(session_id, source=source)
+
+            # Locked sessions get immediate rejection
+            if session.is_locked:
+                conv_info = ConversationInfo(
+                    session_id=session.session_id,
+                    turn_number=len(session.turns),
+                    risk_score=session.cumulative_risk,
+                    action="block",
+                    warnings=["Session is locked due to accumulated violations"],
+                )
+                return TaskResult(
+                    status="blocked",
+                    reason="Session locked — too many security violations",
+                    conversation=conv_info,
+                )
+
+            analysis = self._conversation_analyzer.analyze(session, user_request)
+            conv_info = ConversationInfo(
+                session_id=session.session_id,
+                turn_number=len(session.turns),
+                risk_score=analysis.total_score,
+                action=analysis.action,
+                warnings=analysis.warnings,
+            )
+
+            if analysis.action == "block":
+                session.cumulative_risk = analysis.total_score
+                session.lock()
+                turn = ConversationTurn(
+                    request_text=user_request,
+                    result_status="blocked",
+                    blocked_by=["conversation_analyzer"],
+                    risk_score=analysis.total_score,
+                )
+                session.add_turn(turn)
+                return TaskResult(
+                    status="blocked",
+                    reason="Blocked by multi-turn conversation analysis",
+                    conversation=conv_info,
+                )
+
+            # For "warn", we continue processing but include warnings
+            # Update cumulative risk (carries forward to next turn)
+            if analysis.total_score > session.cumulative_risk:
+                session.cumulative_risk = analysis.total_score
 
         # 1. Scan user input
         try:
@@ -97,16 +162,29 @@ class Orchestrator:
                         "violations": list(input_scan.violations.keys()),
                     },
                 )
+                if session is not None:
+                    turn = ConversationTurn(
+                        request_text=user_request,
+                        result_status="blocked",
+                        blocked_by=list(input_scan.violations.keys()),
+                        risk_score=conv_info.risk_score if conv_info else 0.0,
+                    )
+                    session.add_turn(turn)
                 return TaskResult(
                     status="blocked",
                     reason="Input blocked by security scan",
+                    conversation=conv_info,
                 )
         except Exception as exc:
             logger.error(
                 "Input scan failed",
                 extra={"event": "input_scan_error", "error": str(exc)},
             )
-            return TaskResult(status="error", reason=f"Input scan failed: {exc}")
+            return TaskResult(
+                status="error",
+                reason=f"Input scan failed: {exc}",
+                conversation=conv_info,
+            )
 
         # 2. Get tool descriptions if a tool executor is available
         available_tools = []
@@ -124,7 +202,11 @@ class Orchestrator:
                 "Planning failed",
                 extra={"event": "planner_error", "error": str(exc)},
             )
-            return TaskResult(status="error", reason=f"Planning failed: {exc}")
+            return TaskResult(
+                status="error",
+                reason=f"Planning failed: {exc}",
+                conversation=conv_info,
+            )
 
         # 4. Check if approval is needed
         if approval_mode == "full" and self._approval_manager is not None:
@@ -133,10 +215,23 @@ class Orchestrator:
                 status="awaiting_approval",
                 plan_summary=plan.plan_summary,
                 reason=f"approval_id:{approval_id}",
+                conversation=conv_info,
             )
 
         # 5. Execute plan
-        return await self._execute_plan(plan)
+        result = await self._execute_plan(plan)
+        result.conversation = conv_info
+
+        # Record turn
+        if session is not None:
+            turn = ConversationTurn(
+                request_text=user_request,
+                result_status=result.status,
+                risk_score=conv_info.risk_score if conv_info else 0.0,
+            )
+            session.add_turn(turn)
+
+        return result
 
     async def execute_approved_plan(self, approval_id: str) -> TaskResult:
         """Execute a plan that has been approved via the approval flow."""

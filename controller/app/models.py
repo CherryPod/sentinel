@@ -84,8 +84,17 @@ class StepResult(BaseModel):
     error: str = ""
 
 
+class ConversationInfo(BaseModel):
+    session_id: str
+    turn_number: int
+    risk_score: float
+    action: str                          # "allow", "warn", "block"
+    warnings: list[str] = Field(default_factory=list)
+
+
 class TaskResult(BaseModel):
     status: str                          # "success", "blocked", "denied", "error"
     plan_summary: str = ""
     step_results: list[StepResult] = Field(default_factory=list)
     reason: str = ""
+    conversation: ConversationInfo | None = None

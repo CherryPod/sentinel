@@ -7,6 +7,7 @@ from pydantic import BaseModel
 from .approval import ApprovalManager
 from .audit import setup_audit_logger
 from .config import settings
+from .conversation import ConversationAnalyzer
 from .models import PolicyResult, ValidationResult
 from .orchestrator import Orchestrator
 from .pipeline import ScanPipeline, SecurityViolation
@@ -14,6 +15,7 @@ from .planner import ClaudePlanner, PlannerError
 from .policy_engine import PolicyEngine
 from . import codeshield, prompt_guard
 from .scanner import CommandPatternScanner, CredentialScanner, SensitivePathScanner
+from .session import SessionStore
 from .tools import ToolExecutor
 
 # Module-level references populated at startup
@@ -23,6 +25,7 @@ _path_scanner: SensitivePathScanner | None = None
 _cmd_scanner: CommandPatternScanner | None = None
 _pipeline: ScanPipeline | None = None
 _orchestrator: Orchestrator | None = None
+_session_store: SessionStore | None = None
 _prompt_guard_loaded: bool = False
 _codeshield_loaded: bool = False
 _planner_available: bool = False
@@ -32,7 +35,7 @@ _audit = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _engine, _cred_scanner, _path_scanner, _cmd_scanner, _pipeline
-    global _prompt_guard_loaded, _codeshield_loaded, _audit
+    global _prompt_guard_loaded, _codeshield_loaded, _session_store, _audit
 
     _audit = setup_audit_logger(
         log_dir=settings.log_dir,
@@ -85,6 +88,19 @@ async def lifespan(app: FastAPI):
         },
     )
 
+    # Initialize session store + conversation analyzer (Phase 5)
+    global _session_store
+    _session_store = SessionStore()
+    conversation_analyzer = ConversationAnalyzer()
+    _audit.info(
+        "Conversation tracking initialized",
+        extra={
+            "event": "conversation_init",
+            "enabled": settings.conversation_enabled,
+            "session_ttl": settings.session_ttl,
+        },
+    )
+
     # Initialize Claude planner + orchestrator (Phase 3)
     global _orchestrator, _planner_available
     try:
@@ -96,6 +112,8 @@ async def lifespan(app: FastAPI):
             pipeline=_pipeline,
             tool_executor=tool_executor,
             approval_manager=approval_mgr,
+            session_store=_session_store,
+            conversation_analyzer=conversation_analyzer,
         )
         _planner_available = True
         _audit.info(
@@ -126,6 +144,7 @@ async def health():
         "prompt_guard_loaded": _prompt_guard_loaded,
         "codeshield_loaded": _codeshield_loaded,
         "planner_available": _planner_available,
+        "conversation_tracking": settings.conversation_enabled,
     }
 
 
@@ -261,6 +280,7 @@ async def process_text(req: ProcessRequest):
 class TaskRequest(BaseModel):
     request: str
     source: str = "api"
+    session_id: str | None = None
 
 
 @app.post("/task")
@@ -273,6 +293,7 @@ async def handle_task(req: TaskRequest):
         user_request=req.request,
         source=req.source,
         approval_mode=settings.approval_mode,
+        session_id=req.session_id,
     )
     return result.model_dump()
 
@@ -310,3 +331,35 @@ async def submit_approval(approval_id: str, decision: ApprovalDecision):
         return result.model_dump()
 
     return {"status": "denied", "reason": decision.reason}
+
+
+# ── Session debug endpoint ─────────────────────────────────────
+
+
+@app.get("/session/{session_id}")
+async def get_session(session_id: str):
+    """Debug endpoint: view session state and conversation history."""
+    if _session_store is None:
+        return {"error": "Session store not initialized"}
+
+    session = _session_store.get(session_id)
+    if session is None:
+        return {"error": "Session not found or expired"}
+
+    return {
+        "session_id": session.session_id,
+        "source": session.source,
+        "turn_count": len(session.turns),
+        "cumulative_risk": session.cumulative_risk,
+        "violation_count": session.violation_count,
+        "is_locked": session.is_locked,
+        "turns": [
+            {
+                "request_preview": t.request_text[:100],
+                "result_status": t.result_status,
+                "blocked_by": t.blocked_by,
+                "risk_score": t.risk_score,
+            }
+            for t in session.turns
+        ],
+    }

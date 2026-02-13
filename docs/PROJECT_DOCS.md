@@ -60,7 +60,7 @@
 
 ---
 
-## Security Layers (7 total)
+## Security Layers (8 total)
 
 | # | Layer | Type | What It Catches | Phase |
 |---|-------|------|-----------------|-------|
@@ -70,7 +70,8 @@
 | 4 | **Llama Guard 4** | 12B content safety model | Harmful content (violence, hate, weapons) — GPU or CPU | 5 (skipped) |
 | 5 | **CodeShield** | Semgrep static analysis (codeshield pkg) | Malicious code patterns (os.system, eval, SQL injection, traversal, shells, weak crypto) — scans ALL Qwen output | 3+5 |
 | 6 | **CommandPatternScanner** | Regex patterns | Dangerous shell patterns in prose (pipe-to-shell, reverse shells, nohup, base64 decode+exec) | 5 |
-| 7 | **CaMeL Provenance** | Data tagging | Untrusted data reaching dangerous destinations — architectural guarantee | 1 |
+| 7 | **ConversationAnalyzer** | Multi-turn heuristics | Memory poisoning, retry-after-block, capability escalation, instruction override, context building — 6 rules, additive scoring | 5+ |
+| 8 | **CaMeL Provenance** | Data tagging | Untrusted data reaching dangerous destinations — architectural guarantee | 1 |
 
 ---
 
@@ -128,7 +129,9 @@ Every data item tagged with:
 │       ├── orchestrator.py          # CaMeL execution loop: plan → execute → scan (Phase 3)
 │       ├── tools.py                 # Tool executor with policy checks (Phase 3)
 │       ├── codeshield.py            # CodeShield async wrapper + semgrep patch (Phase 3+5)
-│       └── approval.py              # HTTP approval manager with TTL queue (Phase 3)
+│       ├── approval.py              # HTTP approval manager with TTL queue (Phase 3)
+│       ├── session.py               # Session store + conversation turn tracking (Phase 5+)
+│       └── conversation.py          # Multi-turn conversation analyzer — 6 heuristic rules (Phase 5+)
 ├── controller/tests/
 │   ├── conftest.py                  # Shared fixtures (engine, scanners)
 │   ├── test_policy_engine.py        # Policy rule unit tests
@@ -144,7 +147,8 @@ Every data item tagged with:
 │   ├── test_tools.py                # Tool executor + policy check tests (Phase 3)
 │   ├── test_codeshield.py           # CodeShield scanner tests (Phase 3+5)
 │   ├── test_approval.py             # Approval flow + integration tests (Phase 3)
-│   └── test_hardening.py            # Phase 5 hardening regression tests
+│   ├── test_hardening.py            # Phase 5 hardening regression tests
+│   └── test_conversation.py         # Multi-turn conversation tracking tests (Phase 5+)
 ├── gateway/
 │   ├── Dockerfile                   # nginx:alpine + static files
 │   ├── nginx.conf                   # Static serving + /api proxy to controller
@@ -189,7 +193,7 @@ paho-mqtt>=2.1.0
 | **4** | Interfaces | Signal + WebUI integration, conversational approval |
 | **5** | Hardening | Llama Guard 4, red teaming, tuning, performance benchmarks |
 
-**Current status:** Phase 5 COMPLETE — Hardening deployed, CodeShield working, 315 tests passing
+**Current status:** Phase 5+ — Hardening deployed, CodeShield working, multi-turn conversation tracking, 365 tests passing
 
 > Signal integration planned but paused. Plan archived: `docs/archive/2026-02-12_phase4a-signal-mqtt-plan.md`.
 > CodeShield fix details: `docs/archive/2026-02-13_codeshield-fix.md`
@@ -227,18 +231,20 @@ paho-mqtt>=2.1.0
 | `GET` | `/validate/command?command=...` | 1 | Policy check for shell command |
 | `POST` | `/scan` | 2 | Run all scanners on text `{"text": "..."}` |
 | `POST` | `/process` | 2 | Full Qwen pipeline: scan → spotlight → Qwen → scan |
-| `POST` | `/task` | 3 | **Full CaMeL pipeline**: Claude plans → approve → Qwen executes → scanned |
+| `POST` | `/task` | 3 | **Full CaMeL pipeline**: Claude plans → approve → Qwen executes → scanned. Accepts optional `session_id` for conversation tracking |
 | `GET` | `/approval/{id}` | 3 | Check approval status (pending/approved/denied/expired) |
 | `POST` | `/approve/{id}` | 3 | Submit decision `{"granted": true/false, "reason": "..."}` |
+| `GET` | `/session/{id}` | 5+ | Debug: view session state, turn history, risk scores |
 
 ### CaMeL Task Flow (POST /task)
 
 ```
-User request → Prompt Guard scan → Claude plans → Approval gate
+User request → Conversation analysis (multi-turn check) → Prompt Guard scan
+  → Claude plans → Approval gate
   → For each step:
       llm_task: resolve vars → Qwen generates → CodeShield (all output) → output scan
       tool_call: resolve vars → policy check → execute → tag as TRUSTED
-  → TaskResult returned
+  → TaskResult returned (includes ConversationInfo)
 ```
 
 In `full` approval mode, `/task` returns `{"status": "awaiting_approval", "approval_id": "..."}`. Poll `/approval/{id}` then submit via `/approve/{id}`.

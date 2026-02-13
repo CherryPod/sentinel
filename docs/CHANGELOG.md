@@ -1,5 +1,51 @@
 # Changelog
 
+## Multi-Turn Conversation Tracking (2026-02-13)
+
+Deterministic multi-turn attack detection — closes the "Moltbook-style" memory poisoning gap identified during red teaming.
+
+### New: ConversationAnalyzer (6 heuristic rules)
+- **retry_after_block** — detects rephrased retries of previously blocked requests (SequenceMatcher similarity >0.6)
+- **escalation** — capability tier tracking (observe→read→write→execute→persist→exfiltrate), flags 2+ tier jumps or reaching persist/exfiltrate
+- **sensitive_topic_acceleration** — first mention of sensitive topics after N benign turns
+- **instruction_override** — "from now on", "ignore instructions", "jailbreak", DAN, role reassignment patterns
+- **violation_accumulation** — cumulative penalty (1.5/block) for prior security violations in session
+- **context_building** — context-reference phrases ("as I mentioned") combined with sensitive content or escalation language
+
+### New: SessionStore
+- In-memory session store with 1hr TTL, max 1000 sessions, thread-safe
+- Sessions track turns, cumulative risk, violation count, lock status
+- Locked sessions get immediate rejection on all subsequent requests
+- Ephemeral sessions for requests without `session_id` (backward compatible)
+
+### Scoring
+- Each rule scores 0.0–5.0 (capped). Single rule at max can only WARN, never BLOCK
+- Thresholds: <5.0 = ALLOW, 5.0–9.9 = WARN (process but flag), 10.0+ = BLOCK (refuse + lock session)
+- Risk accumulates within a session, never decreases (prevents gaming by alternating benign/malicious)
+- First message always returns ALLOW (no history; single-turn scanners still protect)
+
+### API Changes
+- `POST /task` now accepts optional `session_id` field — without it, each request gets an ephemeral session
+- `TaskResult` includes `conversation` field: session_id, turn_number, risk_score, action, warnings
+- `GET /session/{id}` debug endpoint — view session state and turn history
+- `/health` response includes `conversation_tracking` field
+
+### WebUI
+- Per-tab session ID via `crypto.randomUUID()` stored in `sessionStorage` (cleared on tab close)
+- Conversation warnings displayed in chat when returned by controller
+- Session reset on history clear (Shift+click)
+
+### Config
+- `SENTINEL_CONVERSATION_ENABLED=true` — kill switch to revert to fully stateless behavior
+- `SENTINEL_SESSION_TTL=3600`, `SENTINEL_SESSION_MAX_COUNT=1000`
+- `SENTINEL_CONVERSATION_WARN_THRESHOLD=5.0`, `SENTINEL_CONVERSATION_BLOCK_THRESHOLD=10.0`
+
+### Tests
+- 50 new tests: session store (8), retry_after_block (4), escalation (5), sensitive_topic_acceleration (4), instruction_override (6), violation_accumulation (4), context_building (4), combined scoring (5), false positive prevention (4), orchestrator integration (6)
+- **365 total tests passing** (315 existing + 50 new, zero regressions)
+
+---
+
 ## Phase 5 — Hardening + CodeShield Fix (2026-02-13)
 
 Security hardening based on red team findings, plus fixing CodeShield to actually work.

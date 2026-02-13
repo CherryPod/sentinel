@@ -9,9 +9,27 @@
     const statusText = document.getElementById('status-text');
 
     const STORAGE_KEY = 'sentinel-history';
+    const SESSION_KEY = 'sentinel-session-id';
     const POLL_INTERVAL = 2000;
 
     let isProcessing = false;
+
+    // --- Session ID (per-tab, cleared on tab close) ---
+
+    function getSessionId() {
+        let sid = sessionStorage.getItem(SESSION_KEY);
+        if (!sid) {
+            sid = crypto.randomUUID();
+            sessionStorage.setItem(SESSION_KEY, sid);
+        }
+        return sid;
+    }
+
+    function resetSessionId() {
+        const sid = crypto.randomUUID();
+        sessionStorage.setItem(SESSION_KEY, sid);
+        return sid;
+    }
 
     // --- localStorage history ---
 
@@ -186,8 +204,19 @@
         addStatusMessage('Sending task to planner...', statusId);
 
         try {
-            const data = await apiPost('task', { request: text, source: 'webui' });
+            const data = await apiPost('task', { request: text, source: 'webui', session_id: getSessionId() });
             removeElement(statusId);
+
+            // Display conversation warnings if present
+            if (data.conversation && data.conversation.warnings && data.conversation.warnings.length > 0) {
+                let warnHtml = '<div class="label">Security</div>';
+                warnHtml += '<div class="conversation-warnings">';
+                for (const w of data.conversation.warnings) {
+                    warnHtml += '<div class="conv-warning">\u26a0 ' + escapeHtml(w) + '</div>';
+                }
+                warnHtml += '</div>';
+                addMessage('system', warnHtml);
+            }
 
             if (data.status === 'awaiting_approval') {
                 // Extract approval ID from reason field
@@ -360,6 +389,7 @@
             if (confirm('Clear conversation history?')) {
                 localStorage.removeItem(STORAGE_KEY);
                 messagesEl.innerHTML = '';
+                resetSessionId();
             }
         }
     });

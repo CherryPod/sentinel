@@ -47,5 +47,12 @@ class Settings(BaseSettings):
     mqtt_topic_out: str = "sentinel/results"
     mqtt_topic_approval: str = "sentinel/approval"
 
+    # Conversation tracking (Phase 5)
+    session_ttl: int = 3600  # 1 hour
+    session_max_count: int = 1000
+    conversation_warn_threshold: float = 5.0
+    conversation_block_threshold: float = 10.0
+    conversation_enabled: bool = True
+
 
 settings = Settings()
