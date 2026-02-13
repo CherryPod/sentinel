@@ -47,6 +47,10 @@ class Settings(BaseSettings):
     mqtt_topic_out: str = "sentinel/results"
     mqtt_topic_approval: str = "sentinel/approval"
 
+    # PIN authentication
+    pin_required: bool = True
+    pin_file: str = "/run/secrets/sentinel_pin"
+
     # Conversation tracking (Phase 5)
     session_ttl: int = 3600  # 1 hour
     session_max_count: int = 1000

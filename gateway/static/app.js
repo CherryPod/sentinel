@@ -10,9 +10,24 @@
 
     const STORAGE_KEY = 'sentinel-history';
     const SESSION_KEY = 'sentinel-session-id';
+    const PIN_KEY = 'sentinel-pin';
     const POLL_INTERVAL = 2000;
 
     let isProcessing = false;
+
+    // --- PIN management (sessionStorage — cleared on tab close) ---
+
+    function getPin() {
+        return sessionStorage.getItem(PIN_KEY);
+    }
+
+    function setPin(pin) {
+        sessionStorage.setItem(PIN_KEY, pin);
+    }
+
+    function clearPin() {
+        sessionStorage.removeItem(PIN_KEY);
+    }
 
     // --- Session ID (per-tab, cleared on tab close) ---
 
@@ -158,16 +173,32 @@
     // --- API calls ---
 
     async function apiPost(path, body) {
+        const headers = { 'Content-Type': 'application/json' };
+        const pin = getPin();
+        if (pin) headers['X-Sentinel-Pin'] = pin;
         const resp = await fetch('/api/' + path, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: headers,
             body: JSON.stringify(body),
         });
+        if (resp.status === 401) {
+            clearPin();
+            showPinOverlay();
+            throw new Error('Authentication required');
+        }
         return resp.json();
     }
 
     async function apiGet(path) {
-        const resp = await fetch('/api/' + path);
+        const headers = {};
+        const pin = getPin();
+        if (pin) headers['X-Sentinel-Pin'] = pin;
+        const resp = await fetch('/api/' + path, { headers: headers });
+        if (resp.status === 401) {
+            clearPin();
+            showPinOverlay();
+            throw new Error('Authentication required');
+        }
         return resp.json();
     }
 
@@ -181,7 +212,12 @@
                 statusText.textContent = 'Controller online';
                 input.disabled = false;
                 sendBtn.disabled = false;
-                input.focus();
+                // If PIN auth is enabled and we don't have a PIN, show overlay
+                if (data.pin_auth_enabled && !getPin()) {
+                    showPinOverlay();
+                } else {
+                    input.focus();
+                }
             } else {
                 statusDot.className = 'status-dot error';
                 statusText.textContent = 'Controller unhealthy';
@@ -371,6 +407,50 @@
 
     function sleep(ms) {
         return new Promise(function (resolve) { setTimeout(resolve, ms); });
+    }
+
+    // --- PIN overlay ---
+
+    function showPinOverlay() {
+        // Don't create duplicate overlays
+        if (document.getElementById('pin-overlay')) return;
+
+        const overlay = document.createElement('div');
+        overlay.id = 'pin-overlay';
+        overlay.className = 'pin-overlay';
+
+        overlay.innerHTML =
+            '<div class="pin-dialog">' +
+            '<h2>Sentinel PIN</h2>' +
+            '<p>Enter your 4-digit PIN to continue</p>' +
+            '<input type="password" id="pin-input" maxlength="4" pattern="[0-9]{4}" inputmode="numeric" autocomplete="off" placeholder="----">' +
+            '<button class="btn btn-approve" id="pin-submit">Unlock</button>' +
+            '<div id="pin-error" class="pin-error"></div>' +
+            '</div>';
+
+        document.body.appendChild(overlay);
+
+        var pinInput = document.getElementById('pin-input');
+        var pinSubmit = document.getElementById('pin-submit');
+
+        function submitPin() {
+            var val = pinInput.value.trim();
+            if (val.length !== 4 || !/^\d{4}$/.test(val)) {
+                document.getElementById('pin-error').textContent = 'PIN must be exactly 4 digits';
+                return;
+            }
+            setPin(val);
+            overlay.remove();
+            // Re-run health check to verify PIN works
+            checkHealth();
+        }
+
+        pinSubmit.addEventListener('click', submitPin);
+        pinInput.addEventListener('keydown', function (e) {
+            if (e.key === 'Enter') submitPin();
+        });
+
+        pinInput.focus();
     }
 
     // --- Init ---

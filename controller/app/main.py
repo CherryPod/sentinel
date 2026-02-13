@@ -5,6 +5,7 @@ from fastapi import FastAPI, Query
 from pydantic import BaseModel
 
 from .approval import ApprovalManager
+from .auth import PinAuthMiddleware
 from .audit import setup_audit_logger
 from .config import settings
 from .conversation import ConversationAnalyzer
@@ -19,6 +20,7 @@ from .session import SessionStore
 from .tools import ToolExecutor
 
 # Module-level references populated at startup
+_pin: str | None = None
 _engine: PolicyEngine | None = None
 _cred_scanner: CredentialScanner | None = None
 _path_scanner: SensitivePathScanner | None = None
@@ -34,7 +36,7 @@ _audit = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _engine, _cred_scanner, _path_scanner, _cmd_scanner, _pipeline
+    global _pin, _engine, _cred_scanner, _path_scanner, _cmd_scanner, _pipeline
     global _prompt_guard_loaded, _codeshield_loaded, _session_store, _audit
 
     _audit = setup_audit_logger(
@@ -43,8 +45,24 @@ async def lifespan(app: FastAPI):
     )
     _audit.info("Starting sentinel-controller", extra={"event": "startup"})
 
+    # Load PIN for authentication
+    if settings.pin_required:
+        try:
+            with open(settings.pin_file) as f:
+                _pin = f.read().strip()
+            _audit.info("PIN auth enabled", extra={"event": "pin_loaded"})
+        except FileNotFoundError:
+            _pin = None
+            _audit.warning(
+                "PIN file not found, auth disabled",
+                extra={"event": "pin_missing", "path": settings.pin_file},
+            )
+    else:
+        _pin = None
+        _audit.info("PIN auth disabled by config", extra={"event": "pin_disabled"})
+
     policy_path = settings.policy_file
-    _engine = PolicyEngine(policy_path)
+    _engine = PolicyEngine(policy_path, workspace_path=settings.workspace_path)
     _audit.info(
         "Policy loaded",
         extra={"event": "policy_loaded", "path": policy_path},
@@ -134,6 +152,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Sentinel Controller", lifespan=lifespan)
+app.add_middleware(PinAuthMiddleware, pin_getter=lambda: _pin)
 
 
 @app.get("/health")
@@ -145,6 +164,7 @@ async def health():
         "codeshield_loaded": _codeshield_loaded,
         "planner_available": _planner_available,
         "conversation_tracking": settings.conversation_enabled,
+        "pin_auth_enabled": _pin is not None,
     }
 
 

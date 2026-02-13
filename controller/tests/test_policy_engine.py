@@ -325,3 +325,28 @@ class TestPathConstrainedCommands:
     def test_mkdir_outside_blocked(self, engine: PolicyEngine):
         r = engine.check_command("mkdir /tmp/escape")
         assert r.status == PolicyResult.BLOCKED
+
+    def test_cat_relative_traversal_blocked(self, engine: PolicyEngine):
+        """cat ../../../etc/passwd should resolve to /etc/passwd and be blocked."""
+        r = engine.check_command("cat ../../../etc/passwd")
+        assert r.status == PolicyResult.BLOCKED
+
+    def test_cat_relative_subdir_allowed(self, engine: PolicyEngine):
+        """cat subdir/file.txt resolves to /workspace/subdir/file.txt — allowed."""
+        r = engine.check_command("cat subdir/file.txt")
+        assert r.status == PolicyResult.ALLOWED
+
+    def test_find_relative_traversal_blocked(self, engine: PolicyEngine):
+        """find ../../etc -name shadow should be blocked."""
+        r = engine.check_command("find ../../etc -name shadow")
+        assert r.status == PolicyResult.BLOCKED
+
+    def test_cp_relative_file_allowed(self, engine: PolicyEngine):
+        """cp a.txt b.txt resolves within /workspace — allowed."""
+        r = engine.check_command("cp a.txt b.txt")
+        assert r.status == PolicyResult.ALLOWED
+
+    def test_cat_glob_pattern_skipped(self, engine: PolicyEngine):
+        """Glob patterns like *.py should be skipped, not resolved."""
+        r = engine.check_command("find /workspace -name '*.py'")
+        assert r.status == PolicyResult.ALLOWED

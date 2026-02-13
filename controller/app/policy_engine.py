@@ -1,4 +1,5 @@
 import fnmatch
+import os
 import re
 from pathlib import Path, PurePosixPath
 from urllib.parse import unquote
@@ -9,9 +10,11 @@ from .models import PolicyResult, ValidationResult
 
 
 class PolicyEngine:
-    def __init__(self, policy_path: str):
+    def __init__(self, policy_path: str, workspace_path: str = "/workspace"):
         with open(policy_path) as f:
             self._policy = yaml.safe_load(f)
+
+        self._workspace_path = workspace_path
 
         self._file_access = self._policy.get("file_access", {})
         self._commands = self._policy.get("commands", {})
@@ -251,13 +254,17 @@ class PolicyEngine:
         # For path-constrained commands, validate arguments against allowed paths
         if base in self._path_constrained:
             args = self._extract_command_args(stripped, base)
-            path_args = [
-                a for a in args
-                if not a.startswith("-")
-                and not a.startswith("'")
-                and not a.startswith('"')
-                and a.startswith("/")
-            ]
+            path_args = []
+            for a in args:
+                if a.startswith("-") or a.startswith("'") or a.startswith('"'):
+                    continue
+                if any(c in a for c in ("*", "?", "[")):
+                    continue  # skip glob patterns
+                if a.startswith("/"):
+                    path_args.append(a)
+                else:
+                    resolved = os.path.normpath(os.path.join(self._workspace_path, a))
+                    path_args.append(resolved)
             for path_arg in path_args:
                 result = self.check_file_read(path_arg)
                 if result.status == PolicyResult.BLOCKED:

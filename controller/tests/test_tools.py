@@ -135,6 +135,100 @@ class TestPodmanBuild:
             assert result.trust_level == TrustLevel.TRUSTED
             mock_run.assert_called_once()
 
+    @pytest.mark.asyncio
+    async def test_policy_string_matches_execution(self, executor):
+        """Policy check string must match the subprocess command."""
+        with patch("app.tools.subprocess.run") as mock_run, \
+             patch.object(executor._engine, "check_command", wraps=executor._engine.check_command) as spy:
+            mock_run.return_value = MagicMock(stdout="ok", returncode=0, stderr="")
+            await executor.execute("podman_build", {
+                "context_path": "/workspace/app", "tag": "myimg:latest",
+            })
+            policy_str = spy.call_args[0][0]
+            executed_cmd = mock_run.call_args[0][0]
+            import shlex
+            assert policy_str == shlex.join(executed_cmd)
+
+
+class TestPodmanRun:
+    @pytest.mark.asyncio
+    async def test_policy_string_matches_execution(self, executor):
+        """Policy check string must include -d flag (the actual execution flag)."""
+        with patch("app.tools.subprocess.run") as mock_run, \
+             patch.object(executor._engine, "check_command", wraps=executor._engine.check_command) as spy:
+            mock_run.return_value = MagicMock(stdout="ok", returncode=0, stderr="")
+            await executor.execute("podman_run", {
+                "image": "myimg:latest", "name": "mycontainer",
+            })
+            policy_str = spy.call_args[0][0]
+            executed_cmd = mock_run.call_args[0][0]
+            import shlex
+            assert policy_str == shlex.join(executed_cmd)
+            assert "-d" in policy_str
+
+
+class TestPodmanStop:
+    @pytest.mark.asyncio
+    async def test_policy_string_matches_execution(self, executor):
+        """Policy check string must match subprocess command for podman stop."""
+        with patch("app.tools.subprocess.run") as mock_run, \
+             patch.object(executor._engine, "check_command", wraps=executor._engine.check_command) as spy:
+            mock_run.return_value = MagicMock(stdout="ok", returncode=0, stderr="")
+            await executor.execute("podman_stop", {"container_name": "test-ctr"})
+            policy_str = spy.call_args[0][0]
+            executed_cmd = mock_run.call_args[0][0]
+            import shlex
+            assert policy_str == shlex.join(executed_cmd)
+
+
+class TestPodmanFlagDenyList:
+    @pytest.mark.asyncio
+    async def test_volume_flag_blocked(self, executor):
+        with pytest.raises(ToolBlockedError, match="Dangerous podman flag"):
+            # Simulate if tool interface were extended to pass extra args
+            executor._check_podman_flags(["podman", "run", "-v", "/host:/container", "img"])
+
+    @pytest.mark.asyncio
+    async def test_privileged_flag_blocked(self, executor):
+        with pytest.raises(ToolBlockedError, match="Dangerous podman flag"):
+            executor._check_podman_flags(["podman", "run", "--privileged", "img"])
+
+    @pytest.mark.asyncio
+    async def test_publish_flag_blocked(self, executor):
+        with pytest.raises(ToolBlockedError, match="Dangerous podman flag"):
+            executor._check_podman_flags(["podman", "run", "-p", "8080:80", "img"])
+
+    @pytest.mark.asyncio
+    async def test_network_host_blocked(self, executor):
+        with pytest.raises(ToolBlockedError, match="Dangerous podman flag"):
+            executor._check_podman_flags(["podman", "run", "--network=host", "img"])
+
+    @pytest.mark.asyncio
+    async def test_pid_host_blocked(self, executor):
+        with pytest.raises(ToolBlockedError, match="Dangerous podman flag"):
+            executor._check_podman_flags(["podman", "run", "--pid=host", "img"])
+
+    @pytest.mark.asyncio
+    async def test_cap_add_blocked(self, executor):
+        with pytest.raises(ToolBlockedError, match="Dangerous podman flag"):
+            executor._check_podman_flags(["podman", "run", "--cap-add=SYS_ADMIN", "img"])
+
+    @pytest.mark.asyncio
+    async def test_device_flag_blocked(self, executor):
+        with pytest.raises(ToolBlockedError, match="Dangerous podman flag"):
+            executor._check_podman_flags(["podman", "run", "--device=/dev/sda", "img"])
+
+    def test_safe_flags_pass(self, executor):
+        """Normal podman run/build/stop commands should pass flag check."""
+        executor._check_podman_flags(["podman", "run", "--name", "test", "-d", "img:latest"])
+        executor._check_podman_flags(["podman", "build", "/workspace/app", "-t", "img:latest"])
+        executor._check_podman_flags(["podman", "stop", "test"])
+
+    @pytest.mark.asyncio
+    async def test_volume_equals_syntax_blocked(self, executor):
+        with pytest.raises(ToolBlockedError, match="Dangerous podman flag"):
+            executor._check_podman_flags(["podman", "run", "--volume=/host:/ctr", "img"])
+
 
 class TestUnknownTool:
     @pytest.mark.asyncio

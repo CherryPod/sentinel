@@ -18,7 +18,7 @@ if not _POLICY_PATH.exists():
 @pytest.fixture
 def engine() -> PolicyEngine:
     """PolicyEngine loaded with the real sentinel-policy.yaml."""
-    return PolicyEngine(str(_POLICY_PATH))
+    return PolicyEngine(str(_POLICY_PATH), workspace_path="/workspace")
 
 
 @pytest.fixture

@@ -9,6 +9,15 @@ from .provenance import create_tagged_data
 
 logger = logging.getLogger("sentinel.audit")
 
+# Podman flags that must never be passed, even if the tool interface is extended
+_DANGEROUS_PODMAN_FLAG_NAMES = frozenset({
+    "-v", "--volume", "-p", "--publish", "--privileged",
+    "--cap-add", "--security-opt", "--device",
+})
+_DANGEROUS_PODMAN_FLAG_VALUES = frozenset({
+    "--pid=host", "--network=host", "--userns=host", "--ipc=host",
+})
+
 
 class ToolError(Exception):
     """Error during tool execution."""
@@ -62,6 +71,17 @@ class ToolExecutor:
                 "args": {"container_name": "string"},
             },
         ]
+
+    def _check_podman_flags(self, cmd: list[str]) -> None:
+        """Reject dangerous podman flags before policy check."""
+        for arg in cmd:
+            # Check exact flag names (e.g. -v, --volume)
+            flag_name = arg.split("=", 1)[0] if "=" in arg else arg
+            if flag_name in _DANGEROUS_PODMAN_FLAG_NAMES:
+                raise ToolBlockedError(f"Dangerous podman flag blocked: {arg}")
+            # Check full flag=value entries (e.g. --network=host)
+            if arg in _DANGEROUS_PODMAN_FLAG_VALUES:
+                raise ToolBlockedError(f"Dangerous podman flag blocked: {arg}")
 
     async def execute(self, tool_name: str, args: dict) -> TaggedData:
         """Execute a tool by name with policy checks."""
@@ -190,14 +210,15 @@ class ToolExecutor:
         context_path = args.get("context_path", "")
         tag = args.get("tag", "")
 
-        command = f"podman build {context_path} -t {tag}"
-        result = self._engine.check_command(command)
+        cmd = ["podman", "build", context_path, "-t", tag]
+        self._check_podman_flags(cmd)
+        result = self._engine.check_command(shlex.join(cmd))
         if result.status != PolicyResult.ALLOWED:
             raise ToolBlockedError(f"podman_build blocked: {result.reason}")
 
         try:
             proc = subprocess.run(
-                ["podman", "build", context_path, "-t", tag],
+                cmd,
                 capture_output=True,
                 text=True,
                 timeout=300,
@@ -222,13 +243,13 @@ class ToolExecutor:
         image = args.get("image", "")
         name = args.get("name", "")
 
-        command = f"podman run --name {name} {image}"
-        result = self._engine.check_command(command)
+        cmd = ["podman", "run", "--name", name, "-d", image]
+        self._check_podman_flags(cmd)
+        result = self._engine.check_command(shlex.join(cmd))
         if result.status != PolicyResult.ALLOWED:
             raise ToolBlockedError(f"podman_run blocked: {result.reason}")
 
         try:
-            cmd = ["podman", "run", "--name", name, "-d", image]
             proc = subprocess.run(
                 cmd,
                 capture_output=True,
@@ -254,14 +275,15 @@ class ToolExecutor:
     async def _podman_stop(self, args: dict) -> TaggedData:
         container_name = args.get("container_name", "")
 
-        command = f"podman stop {container_name}"
-        result = self._engine.check_command(command)
+        cmd = ["podman", "stop", container_name]
+        self._check_podman_flags(cmd)
+        result = self._engine.check_command(shlex.join(cmd))
         if result.status != PolicyResult.ALLOWED:
             raise ToolBlockedError(f"podman_stop blocked: {result.reason}")
 
         try:
             proc = subprocess.run(
-                ["podman", "stop", container_name],
+                cmd,
                 capture_output=True,
                 text=True,
                 timeout=30,

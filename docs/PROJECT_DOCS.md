@@ -40,7 +40,8 @@
 - Topics: `sentinel/tasks`, `sentinel/results`, `sentinel/approval`
 - Volumes: `sentinel-workspace:/workspace`, `./policies:/policies:ro`, `sentinel-logs:/logs`
 - Podman socket: `/run/podman/podman.sock:ro`
-- Secrets: `claude_api_key` via Podman secrets (from `~/.secrets/`)
+- Secrets: `claude_api_key`, `sentinel_pin` via Podman secrets (from `~/.secrets/`)
+- PIN auth: `SENTINEL_PIN_REQUIRED=true`, PIN file at `/run/secrets/sentinel_pin`
 
 **sentinel-ui:**
 - Image: nginx:alpine, static files + reverse proxy
@@ -60,18 +61,19 @@
 
 ---
 
-## Security Layers (8 total)
+## Security Layers (9 total)
 
 | # | Layer | Type | What It Catches | Phase |
 |---|-------|------|-----------------|-------|
-| 1 | **Policy Engine** | Deterministic YAML | File paths, commands, credentials, network — cannot be bypassed by prompt injection | 1 |
-| 2 | **Spotlighting** | String manipulation | Prompt injection (~50% -> <3% success rate) — zero compute cost | 2 |
-| 3 | **Prompt Guard 2** | 86M BERT classifier (CPU) | Injection detection (~67% catch rate) — 512 token window | 2 |
-| 4 | **Llama Guard 4** | 12B content safety model | Harmful content (violence, hate, weapons) — GPU or CPU | 5 (skipped) |
-| 5 | **CodeShield** | Semgrep static analysis (codeshield pkg) | Malicious code patterns (os.system, eval, SQL injection, traversal, shells, weak crypto) — scans ALL Qwen output | 3+5 |
-| 6 | **CommandPatternScanner** | Regex patterns | Dangerous shell patterns in prose (pipe-to-shell, reverse shells, nohup, base64 decode+exec) | 5 |
-| 7 | **ConversationAnalyzer** | Multi-turn heuristics | Memory poisoning, retry-after-block, capability escalation, instruction override, context building — 6 rules, additive scoring | 5+ |
-| 8 | **CaMeL Provenance** | Data tagging | Untrusted data reaching dangerous destinations — architectural guarantee | 1 |
+| 1 | **PIN Authentication** | ASGI middleware | Unauthenticated API access — `X-Sentinel-Pin` header, `/health` exempt | 5+ |
+| 2 | **Policy Engine** | Deterministic YAML | File paths, commands, credentials, network — cannot be bypassed by prompt injection. Includes relative path resolution and podman flag deny-list | 1+5+ |
+| 3 | **Spotlighting** | String manipulation | Prompt injection (~50% -> <3% success rate) — zero compute cost | 2 |
+| 4 | **Prompt Guard 2** | 86M BERT classifier (CPU) | Injection detection (~67% catch rate) — 512 token window | 2 |
+| 5 | **Llama Guard 4** | 12B content safety model | Harmful content (violence, hate, weapons) — GPU or CPU | 5 (skipped) |
+| 6 | **CodeShield** | Semgrep static analysis (codeshield pkg) | Malicious code patterns (os.system, eval, SQL injection, traversal, shells, weak crypto) — scans ALL Qwen output | 3+5 |
+| 7 | **CommandPatternScanner** | Regex patterns | Dangerous shell patterns in prose (pipe-to-shell, reverse shells, nohup, base64 decode+exec) | 5 |
+| 8 | **ConversationAnalyzer** | Multi-turn heuristics | Memory poisoning, retry-after-block, capability escalation, instruction override, context building — 6 rules, additive scoring | 5+ |
+| 9 | **CaMeL Provenance** | Data tagging | Untrusted data reaching dangerous destinations — architectural guarantee | 1 |
 
 ---
 
@@ -115,6 +117,7 @@ Every data item tagged with:
 │   ├── requirements.txt
 │   └── app/
 │       ├── main.py                  # FastAPI entry, all endpoints (see API Endpoints below)
+│       ├── auth.py                  # PIN authentication middleware (Phase 5+)
 │       ├── config.py                # Environment config (pydantic-settings)
 │       ├── policy_engine.py         # YAML policy loader + path/command validators
 │       ├── scanner.py               # Credential + sensitive path regex scanners
@@ -148,7 +151,8 @@ Every data item tagged with:
 │   ├── test_codeshield.py           # CodeShield scanner tests (Phase 3+5)
 │   ├── test_approval.py             # Approval flow + integration tests (Phase 3)
 │   ├── test_hardening.py            # Phase 5 hardening regression tests
-│   └── test_conversation.py         # Multi-turn conversation tracking tests (Phase 5+)
+│   ├── test_conversation.py         # Multi-turn conversation tracking tests (Phase 5+)
+│   └── test_pin_auth.py             # PIN authentication middleware tests (Phase 5+)
 ├── gateway/
 │   ├── Dockerfile                   # nginx:alpine + static files
 │   ├── nginx.conf                   # Static serving + /api proxy to controller
@@ -193,7 +197,7 @@ paho-mqtt>=2.1.0
 | **4** | Interfaces | Signal + WebUI integration, conversational approval |
 | **5** | Hardening | Llama Guard 4, red teaming, tuning, performance benchmarks |
 
-**Current status:** Phase 5+ — Hardening deployed, CodeShield working, multi-turn conversation tracking, 365 tests passing
+**Current status:** Phase 5+ — Hardening deployed, CodeShield working, multi-turn conversation tracking, PIN auth, code review fixes, 395 tests passing
 
 > Signal integration planned but paused. Plan archived: `docs/archive/2026-02-12_phase4a-signal-mqtt-plan.md`.
 > CodeShield fix details: `docs/archive/2026-02-13_codeshield-fix.md`
@@ -226,7 +230,7 @@ paho-mqtt>=2.1.0
 
 | Method | Path | Phase | Purpose |
 |--------|------|-------|---------|
-| `GET` | `/health` | 1 | Status check — policy, Prompt Guard, CodeShield, planner availability |
+| `GET` | `/health` | 1 | Status check — policy, Prompt Guard, CodeShield, planner, PIN auth. **Exempt from PIN auth** |
 | `GET` | `/validate/path?path=...&operation=read` | 1 | Policy check for file path |
 | `GET` | `/validate/command?command=...` | 1 | Policy check for shell command |
 | `POST` | `/scan` | 2 | Run all scanners on text `{"text": "..."}` |
@@ -270,18 +274,22 @@ curl http://localhost:3001/api/health
 # Open http://thebeast:3001 in browser
 
 # Full CaMeL pipeline (Phase 3) — returns approval_id in full mode
+# Note: all endpoints except /health require X-Sentinel-Pin header when PIN auth is enabled
 curl -X POST http://localhost:8000/task -H 'Content-Type: application/json' \
+  -H 'X-Sentinel-Pin: <your-pin>' \
   -d '{"request": "Write me a hello world page in HTML"}'
 
 # Check approval status
-curl http://localhost:8000/approval/<approval_id>
+curl -H 'X-Sentinel-Pin: <your-pin>' http://localhost:8000/approval/<approval_id>
 
 # Approve and execute
 curl -X POST http://localhost:8000/approve/<approval_id> \
-  -H 'Content-Type: application/json' -d '{"granted": true, "reason": "Looks good"}'
+  -H 'Content-Type: application/json' -H 'X-Sentinel-Pin: <your-pin>' \
+  -d '{"granted": true, "reason": "Looks good"}'
 
 # Scan text (Phase 2)
 curl -X POST http://localhost:8000/scan -H 'Content-Type: application/json' \
+  -H 'X-Sentinel-Pin: <your-pin>' \
   -d '{"text": "check this text for problems"}'
 
 # Process via Qwen pipeline (Phase 2)

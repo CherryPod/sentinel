@@ -13,6 +13,8 @@ services:
       - SENTINEL_LOG_DIR=/logs
       - SENTINEL_LOG_LEVEL=INFO
       - SENTINEL_APPROVAL_MODE=full
+      - SENTINEL_PIN_REQUIRED=true
+      - SENTINEL_PIN_FILE=/run/secrets/sentinel_pin
       - SENTINEL_OLLAMA_URL=http://sentinel-qwen:11434
       - SENTINEL_OLLAMA_MODEL=qwen3:14b
     volumes:
@@ -21,6 +23,7 @@ services:
       - sentinel-logs:/logs
     secrets:
       - claude_api_key
+      - sentinel_pin
     ports:
       - "8000:8000"
     restart: always
@@ -66,6 +69,8 @@ networks:
 secrets:
   claude_api_key:
     file: /home/kifterz/.secrets/claude_api_key.txt
+  sentinel_pin:
+    file: /home/kifterz/.secrets/sentinel_pin.txt
 
 volumes:
   sentinel-workspace:

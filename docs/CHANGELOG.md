@@ -1,5 +1,79 @@
 # Changelog
 
+## Code Review Fixes (2026-02-13)
+
+Addressed 5 of 12 remaining code review issues (from `docs/archive/2026-02-12_code-review.md`). Items #2, #3, #10 were fixed in Phase 5. Items #6, #8, #11-15 deferred (low risk for LAN+Tailscale threat model).
+
+### Fix #7 — hex_secret_64 credential pattern refined
+- Pattern now requires keyword prefix (`key=`, `secret:`, `TOKEN `, `password `, etc.) before 64-char hex string
+- Prevents false positives on SHA-256 hashes, git digests, Docker image IDs
+- Case-insensitive matching via `(?i)` inline flag
+
+### Fix #9 — Podman policy check mismatch
+- All three podman methods (`_podman_build`, `_podman_run`, `_podman_stop`) now build `cmd` list first, derive policy string via `shlex.join(cmd)`
+- Previously `_podman_run` validated `"podman run --name {name} {image}"` but executed with `-d` flag — policy checked a different command than what ran
+
+### Fix #5 — Podman flag deny-list
+- Added `_DANGEROUS_PODMAN_FLAG_NAMES` and `_DANGEROUS_PODMAN_FLAG_VALUES` constants to `tools.py`
+- `_check_podman_flags()` method rejects `-v`, `--volume`, `-p`, `--publish`, `--privileged`, `--cap-add`, `--security-opt`, `--device`, `--network=host`, `--pid=host`, `--userns=host`, `--ipc=host`
+- Called before policy check in all podman methods
+
+### Fix #4 — Relative path resolution
+- `PolicyEngine.__init__` now accepts `workspace_path` (default `/workspace`)
+- Path-constrained commands resolve relative args via `os.path.normpath(os.path.join(workspace_path, arg))`
+- `cat ../../../etc/passwd` now correctly resolves to `/etc/passwd` and is blocked
+- Glob patterns (`*`, `?`, `[`) are skipped during resolution
+
+### Fix #1 — PIN authentication
+- New `PinAuthMiddleware` (ASGI middleware) — checks `X-Sentinel-Pin` header on all requests except `/health`
+- PIN loaded from Podman secret (`/run/secrets/sentinel_pin`) at startup
+- Returns 401 JSON response on missing/wrong PIN; passes through when PIN is None (disabled)
+- Config: `SENTINEL_PIN_REQUIRED=true`, `SENTINEL_PIN_FILE=/run/secrets/sentinel_pin`
+- `/health` now includes `pin_auth_enabled` field
+- WebUI: PIN stored in `sessionStorage` (cleared on tab close), injected as header on all API calls
+- WebUI: PIN overlay shown on first load when auth enabled, re-shown on 401 response
+- `podman-compose.yaml`: `sentinel_pin` secret added (`~/.secrets/sentinel_pin.txt`)
+- Disableable: set `SENTINEL_PIN_REQUIRED=false`
+
+### New Files
+- `controller/app/auth.py` — PinAuthMiddleware
+- `controller/tests/test_pin_auth.py` — 9 tests (health exempt, 401 without/wrong PIN, correct PIN, disabled mode)
+
+### Modified Files
+- `policies/sentinel-policy.yaml` — hex_secret_64 pattern
+- `controller/app/tools.py` — shlex.join, flag deny-list, _check_podman_flags
+- `controller/app/policy_engine.py` — workspace_path param, relative path resolution
+- `controller/app/config.py` — pin_required, pin_file settings
+- `controller/app/main.py` — PIN loading, middleware, health field
+- `controller/tests/conftest.py` — engine fixture passes workspace_path
+- `controller/tests/test_scanner.py` — hex_secret_64 tests updated
+- `controller/tests/test_tools.py` — policy match + flag deny-list tests
+- `controller/tests/test_policy_engine.py` — relative path tests
+- `gateway/static/app.js` — PIN management, header injection, overlay
+- `gateway/static/style.css` — PIN overlay styles
+- `podman-compose.yaml` — sentinel_pin secret + env vars
+
+### Tests
+- 30 new tests (5 scanner, 6 tools policy match, 9 flag deny-list, 5 policy engine paths, 9 PIN auth — some overlap in counting with test classes)
+- **395 total tests passing** (365 existing + 30 new, zero regressions)
+
+### Code Review Status
+| Issue | Status |
+|-------|--------|
+| #1 — No API authentication | **Fixed** (PIN auth) |
+| #2 — CodeShield not initialized | Fixed in Phase 5 |
+| #3 — Tool executor trust checks | Fixed in Phase 5 |
+| #4 — Relative path resolution | **Fixed** |
+| #5 — Podman flag deny-list | **Fixed** |
+| #6 — CSRF protection | Deferred (PIN auth mitigates) |
+| #7 — hex_secret_64 too broad | **Fixed** |
+| #8 — Approval ID in reason field | Deferred (works, cosmetic) |
+| #9 — Podman policy check mismatch | **Fixed** |
+| #10 — ToolExecutor not wired | Fixed in Phase 5 |
+| #11-15 — Design observations | Deferred (low risk) |
+
+---
+
 ## Multi-Turn Conversation Tracking (2026-02-13)
 
 Deterministic multi-turn attack detection — closes the "Moltbook-style" memory poisoning gap identified during red teaming.

@@ -58,9 +58,21 @@ class TestCredentialScannerDetection:
         assert r.found is True
         assert r.matches[0].pattern_name == "jwt_token"
 
-    def test_hex_64_chars(self, cred_scanner: CredentialScanner):
+    def test_hex_64_with_secret_prefix(self, cred_scanner: CredentialScanner):
         hex_str = "a" * 64
         r = cred_scanner.scan(f"secret: {hex_str}")
+        assert r.found is True
+        assert r.matches[0].pattern_name == "hex_secret_64"
+
+    def test_hex_64_with_api_key_prefix(self, cred_scanner: CredentialScanner):
+        hex_str = "ab0123456789" * 5 + "abcd"  # 64 hex chars
+        r = cred_scanner.scan(f"api_key={hex_str}")
+        assert r.found is True
+        assert r.matches[0].pattern_name == "hex_secret_64"
+
+    def test_hex_64_with_token_prefix_case_insensitive(self, cred_scanner: CredentialScanner):
+        hex_str = "f" * 64
+        r = cred_scanner.scan(f"TOKEN: {hex_str}")
         assert r.found is True
         assert r.matches[0].pattern_name == "hex_secret_64"
 
@@ -87,6 +99,17 @@ class TestCredentialScannerDetection:
 class TestCredentialScannerClean:
     def test_normal_text_clean(self, cred_scanner: CredentialScanner):
         r = cred_scanner.scan("Here is your portfolio website HTML code")
+        assert r.found is False
+
+    def test_sha256_hash_no_prefix_clean(self, cred_scanner: CredentialScanner):
+        """Bare SHA-256 hash without secret-like prefix should not match."""
+        sha = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        r = cred_scanner.scan(f"File hash: {sha}")
+        assert r.found is False
+
+    def test_git_commit_hash_clean(self, cred_scanner: CredentialScanner):
+        """Git commit-like 64-char hex without keyword prefix should not match."""
+        r = cred_scanner.scan("Digest: " + "a1b2c3d4" * 8)
         assert r.found is False
 
     def test_short_hex_clean(self, cred_scanner: CredentialScanner):
