@@ -18,6 +18,11 @@ RUN --mount=type=secret,id=hf_token \
     HF_TOKEN=$(cat /run/secrets/hf_token) \
     python -c "from transformers import pipeline; pipeline('text-classification', model='meta-llama/Llama-Prompt-Guard-2-86M')"
 
+# Pre-create semgrep symlink at build time (semgrep tries to create this at
+# runtime via os.symlink, which fails on read-only filesystem)
+RUN ln -sf /usr/local/lib/python3.12/site-packages/semgrep/bin/semgrep-core \
+        /usr/local/lib/python3.12/site-packages/semgrep/bin/osemgrep
+
 COPY app/ ./app/
 COPY tests/ ./tests/
 

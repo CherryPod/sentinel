@@ -148,11 +148,25 @@
         }
 
         html += '<div class="approval-buttons" id="approval-' + approvalId + '">';
-        html += '<button class="btn btn-approve" onclick="handleApproval(\'' + approvalId + '\', true)">Approve</button>';
-        html += '<button class="btn btn-deny" onclick="handleApproval(\'' + approvalId + '\', false)">Deny</button>';
+        html += '<button class="btn btn-approve" data-approval-id="' + approvalId + '" data-granted="true">Approve</button>';
+        html += '<button class="btn btn-deny" data-approval-id="' + approvalId + '" data-granted="false">Deny</button>';
         html += '</div>';
 
         addMessage('system', html);
+
+        // Bind click handlers (CSP blocks inline onclick)
+        var container = document.getElementById('approval-' + approvalId);
+        console.log('[Sentinel] Binding approval buttons, container found:', !!container, 'approvalId:', approvalId);
+        if (container) {
+            var buttons = container.querySelectorAll('button');
+            console.log('[Sentinel] Found', buttons.length, 'buttons to bind');
+            buttons.forEach(function (btn) {
+                btn.addEventListener('click', function () {
+                    console.log('[Sentinel] Button clicked:', btn.getAttribute('data-granted'));
+                    handleApproval(btn.getAttribute('data-approval-id'), btn.getAttribute('data-granted') === 'true');
+                });
+            });
+        }
         appendToHistory({ role: 'plan', planSummary: planSummary, steps: steps, approvalId: approvalId });
     }
 
@@ -319,10 +333,11 @@
         }
     }
 
-    // Exposed globally for onclick handlers
+    // Approval handler
     window.handleApproval = async function (approvalId, granted) {
+        console.log('[Sentinel] handleApproval called:', approvalId, granted);
         const btnContainer = document.getElementById('approval-' + approvalId);
-        if (!btnContainer) return;
+        if (!btnContainer) { console.log('[Sentinel] btnContainer not found for:', approvalId); return; }
 
         // Disable buttons immediately
         const buttons = btnContainer.querySelectorAll('button');
