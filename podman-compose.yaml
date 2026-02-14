@@ -21,7 +21,7 @@ services:
     volumes:
       - ./policies:/policies:ro
       - sentinel-workspace:/workspace
-      - sentinel-logs:/logs
+      - ./logs:/logs
     secrets:
       - claude_api_key
       - sentinel_pin
@@ -30,9 +30,24 @@ services:
     restart: always
     depends_on:
       - sentinel-qwen
+    # Resource limits (#23)
+    mem_limit: 4G
+    mem_reservation: 1G
+    cpus: 4.0
+    # Read-only filesystem (#24)
+    read_only: true
+    tmpfs:
+      - /tmp:size=100M,noexec
+    # Health check (#30)
+    healthcheck:
+      test: ["CMD-SHELL", "python -c 'import urllib.request; urllib.request.urlopen(\"http://localhost:8000/health\")'"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
 
   sentinel-qwen:
-    image: docker.io/ollama/ollama:latest
+    image: docker.io/ollama/ollama@sha256:44893537fcc6f100b70ceb7f5c9fd8f787ba58f9f8ce73bf4a48a5b05fd8c422
     container_name: sentinel-qwen
     networks:
       - sentinel_internal
@@ -44,6 +59,16 @@ services:
     devices:
       - nvidia.com/gpu=all
     restart: always
+    # Resource limits (#23)
+    mem_limit: 14G
+    cpus: 4.0
+    # Health check (#30)
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'echo -e \"GET /api/tags HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n\" > /dev/tcp/localhost/11434'"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
 
   sentinel-ui:
     build:
@@ -52,10 +77,27 @@ services:
     networks:
       - sentinel_egress
     ports:
-      - "3001:8080"
+      - "3001:8443"
+      - "3002:8080"
     restart: unless-stopped
     depends_on:
       - sentinel-controller
+    # Resource limits (#23)
+    mem_limit: 128M
+    cpus: 1.0
+    # Read-only filesystem (#24)
+    read_only: true
+    tmpfs:
+      - /tmp:size=10M
+      - /var/cache/nginx:size=50M
+      - /run:size=10M
+    # Health check (#30)
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "--no-check-certificate", "https://localhost:8443/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
 
 networks:
   sentinel_internal:
@@ -75,5 +117,4 @@ secrets:
 
 volumes:
   sentinel-workspace:
-  sentinel-logs:
   sentinel-ollama-data:

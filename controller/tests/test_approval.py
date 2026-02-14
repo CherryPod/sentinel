@@ -169,7 +169,7 @@ class TestApprovalWithOrchestrator:
         # Step 1: Submit task in full approval mode
         result = await orch.handle_task("Build something", approval_mode="full")
         assert result.status == "awaiting_approval"
-        approval_id = result.reason.split(":")[-1]
+        approval_id = result.approval_id
 
         # Step 2: Check status — should be pending
         status = approval_mgr.check_approval(approval_id)
@@ -201,7 +201,7 @@ class TestApprovalWithOrchestrator:
         )
 
         result = await orch.handle_task("Build something", approval_mode="full")
-        approval_id = result.reason.split(":")[-1]
+        approval_id = result.approval_id
 
         approval_mgr.submit_approval(approval_id, granted=False, reason="Nope")
 

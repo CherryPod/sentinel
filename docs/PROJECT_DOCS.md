@@ -23,8 +23,8 @@
 | Container | Image | Networks | Purpose |
 |-----------|-------|----------|---------|
 | `sentinel-controller` | Custom (Python 3.12/FastAPI) | sentinel_internal + sentinel_egress | Security gateway, orchestrator, policy engine |
-| `sentinel-qwen` | `ollama/ollama:latest` | sentinel_internal ONLY | Air-gapped LLM worker (Qwen 3 14B Q4_K_M) |
-| `sentinel-ui` | nginx:alpine | sentinel_egress | WebUI chat interface on port 3001 |
+| `sentinel-qwen` | `ollama/ollama` (pinned digest) | sentinel_internal ONLY | Air-gapped LLM worker (Qwen 3 14B Q4_K_M) |
+| `sentinel-ui` | nginx (pinned digest) | sentinel_egress | WebUI chat interface — HTTPS on port 3001 |
 
 ### Container Config
 
@@ -33,22 +33,29 @@
 - Volume: `sentinel-ollama-data:/root/.ollama`
 - `OLLAMA_KEEP_ALIVE=5m` (release GPU after idle)
 - No host ports, no internet
+- Resources: 14GB RAM / 4 CPU, health checked (bash TCP to 11434)
+- Image pinned to sha256 digest
 
 **sentinel-controller:**
 - Ollama: `http://sentinel-qwen:11434`, model `qwen3:14b`
 - MQTT: `host.containers.internal:1883` (existing mosquitto)
 - Topics: `sentinel/tasks`, `sentinel/results`, `sentinel/approval`
-- Volumes: `sentinel-workspace:/workspace`, `./policies:/policies:ro`, `sentinel-logs:/logs`
-- Podman socket: `/run/podman/podman.sock:ro`
+- Volumes: `sentinel-workspace:/workspace`, `./policies:/policies:ro`, `./logs:/logs` (host bind mount)
 - Secrets: `claude_api_key`, `sentinel_pin` via Podman secrets (from `~/.secrets/`)
 - PIN auth: `SENTINEL_PIN_REQUIRED=true`, PIN file at `/run/secrets/sentinel_pin`
+- Resources: 4GB RAM (1GB reserved) / 4 CPU, read-only FS, health checked (python urllib to /health)
+- CSRF protection: origin header validation (allowed origins configurable)
+- Request size limit: 1MB (nginx + FastAPI middleware)
 
 **sentinel-ui:**
-- Image: nginx:alpine, static files + reverse proxy
-- Port: `3001:8080` (avoids conflict with existing Open WebUI on 3000)
+- Image: nginx (pinned digest), static files + reverse proxy
+- Port: `3001:8443` (HTTPS), `3002:8080` (HTTP redirect)
+- TLS: self-signed cert generated at build time
 - Proxies `/api/*` to `http://sentinel-controller:8000/` (strips `/api` prefix)
 - 300s proxy read timeout (LLM calls take time)
 - Network: `sentinel_egress` only (needs to reach controller)
+- Resources: 128MB RAM / 1 CPU, read-only FS (tmpfs for nginx cache/PID), health checked
+- Security headers: CSP, HSTS, X-Frame-Options DENY, nosniff, XSS-Protection, Referrer-Policy
 
 ---
 
@@ -202,7 +209,7 @@ paho-mqtt>=2.1.0
 | **4** | Interfaces | Signal + WebUI integration, conversational approval |
 | **5** | Hardening | Llama Guard 4, red teaming, tuning, performance benchmarks |
 
-**Current status:** Phase 5+ — Hardening deployed, CodeShield working, multi-turn conversation tracking, PIN auth, code review fixes, comprehensive logging, adversarial stress test (741 requests) running overnight. 395 tests passing
+**Current status:** Phase 5+ — All 4 tiers complete, all 15 code review issues closed. Infrastructure hardened (TLS, CSP, CSRF, resource limits, read-only FS, pinned images, health checks). 415 tests passing
 
 > Signal integration planned but paused. Plan archived: `docs/archive/2026-02-12_phase4a-signal-mqtt-plan.md`.
 > CodeShield fix details: `docs/archive/2026-02-13_codeshield-fix.md`
@@ -272,11 +279,11 @@ podman exec sentinel-controller pytest /app/tests/ -v
 # Health check (direct)
 curl http://localhost:8000/health
 
-# Health check (via WebUI proxy)
-curl http://localhost:3001/api/health
+# Health check (via WebUI proxy — HTTPS, self-signed)
+curl -k https://localhost:3001/api/health
 
-# WebUI
-# Open http://thebeast:3001 in browser
+# WebUI (HTTPS — accept self-signed cert warning in browser)
+# Open https://thebeast:3001 in browser
 
 # Full CaMeL pipeline (Phase 3) — returns approval_id in full mode
 # Note: all endpoints except /health require X-Sentinel-Pin header when PIN auth is enabled

@@ -97,4 +97,5 @@ class TaskResult(BaseModel):
     plan_summary: str = ""
     step_results: list[StepResult] = Field(default_factory=list)
     reason: str = ""
+    approval_id: str = ""
     conversation: ConversationInfo | None = None

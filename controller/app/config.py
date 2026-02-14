@@ -62,5 +62,11 @@ class Settings(BaseSettings):
     conversation_block_threshold: float = 5.0
     conversation_enabled: bool = True
 
+    # CSRF protection (Tier 4) — comma-separated list of allowed origins
+    allowed_origins: str = "https://localhost:3001,https://localhost:3002,https://thebeast:3001,https://thebeast:3002"
+
+    # Request size limit (Tier 4, code review #13) — 1MB
+    max_request_bytes: int = 1_048_576
+
 
 settings = Settings()

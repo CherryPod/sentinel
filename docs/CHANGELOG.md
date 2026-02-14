@@ -1,5 +1,89 @@
 # Changelog
 
+## Tier 4 — Infrastructure Hardening + Code Review Closure (2026-02-14)
+
+Hardened the infrastructure layer (containers, networking, supply chain) and closed all 5 remaining code review issues. All 15 original code review issues are now resolved.
+
+### Infrastructure Hardening (8 items)
+
+**#23 — Container Resource Limits** (`podman-compose.yaml`)
+- Controller: 4GB RAM (1GB reserved), 4 CPU
+- Qwen: 14GB RAM, 4 CPU
+- UI: 128MB RAM, 1 CPU
+- Uses `mem_limit`/`cpus`/`mem_reservation` (podman-compose 1.0.6 doesn't support `deploy.resources`)
+
+**#24 — Read-Only Filesystem** (`podman-compose.yaml`)
+- Controller: `read_only: true`, tmpfs for `/tmp` (100M, noexec)
+- UI: `read_only: true`, tmpfs for `/tmp` (10M), `/var/cache/nginx` (50M), `/run` (10M)
+- Qwen: skipped (Ollama needs writable model storage)
+
+**#25 — Pinned Base Image Digests** (`controller/Dockerfile`, `gateway/Dockerfile`, `podman-compose.yaml`)
+- `python:3.12-slim` → `python@sha256:9e01bf1a...`
+- `nginx:alpine` → `nginx@sha256:5878d06a...`
+- `ollama/ollama:latest` → `ollama/ollama@sha256:44893537...`
+
+**#26 — TLS** (`gateway/Dockerfile`, `gateway/nginx.conf`, `podman-compose.yaml`)
+- Self-signed cert generated at build time (openssl req -x509)
+- HTTPS on port 8443 (mapped to host 3001)
+- HTTP on port 8080 (mapped to host 3002) redirects to HTTPS
+- Plain HTTP to HTTPS port returns 301 redirect (not 400 error)
+
+**#27 — CSRF Protection** (`controller/app/main.py`, `controller/app/config.py`)
+- Origin header validation middleware on all state-changing requests (POST/PUT/DELETE/PATCH)
+- Non-browser clients (no Origin header) pass through — CSRF is a browser-only attack
+- Allowed origins configurable via `SENTINEL_ALLOWED_ORIGINS` env var
+
+**#28 — CSP + Security Headers** (`gateway/nginx.conf`)
+- `Content-Security-Policy`: default-src 'self', script-src 'self', style-src 'self' 'unsafe-inline', frame-ancestors 'none'
+- `Strict-Transport-Security`: max-age=31536000; includeSubDomains
+- `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, `X-XSS-Protection: 1; mode=block`
+- `Referrer-Policy: strict-origin-when-cross-origin`
+
+**#29 — Log Forwarding** (`podman-compose.yaml`)
+- Changed log volume from named volume (`sentinel-logs`) to host bind mount (`./logs`)
+- Logs immediately accessible on host for `tail -f`, `grep`, or log shipper integration
+- Created `logs/` directory with `.gitkeep`
+
+**#30 — Health Checks** (`podman-compose.yaml`)
+- Controller: `CMD-SHELL` python urllib to `/health`, 30s interval, 60s start_period (Prompt Guard model load)
+- Qwen: `CMD-SHELL` bash TCP check to port 11434, 30s interval, 30s start_period
+- UI: `CMD-SHELL` wget to `https://localhost:8443/`, 30s interval, 5s start_period
+
+### Code Review Issues Closed (5 items)
+
+**#6 — CSRF** → Origin validation middleware (see #27 above)
+
+**#8 — approval_id field** (`controller/app/models.py`, `controller/app/orchestrator.py`, `gateway/static/app.js`)
+- Added `approval_id` field to `TaskResult` model
+- Orchestrator populates field directly instead of embedding in `reason` string
+- UI reads from field (with fallback for backwards compat)
+
+**#11 — Bounded provenance store** (`controller/app/provenance.py`)
+- LRU-style eviction: oldest entries removed when store exceeds 10,000 entries
+- Applied to both `_store` and `_file_provenance` dicts
+
+**#13 — Request size limits** (`gateway/nginx.conf`, `controller/app/main.py`, `controller/app/config.py`)
+- nginx: `client_max_body_size 1m` (defence in depth — rejects before reaching controller)
+- FastAPI: `RequestSizeLimitMiddleware` checks `Content-Length` header, rejects >1MB with 413
+
+**#15 — Stored HTML fix** (`gateway/static/app.js`)
+- `addSystemMessage()` now stores raw text (not HTML) in localStorage
+- `restoreHistory()` re-renders from text using `escapeHtml()`
+- Legacy HTML entries (from pre-update localStorage) also re-escaped on restore
+- Conversation warnings stored as structured data, rendered via `renderWarnings()` helper
+
+### Test Changes
+- Updated `test_approval.py` and `test_orchestrator.py` to use `result.approval_id` instead of parsing from `result.reason`
+- **415 tests passing** (zero regressions)
+
+### Gotchas Discovered
+- podman-compose 1.0.6 doesn't pass `--secret` to builds — must build controller manually
+- Health check CMD arrays get mangled by podman-compose — use CMD-SHELL instead
+- Ollama image has no curl/wget — use `bash -c '... > /dev/tcp/...'` (must explicitly invoke bash)
+- `$server_port` in nginx resolves to internal container port (8443), not exposed host port — use `$http_host` for redirects
+
+---
+
 ## Tier 3 — Stress Test Expansion (2026-02-14)
 
 Comprehensive expansion of `scripts/stress_test.py` addressing all 7 Tier 3 audit items (#16-22) plus holistic gaps identified during review.
@@ -350,12 +434,16 @@ Addressed 5 of 12 remaining code review issues (from `docs/archive/2026-02-12_co
 | #3 — Tool executor trust checks | Fixed in Phase 5 |
 | #4 — Relative path resolution | **Fixed** |
 | #5 — Podman flag deny-list | **Fixed** |
-| #6 — CSRF protection | Deferred (PIN auth mitigates) |
+| #6 — CSRF protection | **Fixed** (Tier 4 — origin validation middleware) |
 | #7 — hex_secret_64 too broad | **Fixed** |
-| #8 — Approval ID in reason field | Deferred (works, cosmetic) |
+| #8 — Approval ID in reason field | **Fixed** (Tier 4 — dedicated field on TaskResult) |
 | #9 — Podman policy check mismatch | **Fixed** |
 | #10 — ToolExecutor not wired | Fixed in Phase 5 |
-| #11-15 — Design observations | Deferred (low risk) |
+| #11 — Unbounded provenance store | **Fixed** (Tier 4 — LRU cap at 10k) |
+| #12 — Opaque block reasons | Fixed in Tier 2 |
+| #13 — No request size limit | **Fixed** (Tier 4 — nginx 1MB + FastAPI middleware) |
+| #14 — Planner refusal classification | Fixed in Tier 2 |
+| #15 — Stored HTML in localStorage | **Fixed** (Tier 4 — structured data + escapeHtml) |
 
 ---
 

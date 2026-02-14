@@ -7,6 +7,7 @@ from pydantic import BaseModel
 from slowapi import Limiter
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from .approval import ApprovalManager
 from .auth import PinAuthMiddleware
@@ -22,6 +23,43 @@ from . import codeshield, prompt_guard
 from .scanner import CommandPatternScanner, CredentialScanner, SensitivePathScanner
 from .session import SessionStore
 from .tools import ToolExecutor
+
+
+class CSRFMiddleware(BaseHTTPMiddleware):
+    """Validate Origin header on state-changing requests to prevent CSRF."""
+
+    def __init__(self, app, allowed_origins: list[str]):
+        super().__init__(app)
+        self._allowed = set(o.rstrip("/").lower() for o in allowed_origins)
+
+    async def dispatch(self, request: Request, call_next):
+        if request.method in ("POST", "PUT", "DELETE", "PATCH"):
+            origin = request.headers.get("origin", "")
+            if origin:
+                normalised = origin.rstrip("/").lower()
+                if normalised not in self._allowed:
+                    return JSONResponse(
+                        status_code=403,
+                        content={"status": "error", "reason": "CSRF: invalid origin"},
+                    )
+        return await call_next(request)
+
+
+class RequestSizeLimitMiddleware(BaseHTTPMiddleware):
+    """Reject requests with Content-Length exceeding the configured limit."""
+
+    def __init__(self, app, max_bytes: int):
+        super().__init__(app)
+        self._max_bytes = max_bytes
+
+    async def dispatch(self, request: Request, call_next):
+        content_length = request.headers.get("content-length")
+        if content_length and int(content_length) > self._max_bytes:
+            return JSONResponse(
+                status_code=413,
+                content={"status": "error", "reason": "Request too large"},
+            )
+        return await call_next(request)
 
 # Rate limiter — per-IP, in-memory storage
 limiter = Limiter(key_func=get_remote_address)
@@ -160,7 +198,14 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Sentinel Controller", lifespan=lifespan)
 app.state.limiter = limiter
+
+# Middleware stack (outermost first): size limit → CSRF → PIN auth
 app.add_middleware(PinAuthMiddleware, pin_getter=lambda: _pin)
+app.add_middleware(
+    CSRFMiddleware,
+    allowed_origins=[o.strip() for o in settings.allowed_origins.split(",") if o.strip()],
+)
+app.add_middleware(RequestSizeLimitMiddleware, max_bytes=settings.max_request_bytes)
 
 
 @app.exception_handler(RateLimitExceeded)

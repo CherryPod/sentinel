@@ -93,9 +93,9 @@
         appendToHistory({ role: 'user', text: text });
     }
 
-    function addSystemMessage(html) {
-        addMessage('system', '<div class="label">Sentinel</div>' + html);
-        appendToHistory({ role: 'system', html: html });
+    function addSystemMessage(text) {
+        addMessage('system', '<div class="label">Sentinel</div>' + escapeHtml(text));
+        appendToHistory({ role: 'system', text: text });
     }
 
     function addStatusMessage(text, id) {
@@ -116,6 +116,18 @@
         const div = document.createElement('div');
         div.textContent = str;
         return div.innerHTML;
+    }
+
+    // --- Render conversation warnings ---
+
+    function renderWarnings(warnings) {
+        let html = '<div class="label">Security</div>';
+        html += '<div class="conversation-warnings">';
+        for (const w of warnings) {
+            html += '<div class="conv-warning">\u26a0 ' + escapeHtml(w) + '</div>';
+        }
+        html += '</div>';
+        addMessage('system', html);
     }
 
     // --- Render plan with approve/deny ---
@@ -254,29 +266,24 @@
 
             // Display conversation warnings if present
             if (data.conversation && data.conversation.warnings && data.conversation.warnings.length > 0) {
-                let warnHtml = '<div class="label">Security</div>';
-                warnHtml += '<div class="conversation-warnings">';
-                for (const w of data.conversation.warnings) {
-                    warnHtml += '<div class="conv-warning">\u26a0 ' + escapeHtml(w) + '</div>';
-                }
-                warnHtml += '</div>';
-                addMessage('system', warnHtml);
+                renderWarnings(data.conversation.warnings);
+                appendToHistory({ role: 'warnings', warnings: data.conversation.warnings });
             }
 
             if (data.status === 'awaiting_approval') {
-                // Extract approval ID from reason field
-                const approvalId = data.reason.replace('approval_id:', '');
+                // Read approval_id from dedicated field (fallback to reason for backwards compat)
+                const approvalId = data.approval_id || data.reason.replace('approval_id:', '');
                 addStatusMessage('Waiting for plan...', statusId + '-poll');
                 await pollApproval(approvalId, statusId + '-poll');
             } else if (data.status === 'success') {
-                addSystemMessage(escapeHtml(data.plan_summary || 'Task completed.'));
+                addSystemMessage(data.plan_summary || 'Task completed.');
                 renderStepResults(data.step_results);
             } else if (data.status === 'blocked') {
                 addErrorMessage('Blocked: ' + (data.reason || 'Policy violation'));
             } else if (data.status === 'error') {
                 addErrorMessage('Error: ' + (data.reason || 'Unknown error'));
             } else {
-                addSystemMessage('Response: ' + escapeHtml(JSON.stringify(data)));
+                addSystemMessage('Response: ' + JSON.stringify(data));
             }
         } catch (err) {
             removeElement(statusId);
@@ -298,7 +305,7 @@
                     return; // User will click approve/deny
                 } else if (data.status === 'approved' || data.status === 'denied' || data.status === 'expired') {
                     removeElement(statusElId);
-                    addSystemMessage('Approval status: ' + data.status + (data.reason ? ' — ' + escapeHtml(data.reason) : ''));
+                    addSystemMessage('Approval status: ' + data.status + (data.reason ? ' — ' + data.reason : ''));
                     return;
                 } else if (data.status === 'not_found') {
                     removeElement(statusElId);
@@ -333,7 +340,7 @@
                 removeElement(statusId);
 
                 if (data.status === 'success') {
-                    addSystemMessage(escapeHtml(data.plan_summary || 'Plan executed successfully.'));
+                    addSystemMessage(data.plan_summary || 'Plan executed successfully.');
                     renderStepResults(data.step_results);
                 } else if (data.status === 'blocked') {
                     addErrorMessage('Execution blocked: ' + (data.reason || 'Policy violation'));
@@ -341,7 +348,7 @@
                 } else if (data.status === 'error') {
                     addErrorMessage('Execution error: ' + (data.reason || 'Unknown error'));
                 } else {
-                    addSystemMessage('Result: ' + escapeHtml(JSON.stringify(data)));
+                    addSystemMessage('Result: ' + JSON.stringify(data));
                 }
             } catch (err) {
                 removeElement(statusId);
@@ -367,9 +374,17 @@
             if (entry.role === 'user') {
                 addMessage('user', '<div class="label">You</div>' + escapeHtml(entry.text));
             } else if (entry.role === 'system') {
-                addMessage('system', entry.html);
+                // New format stores text; old format stored pre-rendered html
+                if (entry.text != null) {
+                    addMessage('system', '<div class="label">Sentinel</div>' + escapeHtml(entry.text));
+                } else if (entry.html != null) {
+                    // Legacy: re-escape to prevent stored XSS from old entries
+                    addMessage('system', '<div class="label">Sentinel</div>' + escapeHtml(entry.html));
+                }
             } else if (entry.role === 'error') {
                 addMessage('error', '<div class="label">Error</div>' + escapeHtml(entry.text));
+            } else if (entry.role === 'warnings') {
+                if (entry.warnings) renderWarnings(entry.warnings);
             } else if (entry.role === 'plan') {
                 // Render plan without active buttons (already resolved)
                 let html = '<div class="label">Sentinel</div>';

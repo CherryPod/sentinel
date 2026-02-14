@@ -33,8 +33,16 @@ class ApprovalManager:
         self._timeout = timeout if timeout is not None else settings.approval_timeout
         self._pending: dict[str, PendingApproval] = {}
 
+    def _cleanup_expired(self) -> None:
+        """Remove entries older than the configured timeout."""
+        now = time.monotonic()
+        expired = [k for k, v in self._pending.items() if now - v.created_at > self._timeout]
+        for k in expired:
+            del self._pending[k]
+
     async def request_plan_approval(self, plan: Plan) -> str:
         """Create an approval request. Returns the approval_id."""
+        self._cleanup_expired()
         approval_id = str(uuid.uuid4())
         self._pending[approval_id] = PendingApproval(
             approval_id=approval_id,

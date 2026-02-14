@@ -265,7 +265,7 @@ class Orchestrator:
             return TaskResult(
                 status="awaiting_approval",
                 plan_summary=plan.plan_summary,
-                reason=f"approval_id:{approval_id}",
+                approval_id=approval_id,
                 conversation=conv_info,
             )
 

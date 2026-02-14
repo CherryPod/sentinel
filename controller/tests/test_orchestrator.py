@@ -400,7 +400,7 @@ class TestHandleTask:
         result = await orch.handle_task("Test", approval_mode="full")
 
         assert result.status == "awaiting_approval"
-        assert "approval-123" in result.reason
+        assert result.approval_id == "approval-123"
 
     @pytest.mark.asyncio
     async def test_codeshield_runs_without_expects_code(self, mock_planner, mock_pipeline):
