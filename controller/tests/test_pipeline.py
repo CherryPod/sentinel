@@ -3,7 +3,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from app.models import DataSource, ScanMatch, ScanResult, TrustLevel
-from app.pipeline import PipelineScanResult, ScanPipeline, SecurityViolation
+from app.pipeline import PipelineScanResult, ScanPipeline, SecurityViolation, _SANDWICH_REMINDER
 from app.scanner import CommandPatternScanner, CredentialScanner, SensitivePathScanner
 from app.worker import OllamaWorker
 from app import prompt_guard
@@ -151,7 +151,6 @@ class TestProcessWithQwen:
     async def test_clean_flow(self, mock_settings, pipeline, mock_worker):
         mock_settings.prompt_guard_enabled = False
         mock_settings.spotlighting_enabled = True
-        mock_settings.spotlighting_marker = "^"
         mock_settings.ollama_model = "qwen3:14b"
 
         tagged = await pipeline.process_with_qwen("Write hello world")
@@ -165,14 +164,23 @@ class TestProcessWithQwen:
     async def test_spotlighting_applied(self, mock_settings, pipeline, mock_worker):
         mock_settings.prompt_guard_enabled = False
         mock_settings.spotlighting_enabled = True
-        mock_settings.spotlighting_marker = "^"
         mock_settings.ollama_model = "qwen3:14b"
 
         await pipeline.process_with_qwen("Summarise this", untrusted_data="some data here")
         call_args = mock_worker.generate.call_args
         prompt_sent = call_args.kwargs.get("prompt", call_args.args[0] if call_args.args else "")
-        assert "^some" in prompt_sent
-        assert "^data" in prompt_sent
+        # Dynamic marker — check structural properties, not exact value
+        # Each word should be prefixed with a marker character from the pool
+        assert "<UNTRUSTED_DATA>" in prompt_sent
+        assert "</UNTRUSTED_DATA>" in prompt_sent
+        assert "Data:\n" not in prompt_sent  # old format replaced
+        assert _SANDWICH_REMINDER in prompt_sent
+        # Marker passed to worker for system prompt formatting
+        marker_sent = call_args.kwargs.get("marker", "")
+        assert len(marker_sent) == 4
+        # Verify the marker was actually applied to the data
+        assert f"{marker_sent}some" in prompt_sent
+        assert f"{marker_sent}data" in prompt_sent
 
     @patch("app.pipeline.settings")
     @pytest.mark.asyncio
@@ -184,8 +192,12 @@ class TestProcessWithQwen:
         await pipeline.process_with_qwen("Summarise this", untrusted_data="some data")
         call_args = mock_worker.generate.call_args
         prompt_sent = call_args.kwargs.get("prompt", call_args.args[0] if call_args.args else "")
-        assert "^some" not in prompt_sent
+        # No marker applied when spotlighting is disabled
         assert "some data" in prompt_sent
+        # Structural tags and sandwich are still present (they protect even without marking)
+        assert "<UNTRUSTED_DATA>" in prompt_sent
+        assert "</UNTRUSTED_DATA>" in prompt_sent
+        assert _SANDWICH_REMINDER in prompt_sent
 
     @patch("app.pipeline.settings")
     @pytest.mark.asyncio
@@ -245,3 +257,39 @@ class TestProcessWithQwen:
         assert "credential_scanner" in tagged.scan_results
         assert "sensitive_path_scanner" in tagged.scan_results
         assert "command_pattern_scanner" in tagged.scan_results
+
+    @patch("app.pipeline.settings")
+    @pytest.mark.asyncio
+    async def test_sandwich_absent_without_untrusted_data(self, mock_settings, pipeline, mock_worker):
+        """No sandwich reminder when there's no untrusted data."""
+        mock_settings.prompt_guard_enabled = False
+        mock_settings.spotlighting_enabled = True
+        mock_settings.ollama_model = "qwen3:14b"
+
+        await pipeline.process_with_qwen("Write hello world")
+        call_args = mock_worker.generate.call_args
+        prompt_sent = call_args.kwargs.get("prompt", call_args.args[0] if call_args.args else "")
+        assert _SANDWICH_REMINDER not in prompt_sent
+        assert "<UNTRUSTED_DATA>" not in prompt_sent
+
+    @patch("app.pipeline.settings")
+    @pytest.mark.asyncio
+    async def test_dynamic_marker_varies(self, mock_settings, pipeline, mock_worker):
+        """Two calls should produce different markers (probabilistically)."""
+        mock_settings.prompt_guard_enabled = False
+        mock_settings.spotlighting_enabled = True
+        mock_settings.ollama_model = "qwen3:14b"
+
+        await pipeline.process_with_qwen("task1", untrusted_data="data1")
+        marker1 = mock_worker.generate.call_args.kwargs.get("marker", "")
+
+        mock_worker.generate.reset_mock()
+        await pipeline.process_with_qwen("task2", untrusted_data="data2")
+        marker2 = mock_worker.generate.call_args.kwargs.get("marker", "")
+
+        # Both should be 4-char markers
+        assert len(marker1) == 4
+        assert len(marker2) == 4
+        # Extremely unlikely to collide (1/10000 chance) — if this flakes,
+        # it's a sign the RNG is broken, not bad luck
+        assert marker1 != marker2

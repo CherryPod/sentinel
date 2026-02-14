@@ -8,7 +8,7 @@ from app.worker import (
     OllamaConnectionError,
     OllamaModelNotFound,
     OllamaTimeoutError,
-    QWEN_SYSTEM_PROMPT,
+    QWEN_SYSTEM_PROMPT_TEMPLATE,
 )
 
 
@@ -50,7 +50,9 @@ class TestOllamaWorkerGenerate:
             call_args = mock_client.post.call_args
             payload = call_args.kwargs["json"]
             assert payload["prompt"] == "Say hello"
-            assert payload["system"] == QWEN_SYSTEM_PROMPT
+            # Default marker is "^" — system prompt should be formatted template
+            assert payload["system"] == QWEN_SYSTEM_PROMPT_TEMPLATE.format(marker="^")
+            assert "<UNTRUSTED_DATA>" in payload["system"]
             assert payload["model"] == "qwen3:14b"
             assert payload["stream"] is False
 
@@ -167,3 +169,19 @@ class TestOllamaWorkerGenerate:
             result = await worker.generate("test")
             assert result == "recovered"
             assert mock_client.post.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_dynamic_marker_in_system_prompt(self, worker):
+        """Custom marker should appear in the formatted system prompt."""
+        mock_resp = _mock_response(200, {"response": "ok"})
+        with patch("app.worker.httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.post.return_value = mock_resp
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=False)
+            mock_client_cls.return_value = mock_client
+
+            await worker.generate("test", marker="@#!")
+            payload = mock_client.post.call_args.kwargs["json"]
+            assert "@#!" in payload["system"]
+            assert "^" not in payload["system"]  # old static marker not present

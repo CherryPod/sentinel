@@ -22,9 +22,8 @@ class Settings(BaseSettings):
     ollama_model: str = "qwen3:14b"
     ollama_timeout: int = 120
 
-    # Spotlighting (Phase 2)
+    # Spotlighting (Phase 2) — marker is now generated per-request in pipeline.py
     spotlighting_enabled: bool = True
-    spotlighting_marker: str = "^"
 
     # Prompt Guard (Phase 2)
     prompt_guard_enabled: bool = True
