@@ -92,7 +92,15 @@ class ApprovalManager:
                 "status": "pending",
                 "plan_summary": entry.plan.plan_summary,
                 "steps": [
-                    {"id": s.id, "type": s.type, "description": s.description}
+                    {
+                        "id": s.id,
+                        "type": s.type,
+                        "description": s.description,
+                        "prompt": s.prompt,
+                        "tool": s.tool,
+                        "args": s.args if s.args else None,
+                        "expects_code": s.expects_code,
+                    }
                     for s in entry.plan.steps
                 ],
             }

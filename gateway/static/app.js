@@ -130,29 +130,72 @@
         addMessage('system', html);
     }
 
+    // --- Render step list (shared by renderPlan and restoreHistory) ---
+
+    function buildStepsHtml(steps) {
+        if (!steps || steps.length === 0) return '';
+        let html = '<ul class="plan-steps">';
+        for (const step of steps) {
+            html += '<li class="step-header">';
+            html += '<span class="step-type">' + escapeHtml(step.type || 'step') + '</span>';
+            if (step.expects_code) {
+                html += '<span class="step-badge">code</span>';
+            }
+            html += '<span class="step-desc">' + escapeHtml(step.description || step.id || '') + '</span>';
+            html += '<span class="step-chevron">&#9654;</span>';
+
+            // Expandable detail block
+            var detail = '';
+            if (step.type === 'llm_task' && step.prompt) {
+                detail = escapeHtml(step.prompt);
+            } else if (step.type === 'tool_call') {
+                var parts = [];
+                if (step.tool) parts.push('tool: ' + step.tool);
+                if (step.args) {
+                    try {
+                        parts.push('args: ' + JSON.stringify(step.args, null, 2));
+                    } catch (e) {
+                        parts.push('args: ' + String(step.args));
+                    }
+                }
+                detail = escapeHtml(parts.join('\n'));
+            }
+            if (detail) {
+                html += '<pre class="step-detail">' + detail + '</pre>';
+            }
+            html += '</li>';
+        }
+        html += '</ul>';
+        return html;
+    }
+
+    function bindStepToggles(container) {
+        var headers = container.querySelectorAll('.step-header');
+        headers.forEach(function (li) {
+            li.addEventListener('click', function (e) {
+                // Don't toggle if clicking a button inside
+                if (e.target.tagName === 'BUTTON') return;
+                li.classList.toggle('expanded');
+            });
+        });
+    }
+
     // --- Render plan with approve/deny ---
 
     function renderPlan(planSummary, steps, approvalId) {
         let html = '<div class="label">Sentinel</div>';
         html += '<div class="plan-summary">' + escapeHtml(planSummary) + '</div>';
-
-        if (steps && steps.length > 0) {
-            html += '<ul class="plan-steps">';
-            for (const step of steps) {
-                html += '<li>';
-                html += '<span class="step-type">' + escapeHtml(step.type || 'step') + '</span>';
-                html += escapeHtml(step.description || step.id || '');
-                html += '</li>';
-            }
-            html += '</ul>';
-        }
+        html += buildStepsHtml(steps);
 
         html += '<div class="approval-buttons" id="approval-' + approvalId + '">';
         html += '<button class="btn btn-approve" data-approval-id="' + approvalId + '" data-granted="true">Approve</button>';
         html += '<button class="btn btn-deny" data-approval-id="' + approvalId + '" data-granted="false">Deny</button>';
         html += '</div>';
 
-        addMessage('system', html);
+        var msgEl = addMessage('system', html);
+
+        // Bind expand/collapse on step headers
+        bindStepToggles(msgEl);
 
         // Bind click handlers (CSP blocks inline onclick)
         var container = document.getElementById('approval-' + approvalId);
@@ -404,17 +447,9 @@
                 // Render plan without active buttons (already resolved)
                 let html = '<div class="label">Sentinel</div>';
                 html += '<div class="plan-summary">' + escapeHtml(entry.planSummary || '') + '</div>';
-                if (entry.steps && entry.steps.length > 0) {
-                    html += '<ul class="plan-steps">';
-                    for (const step of entry.steps) {
-                        html += '<li>';
-                        html += '<span class="step-type">' + escapeHtml(step.type || 'step') + '</span>';
-                        html += escapeHtml(step.description || step.id || '');
-                        html += '</li>';
-                    }
-                    html += '</ul>';
-                }
-                addMessage('system', html);
+                html += buildStepsHtml(entry.steps);
+                var planMsgEl = addMessage('system', html);
+                bindStepToggles(planMsgEl);
             } else if (entry.role === 'results') {
                 renderStepResultsStatic(entry.stepResults);
             }

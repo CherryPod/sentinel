@@ -1,5 +1,33 @@
 # Changelog
 
+## Expandable Step Details in Approval View (2026-02-14)
+
+Show the full prompt and tool args in the UI approval screen, not just step type and description. Previously, the approval view only showed `type` + `description` — you couldn't see what Claude was actually telling Qwen to do.
+
+### Backend (`controller/app/approval.py`)
+- `check_approval()` step serialisation now includes `prompt`, `tool`, `args`, and `expects_code` fields alongside existing `id`, `type`, `description`
+
+### Frontend (`gateway/static/app.js`)
+- Extracted shared `buildStepsHtml()` helper — renders steps with chevron toggle, `expects_code` badge, and hidden `<pre>` detail block
+- `bindStepToggles()` — attaches click-to-expand listeners (CSP-safe `addEventListener`, no inline handlers)
+- `renderPlan()` and `restoreHistory()` both use the shared helpers (no duplication)
+- For `llm_task` steps: detail block shows the full prompt that will be sent to Qwen
+- For `tool_call` steps: detail block shows tool name + args as formatted JSON
+
+### Styles (`gateway/static/style.css`)
+- `.step-header` — clickable with pointer cursor, relative positioning for chevron
+- `.step-chevron` — right-aligned triangle indicator, rotates 90° on expand
+- `.step-detail` — dark `<pre>` block, hidden by default, scrollable at 300px max-height
+- `.step-badge` — small yellow "CODE" label for `expects_code` steps
+
+### Observed Nuance
+Claude (the planner) writes the prompt for Qwen and the controller passes it through as-is. Claude non-deterministically either quotes the user verbatim or paraphrases — the same input can produce different prompts across runs. This feature makes that visible: you can now see exactly what Qwen will receive before approving.
+
+### Tests
+- **415 tests passing** (zero regressions — backend change is data-only, no logic change)
+
+---
+
 ## Tier 4 — Infrastructure Hardening + Code Review Closure (2026-02-14)
 
 Hardened the infrastructure layer (containers, networking, supply chain) and closed all 5 remaining code review issues. All 15 original code review issues are now resolved.

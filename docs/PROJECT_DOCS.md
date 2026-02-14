@@ -248,7 +248,7 @@ paho-mqtt>=2.1.0
 | `POST` | `/scan` | 2 | Run all scanners on text `{"text": "..."}` |
 | `POST` | `/process` | 2 | Full Qwen pipeline: scan → spotlight → Qwen → scan |
 | `POST` | `/task` | 3 | **Full CaMeL pipeline**: Claude plans → approve → Qwen executes → scanned. Accepts optional `session_id` for conversation tracking |
-| `GET` | `/approval/{id}` | 3 | Check approval status (pending/approved/denied/expired) |
+| `GET` | `/approval/{id}` | 3 | Check approval status (pending/approved/denied/expired). Pending responses include full step details: `prompt`, `tool`, `args`, `expects_code` |
 | `POST` | `/approve/{id}` | 3 | Submit decision `{"granted": true/false, "reason": "..."}` |
 | `GET` | `/session/{id}` | 5+ | Debug: view session state, turn history, risk scores |
 
