@@ -4026,7 +4026,11 @@ class StressTest:
 
         data = {
             "request": prompt,
-            "source": "stress_test",
+            # Unique source per request so each gets its own session.
+            # Without this, all requests share one session (keyed by source:IP),
+            # and adversarial prompts lock the session, blocking all subsequent
+            # genuine requests — making test results meaningless.
+            "source": f"stress_test_{index}",
         }
         if session_id:
             data["session_id"] = session_id

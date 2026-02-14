@@ -319,6 +319,12 @@ podman compose up -d sentinel-ui
 
 The stress test runner calls `podman compose build` + `podman compose up -d` internally (step 2). This rebuilds the Dockerfile from scratch, so it picks up code changes — but only if the Dockerfile cache is invalidated (i.e. files in `COPY app/` or `COPY tests/` changed). It does NOT use `--force-recreate`, so if the image ID doesn't change, old containers may persist.
 
+### Session isolation in stress tests
+
+The controller tracks sessions by `source:client_IP`. In a stress test, all requests come from `localhost` — so adversarial prompts that trigger security violations lock the shared session, and all subsequent genuine requests are blocked too. This makes test results meaningless (88%+ false positive rate from session lock, not actual detection).
+
+Fix: the stress test sends a unique `source` per request (`stress_test_0`, `stress_test_1`, ...) so each gets its own session. This tests every prompt independently. Multi-turn test sequences that intentionally share a session use explicit `session_id` fields and are not affected by this.
+
 ---
 
 ## Quick Commands
