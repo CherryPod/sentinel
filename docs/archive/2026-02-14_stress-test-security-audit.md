@@ -558,3 +558,17 @@ For deployment in hostile environments such as Moltbook:
 ---
 
 *Report generated 2026-02-14 by Claude Opus 4.6 based on automated analysis of stress test results, pipeline source code, test scripts, and infrastructure configuration.*
+
+---
+
+## Open Questions
+
+### Chain-safe variable substitution scan trade-off (2026-02-14)
+
+P7's chain-safe wrapping (`<UNTRUSTED_DATA>` tags + spotlighting + chain reminder) triggers Prompt Guard false positives on chained step prompts. The defensive wrapper text looks like injection to the BERT classifier.
+
+**Resolution:** `process_with_qwen()` accepts `skip_input_scan=True` for internally-constructed prompts. The orchestrator sets this flag when `step.input_vars` is non-empty (chained steps).
+
+**Trade-off:** Chained variable content relies on step N-1's **output** scan rather than step N's **input** scan. Both scan pipelines run the same scanners (Prompt Guard + credential + sensitive path + command pattern), so if content passed the output scan it would pass the input scan too. The original user request is still input-scanned at task intake (`handle_task()` → `scan_input()`).
+
+**Risk:** If a future change adds scanners to input-only (not output), chained content would bypass them. Mitigated by the architectural rule that input and output scan pipelines use the same scanner set.

@@ -185,24 +185,40 @@ class ScanPipeline:
         prompt: str,
         untrusted_data: str | None = None,
         marker: str | None = None,
+        skip_input_scan: bool = False,
     ) -> TaggedData:
         """Full pipeline: scan → spotlight → Qwen → scan → tag.
 
         Raises SecurityViolation if any scan fails.
         """
-        # 1. Scan input via Prompt Guard
-        input_scan = self.scan_input(prompt)
-        if not input_scan.is_clean:
-            logger.warning(
-                "Input blocked by scan pipeline",
+        # 1. Input scan: skip for internally-constructed prompts (e.g. chained
+        # steps where the orchestrator has already wrapped prior output in
+        # UNTRUSTED_DATA tags + spotlighting markers). The original user request
+        # was scanned at task intake, and the chained content was scanned as
+        # output from the previous step. Scanning our own defensive wrapper text
+        # causes Prompt Guard false positives (the instruction-like reminders
+        # look like injection).
+        if not skip_input_scan:
+            input_scan = self.scan_input(prompt)
+            if not input_scan.is_clean:
+                logger.warning(
+                    "Input blocked by scan pipeline",
+                    extra={
+                        "event": "input_blocked",
+                        "violations": list(input_scan.violations.keys()),
+                    },
+                )
+                raise SecurityViolation(
+                    "Input blocked by security scan",
+                    input_scan.violations,
+                )
+        else:
+            logger.info(
+                "Input scan skipped for internally-constructed prompt",
                 extra={
-                    "event": "input_blocked",
-                    "violations": list(input_scan.violations.keys()),
+                    "event": "input_scan_skipped",
+                    "prompt_length": len(prompt),
                 },
-            )
-            raise SecurityViolation(
-                "Input blocked by security scan",
-                input_scan.violations,
             )
 
         # 2. Apply spotlighting to untrusted data + structural tags + sandwich

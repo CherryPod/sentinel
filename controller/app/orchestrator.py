@@ -469,6 +469,7 @@ class Orchestrator:
             tagged = await self._pipeline.process_with_qwen(
                 prompt=resolved_prompt,
                 marker=marker or None,
+                skip_input_scan=bool(step.input_vars),
             )
 
             # Fail-closed: if CodeShield is required but unavailable, block

@@ -1,5 +1,22 @@
 # Changelog
 
+## Fix: Skip Input Scan on Chained Prompts (2026-02-14)
+
+P7's chain-safe wrapping (`<UNTRUSTED_DATA>` tags + spotlighting + chain reminder) triggered Prompt Guard false positives on chained step prompts — the defensive wrapper text looked like injection to the BERT classifier, blocking all multi-step plans at step 2+.
+
+### Fix
+- `process_with_qwen()` now accepts `skip_input_scan: bool = False` — when `True`, the input scan is skipped entirely with an info-level log
+- The orchestrator passes `skip_input_scan=bool(step.input_vars)` — chained steps skip input scanning, standalone steps still get full input scanning
+- This is safe because: (1) the original user request was already scanned at task intake, (2) chained content was already scanned as output from the previous step, (3) the wrapper text is our own trusted code
+
+### Trade-off
+Chained variable content relies on step N-1's output scan rather than step N's input scan. Both pipelines run the same scanners (Prompt Guard + credential + sensitive path + command pattern). Documented in the audit report's new "Open Questions" section.
+
+### Tests
+- 4 new tests (435 total): `test_skip_input_scan_bypasses_prompt_guard`, `test_skip_input_scan_false_still_scans`, `test_standalone_step_does_not_skip_input_scan`, plus assertions added to `test_variable_substitution_across_steps`
+
+---
+
 ## System Prompt Hardening — Priorities 4, 5, 7, 8 (2026-02-14)
 
 Completed 4 of the remaining 5 system prompt hardening recommendations from the audit (`docs/archive/2026-02-14_system-prompt-audit.md`). P6 (disable thinking mode) deliberately skipped — Qwen needs thinking mode for code generation quality, documented as an intentional decision.

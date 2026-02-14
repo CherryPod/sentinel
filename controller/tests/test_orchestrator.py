@@ -200,6 +200,10 @@ class TestHandleTask:
         step2_marker = calls[1].kwargs.get("marker")
         assert step2_marker is not None
         assert len(step2_marker) == 4
+        # Step 1 (standalone): input scan runs normally
+        assert calls[0].kwargs.get("skip_input_scan") is not True
+        # Step 2 (chained): input scan skipped — wrapper would trigger false positives
+        assert calls[1].kwargs.get("skip_input_scan") is True
 
     @pytest.mark.asyncio
     async def test_llm_result_tagged_untrusted(self, mock_planner, mock_pipeline):
@@ -514,6 +518,29 @@ class TestHandleTask:
         result = await orch.handle_task("Greet me")
 
         assert result.plan_summary == "Generate a greeting"
+
+    @pytest.mark.asyncio
+    async def test_standalone_step_does_not_skip_input_scan(self, mock_planner, mock_pipeline):
+        """Single-step plan with no input_vars does NOT skip input scanning."""
+        plan = _make_plan([
+            {
+                "id": "step_1",
+                "type": "llm_task",
+                "description": "Generate",
+                "prompt": "Hello world",
+            }
+        ])
+        mock_planner.create_plan.return_value = plan
+
+        tagged = create_tagged_data("response", DataSource.QWEN, TrustLevel.UNTRUSTED)
+        mock_pipeline.process_with_qwen.return_value = tagged
+
+        orch = Orchestrator(planner=mock_planner, pipeline=mock_pipeline)
+        result = await orch.handle_task("test")
+
+        assert result.status == "success"
+        calls = mock_pipeline.process_with_qwen.call_args_list
+        assert calls[0].kwargs.get("skip_input_scan") is not True
 
 
 class TestTrustGate:
