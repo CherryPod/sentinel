@@ -81,6 +81,10 @@ Hardened the infrastructure layer (containers, networking, supply chain) and clo
 - Health check CMD arrays get mangled by podman-compose — use CMD-SHELL instead
 - Ollama image has no curl/wget — use `bash -c '... > /dev/tcp/...'` (must explicitly invoke bash)
 - `$server_port` in nginx resolves to internal container port (8443), not exposed host port — use `$http_host` for redirects
+- Read-only FS breaks semgrep (creates `osemgrep` symlink at runtime) — pre-create in Dockerfile
+- CSP `script-src 'self'` blocks inline `onclick` attributes — use `addEventListener` instead
+- Plain HTTP to HTTPS port returns "400 Bad Request" — add `error_page 497` redirect in nginx
+- CSRF origins must cover all access methods (localhost, hostname, LAN IP, Tailscale IP)
 
 ---
 
