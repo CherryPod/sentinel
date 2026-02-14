@@ -136,6 +136,10 @@ Rules:
 - Every step must have a unique "id" (e.g. "step_1", "step_2").
 - Only reference variables defined by previous steps' output_var.
 - Keep plans minimal — use the fewest steps necessary.
+- For text generation requests (essays, code, explanations, documentation, etc.), \
+use a SINGLE llm_task step that returns the result directly. Do NOT add a \
+file_write step unless the user explicitly asks to save output to a file. \
+The pipeline returns the final step's content to the user automatically.
 
 Code detection — expects_code:
 - ALWAYS set expects_code=true when the LLM step may produce: shell scripts, \
@@ -212,9 +216,20 @@ class ClaudePlanner:
     ) -> Plan:
         """Ask Claude to produce a structured Plan for the given request."""
         tool_desc = json.dumps(available_tools or [], indent=2)
-        system = _PLANNER_SYSTEM_PROMPT_TEMPLATE.format(tool_descriptions=tool_desc)
+        system_text = _PLANNER_SYSTEM_PROMPT_TEMPLATE.format(tool_descriptions=tool_desc)
         if policy_summary:
-            system += f"\n\nSecurity policy summary:\n{policy_summary}"
+            system_text += f"\n\nSecurity policy summary:\n{policy_summary}"
+
+        # Use content-block format with cache_control for prompt caching.
+        # The system prompt is identical across requests, so caching saves
+        # ~90% on input tokens after the first call (10% read vs full price).
+        system = [
+            {
+                "type": "text",
+                "text": system_text,
+                "cache_control": {"type": "ephemeral"},
+            }
+        ]
 
         user_content = f"User request: {user_request}"
 

@@ -267,6 +267,60 @@ In `full` approval mode, `/task` returns `{"status": "awaiting_approval", "appro
 
 ---
 
+## Rebuilding Containers
+
+Rebuilding the controller after code changes has multiple gotchas. Follow this procedure to avoid stale images.
+
+### Why it's tricky
+
+1. **Image naming mismatch:** `podman build -t sentinel-controller` creates `sentinel-controller:latest`, but `podman compose up` looks for `sentinel_sentinel-controller:latest` (adds project prefix). If you only tag one name, compose uses the old image silently.
+2. **Compose won't recreate on image change:** `podman compose up -d` checks the compose config hash, not the image ID. If only the image changed (not the YAML), it reuses existing containers. You need `--force-recreate` or a full stop/rm/up cycle.
+3. **Dependency chain blocks removal:** `sentinel-ui` depends on `sentinel-controller` depends on `sentinel-qwen`. You must stop/remove in order: UI → controller → qwen.
+4. **Secret not passed by compose build:** `podman-compose build` doesn't support `--secret`, so the controller must be built manually (Prompt Guard needs the HF token).
+
+### Clean rebuild procedure
+
+```bash
+# 1. Build the controller image (tag BOTH names)
+podman build \
+  --secret id=hf_token,src=/home/kifterz/.secrets/hf_token.txt \
+  -t sentinel-controller:latest \
+  -t sentinel_sentinel-controller:latest \
+  -f controller/Dockerfile controller/
+
+# 2. Stop and remove all sentinel containers (dependency order)
+podman stop sentinel-ui sentinel-controller sentinel-qwen
+podman rm sentinel-ui sentinel-controller sentinel-qwen
+
+# 3. Start fresh (--force-recreate ensures new image is used)
+podman compose up -d --force-recreate
+
+# 4. Verify the new code is live
+podman exec sentinel-controller python -c "
+from app.planner import _PLANNER_SYSTEM_PROMPT_TEMPLATE
+print('Container is running new code')
+"
+
+# 5. Health check
+curl -sf http://localhost:8000/health | python3 -m json.tool
+```
+
+### Rebuilding the UI only
+
+The UI (nginx + static files) has no secrets, so compose build works fine:
+
+```bash
+podman compose build sentinel-ui
+podman stop sentinel-ui && podman rm sentinel-ui
+podman compose up -d sentinel-ui
+```
+
+### Note on run_stress_test.sh
+
+The stress test runner calls `podman compose build` + `podman compose up -d` internally (step 2). This rebuilds the Dockerfile from scratch, so it picks up code changes — but only if the Dockerfile cache is invalidated (i.e. files in `COPY app/` or `COPY tests/` changed). It does NOT use `--force-recreate`, so if the image ID doesn't change, old containers may persist.
+
+---
+
 ## Quick Commands
 
 ```bash
@@ -312,18 +366,21 @@ curl -X POST http://localhost:8000/process -H 'Content-Type: application/json' \
 podman exec sentinel-qwen ping -c1 8.8.8.8        # should FAIL
 podman exec sentinel-qwen curl https://google.com  # should FAIL
 
-# Build controller with Prompt Guard model
+# Build controller with Prompt Guard model (see "Rebuilding Containers" above)
 podman build --secret id=hf_token,src=/home/kifterz/.secrets/hf_token.txt \
-  -t sentinel_sentinel-controller controller/
+  -t sentinel-controller:latest -t sentinel_sentinel-controller:latest \
+  -f controller/Dockerfile controller/
 
 # ── Stress Test ──────────────────────────────────────────────
-# Run full overnight stress test (741 requests, handles auto mode + restore)
+# Run full overnight stress test (976 requests, handles auto mode + restore)
 nohup ./scripts/run_stress_test.sh &
 
 # Check stress test progress
 wc -l scripts/results/stress_test_*.jsonl
-tail -5 scripts/results/stress_test_*.jsonl | python3 -m json.tool
-tail -20 scripts/results/nohup_output*.log
+ls -t scripts/results/stress_test_*.jsonl | head -1 | xargs tail -3
+
+# Tail the runner log live
+ls -t scripts/results/runner_*.log | head -1 | xargs tail -f
 
 # Check if stress test is still running
 ps aux | grep stress_test | grep -v grep

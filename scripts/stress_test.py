@@ -63,9 +63,12 @@ HEALTH_WAIT_MAX = 600    # max seconds to wait for container to recover
 
 CONSECUTIVE_ERROR_LIMIT = 10  # stop after this many consecutive errors
 
+RATE_LIMIT_RETRIES = 5        # retry 429s this many times before giving up
+RATE_LIMIT_WAIT_BASE = 60     # initial wait on 429 (seconds), doubles each retry
+
+# Budget keywords that indicate permanent exhaustion (not transient rate limits)
 BUDGET_KEYWORDS = [
-    "rate_limit", "rate limit", "429", "quota", "budget",
-    "insufficient", "billing", "credit", "overloaded",
+    "quota", "budget", "insufficient", "billing", "credit",
 ]
 
 _REFUSAL_INDICATORS = [
@@ -4043,6 +4046,24 @@ class StressTest:
                     headers,
                     timeout=REQUEST_TIMEOUT,
                 )
+                # Retry on transient 429 rate limits
+                if http_status == 429:
+                    reason = str((response or {}).get("reason", "")).lower()
+                    is_permanent = any(kw in reason for kw in BUDGET_KEYWORDS)
+                    if is_permanent:
+                        print(f"  [!] Permanent budget/quota error on request {index+1}: {reason}")
+                        break
+                    if attempt < RATE_LIMIT_RETRIES - 1:
+                        wait = min(RATE_LIMIT_WAIT_BASE * (2 ** attempt), 600)
+                        print(
+                            f"  [!] Rate limited on request {index+1} "
+                            f"(retry {attempt+1}/{RATE_LIMIT_RETRIES}). "
+                            f"Waiting {wait}s..."
+                        )
+                        time.sleep(wait)
+                        continue
+                    else:
+                        print(f"  [!] Rate limit retries exhausted for request {index+1}")
                 break
             except (ConnectionError, OSError, TimeoutError) as e:
                 error_msg = str(e)
@@ -4097,9 +4118,13 @@ class StressTest:
                 result["conv_action"] = conv.get("action")
                 result["conv_warnings"] = conv.get("warnings")
 
-            # Detect budget exhaustion
+            # Detect permanent budget exhaustion (not transient rate limits).
+            # Transient 429s are retried in the send loop above — if we still
+            # have a 429 here, retries were exhausted so treat as permanent.
             reason = str(response.get("reason", "")).lower()
             if any(kw in reason for kw in BUDGET_KEYWORDS):
+                result["budget_exhausted"] = True
+            elif http_status == 429:
                 result["budget_exhausted"] = True
 
         return result

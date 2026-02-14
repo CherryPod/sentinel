@@ -1,5 +1,11 @@
 # Changelog
 
+## Fix: Planner Prompt — Mention Spotlighting Markers (2026-02-14)
+
+Added spotlighting marker awareness to the planner's ABOUT THE WORKER LLM section. The prompt already told Claude about auto-applied `<UNTRUSTED_DATA>` tags but not about spotlighting markers, which could lead Claude to invent its own marking scheme. Now mentions both are auto-applied: "Do not add these tags or markers yourself."
+
+---
+
 ## Fix: Skip Input Scan on Chained Prompts (2026-02-14)
 
 P7's chain-safe wrapping (`<UNTRUSTED_DATA>` tags + spotlighting + chain reminder) triggered Prompt Guard false positives on chained step prompts — the defensive wrapper text looked like injection to the BERT classifier, blocking all multi-step plans at step 2+.
