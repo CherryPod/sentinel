@@ -65,12 +65,19 @@ commands:
     - iptables
     - systemctl
     - journalctl
+    - "-exec"
+    - "-execdir"
 
   path_constrained:
     - cat
     - find
     - cp
     - mkdir
+    - head
+    - tail
+    - grep
+    - ls
+    - wc
 
 network:
   qwen_outbound: none

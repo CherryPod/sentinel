@@ -7,10 +7,15 @@ from .models import DataSource, TaggedData, TrustLevel
 # In-memory store for provenance tracking — replaced with a DB in production
 _store: dict[str, TaggedData] = {}
 
+# File provenance registry: maps file paths to the data_id of the write that created them.
+# Used to prevent trust laundering — file_read inherits trust from the writer, not a default.
+_file_provenance: dict[str, str] = {}
+
 
 def reset_store() -> None:
-    """Clear the provenance store (used in tests)."""
+    """Clear the provenance store and file provenance registry (used in tests)."""
     _store.clear()
+    _file_provenance.clear()
 
 
 def create_tagged_data(
@@ -85,3 +90,13 @@ def is_trust_safe_for_execution(data_id: str) -> bool:
     """Check whether data (and all its ancestors) are trusted."""
     chain = get_provenance_chain(data_id)
     return all(item.trust_level == TrustLevel.TRUSTED for item in chain)
+
+
+def record_file_write(path: str, data_id: str) -> None:
+    """Record that a file was written by a specific provenance chain entry."""
+    _file_provenance[path] = data_id
+
+
+def get_file_writer(path: str) -> str | None:
+    """Get the data_id of the provenance entry that last wrote to this file."""
+    return _file_provenance.get(path)

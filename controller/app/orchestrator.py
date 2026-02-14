@@ -16,8 +16,8 @@ from . import codeshield
 from .config import settings
 from .conversation import ConversationAnalyzer
 from .pipeline import ScanPipeline, SecurityViolation
-from .planner import ClaudePlanner, PlannerError
-from .provenance import create_tagged_data
+from .planner import ClaudePlanner, PlannerError, PlannerRefusalError
+from .provenance import create_tagged_data, is_trust_safe_for_execution
 from .session import ConversationTurn, SessionStore
 
 logger = logging.getLogger("sentinel.audit")
@@ -59,6 +59,26 @@ class ExecutionContext:
                 resolved[key] = value
         return resolved
 
+    def get_referenced_data_ids(self, text: str) -> list[str]:
+        """Return data IDs from all $var_name references found in text."""
+        if not text:
+            return []
+        data_ids = []
+        for match in re.finditer(r"\$\w+", text):
+            var_name = match.group(0)
+            data = self._vars.get(var_name)
+            if data is not None:
+                data_ids.append(data.id)
+        return data_ids
+
+    def get_referenced_data_ids_from_args(self, args: dict) -> list[str]:
+        """Return data IDs from all $var_name references in dict values."""
+        data_ids = []
+        for value in args.values():
+            if isinstance(value, str):
+                data_ids.extend(self.get_referenced_data_ids(value))
+        return data_ids
+
 
 class Orchestrator:
     """Main CaMeL execution loop: plan → execute → scan → return."""
@@ -84,7 +104,7 @@ class Orchestrator:
         user_request: str,
         source: str = "api",
         approval_mode: str = "auto",
-        session_id: str | None = None,
+        source_key: str | None = None,
     ) -> TaskResult:
         """Full CaMeL pipeline: conversation check → scan → plan → execute → return."""
         task_t0 = time.monotonic()
@@ -93,7 +113,7 @@ class Orchestrator:
             extra={
                 "event": "task_received",
                 "source": source,
-                "session_id": session_id,
+                "source_key": source_key,
                 "request_length": len(user_request),
                 "request_preview": user_request[:200],
             },
@@ -107,7 +127,9 @@ class Orchestrator:
             and self._session_store is not None
             and self._conversation_analyzer is not None
         ):
-            session = self._session_store.get_or_create(session_id, source=source)
+            # Session ID is server-generated, keyed by source_key (source:IP).
+            # Client-provided session_id is never used — prevents session rotation attacks.
+            session = self._session_store.get_or_create(source_key, source=source)
 
             # Locked sessions get immediate rejection
             if session.is_locked:
@@ -158,11 +180,19 @@ class Orchestrator:
         try:
             input_scan = self._pipeline.scan_input(user_request)
             if not input_scan.is_clean:
+                # Build specific block reason with scanner names and matched patterns
+                violation_details = []
+                for scanner_name, sr in input_scan.violations.items():
+                    patterns = [m.pattern_name for m in sr.matches]
+                    violation_details.append(f"{scanner_name}: {', '.join(patterns)}")
+                specific_reason = "Input blocked — " + "; ".join(violation_details)
+
                 logger.warning(
                     "Task input blocked by scan",
                     extra={
                         "event": "task_input_blocked",
                         "violations": list(input_scan.violations.keys()),
+                        "detail": specific_reason,
                     },
                 )
                 if session is not None:
@@ -175,7 +205,7 @@ class Orchestrator:
                     session.add_turn(turn)
                 return TaskResult(
                     status="blocked",
-                    reason="Input blocked by security scan",
+                    reason=specific_reason,
                     conversation=conv_info,
                 )
         except Exception as exc:
@@ -199,6 +229,24 @@ class Orchestrator:
             plan = await self._planner.create_plan(
                 user_request=user_request,
                 available_tools=available_tools,
+            )
+        except PlannerRefusalError as exc:
+            logger.info(
+                "Planner refused request",
+                extra={"event": "planner_refusal", "reason": str(exc)},
+            )
+            if session is not None:
+                turn = ConversationTurn(
+                    request_text=user_request,
+                    result_status="refused",
+                    blocked_by=["planner"],
+                    risk_score=conv_info.risk_score if conv_info else 0.0,
+                )
+                session.add_turn(turn)
+            return TaskResult(
+                status="refused",
+                reason=str(exc),
+                conversation=conv_info,
             )
         except PlannerError as exc:
             logger.error(
@@ -357,6 +405,21 @@ class Orchestrator:
         try:
             tagged = await self._pipeline.process_with_qwen(prompt=resolved_prompt)
 
+            # Fail-closed: if CodeShield is required but unavailable, block
+            if settings.require_codeshield and not codeshield.is_loaded():
+                logger.warning(
+                    "CodeShield required but not loaded — blocking step",
+                    extra={
+                        "event": "codeshield_unavailable",
+                        "step_id": step.id,
+                    },
+                )
+                return StepResult(
+                    step_id=step.id,
+                    status="blocked",
+                    error="CodeShield required but not loaded",
+                )
+
             # CodeShield scan on ALL Qwen output (not just expects_code steps)
             if codeshield.is_loaded():
                 cs_result = await codeshield.scan(tagged.content)
@@ -382,10 +445,16 @@ class Orchestrator:
                 content=tagged.content,
             )
         except SecurityViolation as exc:
+            # Build specific block reason from scan results
+            details = []
+            for scanner_name, sr in exc.scan_results.items():
+                patterns = [m.pattern_name for m in sr.matches]
+                details.append(f"{scanner_name}: {', '.join(patterns)}")
+            specific = "; ".join(details) if details else str(exc)
             return StepResult(
                 step_id=step.id,
                 status="blocked",
-                error=f"Security violation: {exc}",
+                error=f"Output blocked — {specific}",
             )
         except Exception as exc:
             return StepResult(
@@ -397,7 +466,7 @@ class Orchestrator:
     async def _execute_tool_call(
         self, step: PlanStep, context: ExecutionContext
     ) -> StepResult:
-        """Execute a tool call step."""
+        """Execute a tool call step with provenance trust verification."""
         if self._tool_executor is None:
             logger.info(
                 "Tool execution not available — skipping",
@@ -418,6 +487,29 @@ class Orchestrator:
                 step_id=step.id,
                 status="error",
                 error="Tool call step has no tool specified",
+            )
+
+        # CaMeL trust gate: check provenance of all data flowing into this tool call.
+        # If any resolved variable has UNTRUSTED provenance, block execution.
+        referenced_ids = context.get_referenced_data_ids_from_args(step.args)
+        untrusted_ids = [
+            did for did in referenced_ids
+            if not is_trust_safe_for_execution(did)
+        ]
+        if untrusted_ids:
+            logger.warning(
+                "Tool execution blocked — untrusted provenance",
+                extra={
+                    "event": "trust_gate_blocked",
+                    "step_id": step.id,
+                    "tool": step.tool,
+                    "untrusted_data_ids": untrusted_ids,
+                },
+            )
+            return StepResult(
+                step_id=step.id,
+                status="blocked",
+                error=f"Provenance trust check failed: {len(untrusted_ids)} arg(s) have untrusted data in their provenance chain",
             )
 
         resolved_args = context.resolve_args(step.args)

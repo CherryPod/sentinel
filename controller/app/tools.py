@@ -6,7 +6,7 @@ import time
 
 from .models import DataSource, PolicyResult, TaggedData, TrustLevel
 from .policy_engine import PolicyEngine
-from .provenance import create_tagged_data
+from .provenance import create_tagged_data, get_file_writer, get_tagged_data, record_file_write
 
 logger = logging.getLogger("sentinel.audit")
 
@@ -168,12 +168,15 @@ class ToolExecutor:
             "File written",
             extra={"event": "file_written", "path": path, "size": len(content)},
         )
-        return create_tagged_data(
+        tagged = create_tagged_data(
             content=f"File written: {path}",
             source=DataSource.TOOL,
             trust_level=TrustLevel.TRUSTED,
             originated_from=f"file_write:{path}",
         )
+        # Record file provenance so file_read can inherit trust from the writer
+        record_file_write(path, tagged.id)
+        return tagged
 
     async def _file_read(self, args: dict) -> TaggedData:
         path = args.get("path", "")
@@ -201,15 +204,34 @@ class ToolExecutor:
             )
             raise ToolError(f"file_read failed: {exc}") from exc
 
+        # Determine trust level: if this file was written by the pipeline,
+        # inherit trust from the writer's provenance chain to prevent trust laundering.
+        # Files not tracked (e.g. pre-existing workspace files) default to TRUSTED.
+        trust_level = TrustLevel.TRUSTED
+        parent_ids = []
+        writer_id = get_file_writer(path)
+        if writer_id is not None:
+            parent_ids = [writer_id]
+            writer_data = get_tagged_data(writer_id)
+            if writer_data and writer_data.trust_level == TrustLevel.UNTRUSTED:
+                trust_level = TrustLevel.UNTRUSTED
+
         logger.info(
             "File read",
-            extra={"event": "file_read_success", "path": path, "size": len(content)},
+            extra={
+                "event": "file_read_success",
+                "path": path,
+                "size": len(content),
+                "trust_level": trust_level.value,
+                "inherited_from": writer_id,
+            },
         )
         return create_tagged_data(
             content=content,
-            source=DataSource.TOOL,
-            trust_level=TrustLevel.TRUSTED,
+            source=DataSource.FILE,
+            trust_level=trust_level,
             originated_from=f"file_read:{path}",
+            parent_ids=parent_ids,
         )
 
     async def _mkdir(self, args: dict) -> TaggedData:

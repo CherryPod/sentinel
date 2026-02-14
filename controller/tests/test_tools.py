@@ -91,7 +91,7 @@ class TestFileRead:
 class TestShell:
     @pytest.mark.asyncio
     async def test_allowed_command(self, executor):
-        result = await executor.execute("shell", {"command": "ls /tmp"})
+        result = await executor.execute("shell", {"command": "ls /workspace"})
         assert result.trust_level == TrustLevel.TRUSTED
 
     @pytest.mark.asyncio

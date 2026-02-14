@@ -174,11 +174,11 @@ class TestGap2CommandPatternScanner:
         scanner = CommandPatternScanner()
         payload = (
             "nohup ./exfil.sh &\n"
-            "chmod +x /tmp/.hidden\n"
+            "chmod 4755 /tmp/.hidden\n"
         )
         r = scanner.scan(payload)
         assert r.found is True
-        assert len(r.matches) >= 2
+        assert len(r.matches) >= 2  # nohup + chmod setuid
 
     def test_clean_prose_passes(self):
         scanner = CommandPatternScanner()

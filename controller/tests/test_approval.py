@@ -133,6 +133,15 @@ class TestApprovalManager:
 
 
 class TestApprovalWithOrchestrator:
+    @pytest.fixture(autouse=True)
+    def _disable_codeshield_requirement(self):
+        """CodeShield isn't loaded in unit tests; disable fail-closed."""
+        from app.config import settings
+        original = settings.require_codeshield
+        settings.require_codeshield = False
+        yield
+        settings.require_codeshield = original
+
     @pytest.mark.asyncio
     async def test_full_approval_flow(self):
         """Task → awaiting_approval → approve → execution proceeds."""

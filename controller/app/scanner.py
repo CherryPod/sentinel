@@ -98,9 +98,13 @@ class CommandPatternScanner:
         ("nohup_background", re.compile(
             r"nohup\s+\S+", re.IGNORECASE,
         )),
-        # chmod +x (making files executable)
-        ("chmod_executable", re.compile(
-            r"chmod\s+\+x\s+", re.IGNORECASE,
+        # chmod setuid/setgid (privilege escalation)
+        ("chmod_setuid", re.compile(
+            r"chmod\s+[ugo]*\+[rwx]*s|chmod\s+[2467]\d{3}\s+", re.IGNORECASE,
+        )),
+        # chmod world-writable (insecure permissions)
+        ("chmod_world_writable", re.compile(
+            r"chmod\s+(777|666|o\+w)\s+", re.IGNORECASE,
         )),
         # Cron injection
         ("cron_injection", re.compile(

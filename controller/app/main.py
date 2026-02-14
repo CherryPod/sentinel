@@ -4,6 +4,9 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+from slowapi import Limiter
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
 
 from .approval import ApprovalManager
 from .auth import PinAuthMiddleware
@@ -19,6 +22,9 @@ from . import codeshield, prompt_guard
 from .scanner import CommandPatternScanner, CredentialScanner, SensitivePathScanner
 from .session import SessionStore
 from .tools import ToolExecutor
+
+# Rate limiter — per-IP, in-memory storage
+limiter = Limiter(key_func=get_remote_address)
 
 # Module-level references populated at startup
 _pin: str | None = None
@@ -153,7 +159,29 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Sentinel Controller", lifespan=lifespan)
+app.state.limiter = limiter
 app.add_middleware(PinAuthMiddleware, pin_getter=lambda: _pin)
+
+
+@app.exception_handler(RateLimitExceeded)
+async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
+    """Return JSON 429 when rate limit is exceeded."""
+    if _audit:
+        _audit.warning(
+            "Rate limit exceeded",
+            extra={
+                "event": "rate_limit_exceeded",
+                "path": str(request.url.path),
+                "remote": request.client.host if request.client else "unknown",
+            },
+        )
+    return JSONResponse(
+        status_code=429,
+        content={
+            "status": "error",
+            "reason": "Rate limit exceeded — try again later",
+        },
+    )
 
 
 @app.exception_handler(Exception)
@@ -323,20 +351,26 @@ async def process_text(req: ProcessRequest):
 class TaskRequest(BaseModel):
     request: str
     source: str = "api"
-    session_id: str | None = None
+    session_id: str | None = None  # Accepted but ignored — server assigns sessions
 
 
 @app.post("/task")
-async def handle_task(req: TaskRequest):
+@limiter.limit("10/minute")
+async def handle_task(req: TaskRequest, request: Request):
     """Full CaMeL pipeline: user request → Claude plans → Qwen executes → scanned result."""
     if _orchestrator is None:
         return {"status": "error", "reason": "Orchestrator not initialized"}
+
+    # Server-side session binding: derive session from client IP, not client-provided ID.
+    # This prevents attackers from rotating session IDs to bypass conversation tracking.
+    client_ip = request.client.host if request.client else "unknown"
+    source_key = f"{req.source}:{client_ip}"
 
     result = await _orchestrator.handle_task(
         user_request=req.request,
         source=req.source,
         approval_mode=settings.approval_mode,
-        session_id=req.session_id,
+        source_key=source_key,
     )
     return result.model_dump()
 

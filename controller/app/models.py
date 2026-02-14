@@ -93,7 +93,7 @@ class ConversationInfo(BaseModel):
 
 
 class TaskResult(BaseModel):
-    status: str                          # "success", "blocked", "denied", "error"
+    status: str                          # "success", "blocked", "denied", "refused", "error"
     plan_summary: str = ""
     step_results: list[StepResult] = Field(default_factory=list)
     reason: str = ""

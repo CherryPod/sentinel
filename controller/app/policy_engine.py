@@ -33,6 +33,9 @@ class PolicyEngine:
             re.compile(r"\$\("),       # $( subshell
             re.compile(r"`"),          # backtick subshell
             re.compile(r";\s*"),       # semicolon chaining
+            re.compile(r"&&"),         # AND chaining
+            re.compile(r"\|\|"),       # OR chaining
+            re.compile(r"(?<!\|)\|(?!\|)"),  # bare pipe (not ||)
         ]
 
     # ── Path normalisation ──────────────────────────────────────────

@@ -30,6 +30,7 @@ class Settings(BaseSettings):
     prompt_guard_enabled: bool = True
     prompt_guard_model: str = "meta-llama/Llama-Prompt-Guard-2-86M"
     prompt_guard_threshold: float = 0.9
+    require_prompt_guard: bool = True  # fail-closed: block if PG unavailable
 
     # Claude planner (Phase 3)
     claude_api_key_file: str = "/run/secrets/claude_api_key"
@@ -51,11 +52,14 @@ class Settings(BaseSettings):
     pin_required: bool = True
     pin_file: str = "/run/secrets/sentinel_pin"
 
+    # CodeShield (Phase 5)
+    require_codeshield: bool = True  # fail-closed: block if CodeShield unavailable
+
     # Conversation tracking (Phase 5)
     session_ttl: int = 3600  # 1 hour
     session_max_count: int = 1000
-    conversation_warn_threshold: float = 5.0
-    conversation_block_threshold: float = 10.0
+    conversation_warn_threshold: float = 3.0
+    conversation_block_threshold: float = 5.0
     conversation_enabled: bool = True
 
 

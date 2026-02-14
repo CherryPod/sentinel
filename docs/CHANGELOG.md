@@ -1,8 +1,189 @@
 # Changelog
 
+## Tier 3 — Stress Test Expansion (2026-02-14)
+
+Comprehensive expansion of `scripts/stress_test.py` addressing all 7 Tier 3 audit items (#16-22) plus holistic gaps identified during review.
+
+### Test Runner Classification Fix (#21)
+- Added `_classify_response()` method with priority: blocked > refused (status) > refused (heuristic) > success > error
+- 20 refusal indicator phrases for heuristic detection (covers "I cannot", "request refused", "must decline", etc.)
+- Stats now track 4 buckets per category: success, blocked, refused, error
+- Summary shows **true escape rate**, **combined block rate**, **planner refusal rate**, and **top block reasons**
+- Progress line includes `ref=` (refused count)
+- Previously: planner refusals misclassified as escapes, inflating rate from 5.3% to 30.2%
+
+### New Adversarial Categories (160 new prompts)
+| Category | Count | Audit Item |
+|----------|-------|------------|
+| tool_manipulation | 30 | #16 — fictitious tools, manipulated params, trust laundering, flag injection, step ordering |
+| non_english_injection | 30 | #18 — Chinese, Russian, Arabic, Japanese, Korean, mixed-language (hand-written) |
+| cross_model_confusion | 15 | #19 — data injection targeting Qwen, Chinese system prompts, output format exploitation |
+| payload_free_injection | 15 | #20 — safety suppression, behavioral anchoring, mode escalation, format extraction |
+| threshold_evasion | 10 | Holistic — prompts designed to score 0.5-0.89 on PromptGuard (below 0.9 threshold) |
+| chunking_boundary | 8 | Holistic — injection placed at 2000-char PromptGuard chunk boundary |
+| dos_resource | 10 | Holistic — 100K input, nested JSON, Unicode bombs, scanner stress tests |
+| unicode_homoglyph | 12 | Holistic — Cyrillic, full-width, RTL override, combining chars, soft hyphens |
+| owasp_llm | 15 | Holistic — OWASP LLM Top 10 (LLM01/02/04/05/06/07/09/10) |
+| model_specific_jailbreak | 10 | Holistic — prefix injection, XML tags, Qwen chat templates, many-shot, crescendo |
+| benchmark_inspired | 5 | #22 — GCG suffix, PAIR roleplay, TAP refinement, HarmBench, AutoDAN |
+
+### New Genuine Category
+- **genuine_multi_turn**: 25 chains (75 turns) — code iteration, debugging, architecture, config/deploy, docs, learning
+- All hand-written, realistic conversations for measuring multi-turn false positive rate
+
+### Queue & CLI Updates
+- Default `max_requests`: 750 → 1400
+- `WARMUP_COUNT`: 10 → 15, `STEADY_COUNT`: 90 → 135
+- Added `--categories` flag for targeted re-testing (e.g. `--categories tool_manipulation non_english_injection`)
+- DoS prompts placed at end of queue (won't crash controller before other tests complete)
+- Grand total: **976 prompts** (175 genuine + 801 adversarial)
+
+---
+
+## Tier 2 Architecture Fixes — 8 Issues Resolved (2026-02-14)
+
+All 8 "should fix soon" architectural issues from the security audit, plus test runner classification (#15):
+
+### 7. Deterministic Scanners on Input (`pipeline.py`)
+- Input scan now runs all 4 scanners: PromptGuard + credential + sensitive path + command pattern
+- Previously only PromptGuard ran on inbound text
+
+### 8. Command Chaining Detection (`policy_engine.py`)
+- Added injection patterns: `&&`, `||`, bare `|` (using negative lookahead/lookbehind to avoid matching `||`)
+- Blocks shell injection via command chaining in tool execution
+
+### 9. Block `find -exec` Patterns (`sentinel-policy.yaml`)
+- Added `-exec` and `-execdir` to blocked_patterns
+- Prevents command execution via find's -exec flag
+
+### 10. Path-Constrain Additional Commands (`sentinel-policy.yaml`)
+- Added `head`, `tail`, `grep`, `ls`, `wc` to path_constrained list
+- These commands now enforce read_allowed path checks on their arguments
+
+### 11. Specific Block Reasons (`orchestrator.py`)
+- Block messages now include scanner name and matched pattern(s)
+- Format: "Input blocked — scanner_name: pattern1, pattern2"
+- SecurityViolation errors include scanner details
+
+### 12. Fail-Closed for CodeShield/PromptGuard (`pipeline.py`, `orchestrator.py`, `config.py`)
+- Added `require_prompt_guard` and `require_codeshield` config settings (both default True)
+- When required scanner is unavailable, requests are blocked instead of silently skipping
+- PromptGuard fail-closed in both `scan_input()` and `scan_output()`
+- CodeShield fail-closed in `_execute_llm_task()`
+
+### 13. Tuned Output Scanner for Code Generation (`scanner.py`)
+- Replaced broad `chmod +x` pattern (major FP source) with targeted patterns:
+  - `chmod_setuid`: catches setuid/setgid (u+s, g+s, 4xxx, 2xxx modes)
+  - `chmod_world_writable`: catches 777, 666, o+w
+- Normal `chmod +x script.sh` no longer flagged (command execution still blocked by policy engine)
+
+### 14. Planner Refusal Classification (`planner.py`, `orchestrator.py`, `models.py`)
+- Added `PlannerRefusalError` exception class
+- Empty Claude responses classified as planner refusals (not errors)
+- Non-JSON text responses checked for refusal indicators
+- Orchestrator returns `status="refused"` instead of `status="error"`
+- Refusals recorded as conversation turns for session tracking
+
+### Test Coverage
+- 415 tests passing (up from 413)
+- Updated tests for: new chmod patterns, path-constrained ls, fail-closed behavior, specific block reasons
+
+---
+
+## Tier 1 Security Fixes — All 6 Critical Issues Resolved (2026-02-14)
+
+All 6 "must fix before hostile deployment" issues from the security audit have been addressed:
+
+### 1. PIN Auth Hardened (`auth.py`)
+- Constant-time comparison via `hmac.compare_digest()` — prevents timing side-channel attacks
+- Per-IP lockout after 5 failed attempts (60s cooldown) — prevents brute-force enumeration
+- Successful auth clears failure counter
+
+### 2. Conversation Block Threshold Lowered (`config.py`)
+- Block threshold: 10.0 → 5.0 (old threshold was never reached; max stress test score was 7.0)
+- Warn threshold: 5.0 → 3.0 (maintains graduated response: allow < 3.0, warn 3.0-4.99, block >= 5.0)
+
+### 3. Server-Side Session IDs (`main.py`, `orchestrator.py`)
+- Sessions now keyed by `source:client_ip` — server-generated, not client-provided
+- Client-provided `session_id` is accepted but ignored (backwards compatibility)
+- Prevents session rotation and replay attacks against conversation tracking
+
+### 4. Rate Limiting (`main.py`, `requirements.txt`)
+- Added `slowapi` rate limiter: 10 requests/minute per IP on `/task` endpoint
+- Returns JSON 429 with clear error message when exceeded
+- Prevents API credit exhaustion and DoS
+
+### 5. Provenance Trust Gate (`orchestrator.py`)
+- `is_trust_safe_for_execution()` now called before every tool execution
+- Checks provenance chain of all `$var_name` references in tool call args
+- Blocks execution when any arg has UNTRUSTED data in its provenance chain
+- Core CaMeL security guarantee now enforced
+
+### 6. Trust Laundering Prevention (`tools.py`, `provenance.py`)
+- Added file provenance registry: tracks which data_id wrote each file
+- `file_read` inherits trust from the writer's provenance chain (not blind TRUSTED)
+- `file_write` records provenance for every write operation
+- Pre-existing workspace files (no tracked writer) still default to TRUSTED
+- Defence-in-depth: trust gate (#5) blocks the write, provenance (#6) blocks the read
+
+### Test Coverage
+- 413 tests passing (up from 395)
+- 18 new tests: PIN lockout (5), trust gate (3), execution context data IDs (4), file provenance (6)
+- Updated 4 existing tests for new thresholds and server-side sessions
+
+---
+
+## Security Audit — Full Analysis (2026-02-14)
+
+Comprehensive security audit of the stress test results, pipeline code, test coverage, and infrastructure. Four parallel analysis agents assessed the system from different angles.
+
+### Key Finding: True Escape Rate is 5.3%, Not 30.2%
+The test runner misclassified Claude planner refusals (plan_summary starts with "Request refused") as escapes. Of 194 adversarial "successes", 160 were actually refused by Claude. Only 34 truly bypassed all defences.
+
+- **Combined block rate: 89.9%** (hard blocked 64.9% + planner refused 25.0%)
+- **True escapes: 34** — 20 multi_turn, 9 code_injection, 3 indirect_injection, 1 edge_case, 1 credential_exfil
+- **False positive rate: 17%** — 10 from output scanner, 5 from chmod pattern, 1 CodeShield, 1 cd not allowed
+- **Test coverage grade: C+** — solid first iteration, 5 critical test categories missing
+
+### Critical Architectural Findings (3)
+1. **Provenance trust checks never called** — `is_trust_safe_for_execution()` exists but is never invoked. Core CaMeL guarantee unenforced
+2. **Trust laundering via filesystem** — `file_read` tags everything TRUSTED, even files written by Qwen (UNTRUSTED)
+3. **Client-controlled session IDs** — attacker sends new session_id per request to bypass all conversation tracking
+
+### Pipeline Code Audit: 26 Findings
+- CRITICAL (6): fail-open scanners, unenforced provenance, trust laundering, PIN timing attack, no rate limiting, input scanning gaps
+- HIGH (8): command chaining bypass, substring matching evasion, path-constrained gaps, regex evasion vectors, find -exec, conversation threshold too high, unbounded stores, opaque block reasons
+- MEDIUM (8): spotlighting weakness, CSRF, port 8000 exposed, planner prompt leakage, TOCTOU, approval auth, sensitive path FPs, approval queue unbounded
+- LOW (4): approval queue DoS, exception detail leakage, no CSRF, stored HTML
+
+### Prioritised Remediation: 30 Items Across 4 Tiers
+- Tier 1 (6 items): Must fix before hostile deployment — provenance, trust laundering, server-side sessions, conversation threshold, rate limiting, PIN auth
+- Tier 2 (9 items): Should fix soon — input scanning, command chaining, find -exec, path constraints, block reasons, fail-closed scanners, output scanner tuning, step types, empty response classification
+- Tier 3 (7 items): Test suite expansion — tool manipulation, genuine multi-turn, non-English, cross-model, payload-free, runner classification, academic benchmarks
+- Tier 4 (8 items): Infrastructure — resource limits, read-only FS, image pinning, TLS, CSRF, CSP, log forwarding, health check backoff
+
+### Files
+- **Full report:** `docs/archive/2026-02-14_stress-test-security-audit.md`
+- **Test overview:** `docs/archive/2026-02-14_stress-test-overview.md`
+- **Raw results:** `scripts/results/2026-02-14-overnight/stress_test_results.jsonl`
+
+### Deployment Readiness: NOT YET READY
+Architecture score B+, implementation C+, test quality C+, infrastructure B-. Estimated ~2 weeks to deployment-ready across all tiers.
+
+---
+
 ## Adversarial Stress Test (2026-02-14)
 
-Full-pipeline adversarial stress test — 741 unique requests (100 genuine + 641 adversarial) across 10 attack categories. Designed to run unattended overnight.
+Full-pipeline adversarial stress test — 742 requests (100 genuine + 642 adversarial) across 10 attack categories. Ran overnight (~10hrs).
+
+### Results Summary
+- **Overall:** 433 blocked (58.4%), 274 success (36.9%), 34 error (4.6%)
+- **Genuine:** 80/100 passed (80%), 17 false positives (17%), 3 errors
+- **Adversarial:** 416/642 blocked (64.8%), 194 escapes (30.2%), 31 errors
+- **Strongest defence:** direct_injection (85.3% blocked), edge_case (77.3%), indirect_injection (74.2%)
+- **Weakest defence:** multi_turn (48.2%), code_injection (51.0%), encoding_obfuscation (54.9%)
+- **Results:** `scripts/results/2026-02-14-overnight/`
+- **Full overview:** `docs/archive/2026-02-14_stress-test-overview.md`
 
 ### New: Stress Test Script (`scripts/stress_test.py`)
 - **741 unique requests** — no repetitive prompts, all generated via a template-based variation engine with substitution pools

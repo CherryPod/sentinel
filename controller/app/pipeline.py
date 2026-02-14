@@ -3,7 +3,7 @@ import logging
 import time
 
 from .config import settings
-from .models import DataSource, ScanResult, TaggedData, TrustLevel
+from .models import DataSource, ScanMatch, ScanResult, TaggedData, TrustLevel
 from .provenance import create_tagged_data
 from .scanner import CommandPatternScanner, CredentialScanner, SensitivePathScanner
 from . import prompt_guard
@@ -55,22 +55,55 @@ class ScanPipeline:
         )
 
     def scan_input(self, text: str) -> PipelineScanResult:
-        """Scan inbound text (Prompt Guard only)."""
+        """Scan inbound text (Prompt Guard + deterministic scanners)."""
         t0 = time.monotonic()
         result = PipelineScanResult()
+
+        # Fail-closed: if PromptGuard is required but unavailable, block
+        if settings.prompt_guard_enabled and settings.require_prompt_guard and not prompt_guard.is_loaded():
+            result.results["prompt_guard"] = ScanResult(
+                found=True,
+                matches=[ScanMatch(
+                    pattern_name="scanner_unavailable",
+                    matched_text="Prompt Guard required but not loaded",
+                )],
+                scanner_name="prompt_guard",
+            )
+            return result
 
         if settings.prompt_guard_enabled:
             result.results["prompt_guard"] = prompt_guard.scan(
                 text, threshold=settings.prompt_guard_threshold
             )
 
+        # Run deterministic scanners on input too — catches obvious
+        # credential leaks, sensitive path references, and dangerous
+        # command patterns before they even reach the planner.
+        result.results["credential_scanner"] = self._cred_scanner.scan(text)
+        result.results["sensitive_path_scanner"] = self._path_scanner.scan(text)
+        result.results["command_pattern_scanner"] = self._cmd_scanner.scan(text)
+
         elapsed = time.monotonic() - t0
+
+        for scanner_name, sr in result.results.items():
+            if sr.found:
+                logger.warning(
+                    "Input scanner found matches",
+                    extra={
+                        "event": "input_scanner_match",
+                        "scanner": scanner_name,
+                        "match_count": len(sr.matches),
+                        "patterns": [m.pattern_name for m in sr.matches],
+                    },
+                )
+
         logger.info(
             "Input scan complete",
             extra={
                 "event": "scan_input",
                 "clean": result.is_clean,
                 "scanners": list(result.results.keys()),
+                "violations": list(result.violations.keys()),
                 "text_length": len(text),
                 "elapsed_s": round(elapsed, 3),
             },
@@ -81,6 +114,18 @@ class ScanPipeline:
         """Scan Qwen output (Prompt Guard + credential + sensitive path)."""
         t0 = time.monotonic()
         result = PipelineScanResult()
+
+        # Fail-closed: if PromptGuard is required but unavailable, block
+        if settings.prompt_guard_enabled and settings.require_prompt_guard and not prompt_guard.is_loaded():
+            result.results["prompt_guard"] = ScanResult(
+                found=True,
+                matches=[ScanMatch(
+                    pattern_name="scanner_unavailable",
+                    matched_text="Prompt Guard required but not loaded",
+                )],
+                scanner_name="prompt_guard",
+            )
+            return result
 
         if settings.prompt_guard_enabled:
             result.results["prompt_guard"] = prompt_guard.scan(

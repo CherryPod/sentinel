@@ -91,7 +91,8 @@ class TestScanInput:
     def test_prompt_guard_not_loaded_clean(self, mock_settings, pipeline):
         mock_settings.prompt_guard_enabled = True
         mock_settings.prompt_guard_threshold = 0.9
-        # prompt_guard._pipeline is None → returns clean
+        mock_settings.require_prompt_guard = False
+        # prompt_guard._pipeline is None → returns clean (non-fail-closed mode)
         result = pipeline.scan_input("any text")
         assert result.is_clean is True
 
