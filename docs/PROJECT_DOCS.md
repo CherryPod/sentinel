@@ -160,6 +160,11 @@ Every data item tagged with:
 │       ├── index.html               # Chat interface (single page)
 │       ├── style.css                # Dark theme styling
 │       └── app.js                   # Chat logic, API calls, approval flow
+├── scripts/
+│   ├── stress_test.py               # Adversarial stress test — 741 requests (100 genuine + 641 adversarial)
+│   ├── run_stress_test.sh           # Unattended runner: auto mode, rebuild, health check, restore on exit
+│   ├── .gitignore                   # Excludes results/ from git
+│   └── results/                     # JSONL results + runner logs (gitignored)
 ├── docs/
 │   ├── PROJECT_DOCS.md              # This file
 │   ├── project-sentinel-build-plan.md
@@ -197,7 +202,7 @@ paho-mqtt>=2.1.0
 | **4** | Interfaces | Signal + WebUI integration, conversational approval |
 | **5** | Hardening | Llama Guard 4, red teaming, tuning, performance benchmarks |
 
-**Current status:** Phase 5+ — Hardening deployed, CodeShield working, multi-turn conversation tracking, PIN auth, code review fixes, 395 tests passing
+**Current status:** Phase 5+ — Hardening deployed, CodeShield working, multi-turn conversation tracking, PIN auth, code review fixes, comprehensive logging, adversarial stress test (741 requests) running overnight. 395 tests passing
 
 > Signal integration planned but paused. Plan archived: `docs/archive/2026-02-12_phase4a-signal-mqtt-plan.md`.
 > CodeShield fix details: `docs/archive/2026-02-13_codeshield-fix.md`
@@ -303,4 +308,19 @@ podman exec sentinel-qwen curl https://google.com  # should FAIL
 # Build controller with Prompt Guard model
 podman build --secret id=hf_token,src=/home/kifterz/.secrets/hf_token.txt \
   -t sentinel_sentinel-controller controller/
+
+# ── Stress Test ──────────────────────────────────────────────
+# Run full overnight stress test (741 requests, handles auto mode + restore)
+nohup ./scripts/run_stress_test.sh &
+
+# Check stress test progress
+wc -l scripts/results/stress_test_*.jsonl
+tail -5 scripts/results/stress_test_*.jsonl | python3 -m json.tool
+tail -20 scripts/results/nohup_output*.log
+
+# Check if stress test is still running
+ps aux | grep stress_test | grep -v grep
+
+# View controller logs during stress test
+podman logs --tail 50 sentinel-controller
 ```

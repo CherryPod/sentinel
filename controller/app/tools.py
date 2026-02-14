@@ -2,6 +2,7 @@ import logging
 import os
 import shlex
 import subprocess
+import time
 
 from .models import DataSource, PolicyResult, TaggedData, TrustLevel
 from .policy_engine import PolicyEngine
@@ -78,9 +79,17 @@ class ToolExecutor:
             # Check exact flag names (e.g. -v, --volume)
             flag_name = arg.split("=", 1)[0] if "=" in arg else arg
             if flag_name in _DANGEROUS_PODMAN_FLAG_NAMES:
+                logger.warning(
+                    "Dangerous podman flag blocked",
+                    extra={"event": "podman_flag_blocked", "flag": arg, "cmd": shlex.join(cmd)},
+                )
                 raise ToolBlockedError(f"Dangerous podman flag blocked: {arg}")
             # Check full flag=value entries (e.g. --network=host)
             if arg in _DANGEROUS_PODMAN_FLAG_VALUES:
+                logger.warning(
+                    "Dangerous podman flag blocked",
+                    extra={"event": "podman_flag_blocked", "flag": arg, "cmd": shlex.join(cmd)},
+                )
                 raise ToolBlockedError(f"Dangerous podman flag blocked: {arg}")
 
     async def execute(self, tool_name: str, args: dict) -> TaggedData:
@@ -105,9 +114,25 @@ class ToolExecutor:
         }.get(tool_name)
 
         if handler is None:
+            logger.warning(
+                "Unknown tool requested",
+                extra={"event": "tool_unknown", "tool": tool_name},
+            )
             raise ToolError(f"Unknown tool: {tool_name}")
 
-        return await handler(args)
+        t0 = time.monotonic()
+        result = await handler(args)
+        elapsed = time.monotonic() - t0
+        logger.info(
+            "Tool execution complete",
+            extra={
+                "event": "tool_complete",
+                "tool": tool_name,
+                "data_id": result.id,
+                "elapsed_s": round(elapsed, 3),
+            },
+        )
+        return result
 
     async def _file_write(self, args: dict) -> TaggedData:
         path = args.get("path", "")
@@ -115,7 +140,16 @@ class ToolExecutor:
 
         result = self._engine.check_file_write(path)
         if result.status != PolicyResult.ALLOWED:
+            logger.warning(
+                "file_write blocked by policy",
+                extra={"event": "file_write_blocked", "path": path, "reason": result.reason},
+            )
             raise ToolBlockedError(f"file_write blocked: {result.reason}")
+
+        logger.debug(
+            "file_write policy passed",
+            extra={"event": "file_write_allowed", "path": path},
+        )
 
         try:
             parent = os.path.dirname(path)
@@ -124,6 +158,10 @@ class ToolExecutor:
             with open(path, "w") as f:
                 f.write(content)
         except OSError as exc:
+            logger.error(
+                "file_write OS error",
+                extra={"event": "file_write_error", "path": path, "error": str(exc)},
+            )
             raise ToolError(f"file_write failed: {exc}") from exc
 
         logger.info(
@@ -142,14 +180,31 @@ class ToolExecutor:
 
         result = self._engine.check_file_read(path)
         if result.status != PolicyResult.ALLOWED:
+            logger.warning(
+                "file_read blocked by policy",
+                extra={"event": "file_read_blocked", "path": path, "reason": result.reason},
+            )
             raise ToolBlockedError(f"file_read blocked: {result.reason}")
+
+        logger.debug(
+            "file_read policy passed",
+            extra={"event": "file_read_allowed", "path": path},
+        )
 
         try:
             with open(path) as f:
                 content = f.read()
         except OSError as exc:
+            logger.error(
+                "file_read OS error",
+                extra={"event": "file_read_error", "path": path, "error": str(exc)},
+            )
             raise ToolError(f"file_read failed: {exc}") from exc
 
+        logger.info(
+            "File read",
+            extra={"event": "file_read_success", "path": path, "size": len(content)},
+        )
         return create_tagged_data(
             content=content,
             source=DataSource.TOOL,
@@ -162,12 +217,25 @@ class ToolExecutor:
 
         result = self._engine.check_file_write(path)
         if result.status != PolicyResult.ALLOWED:
+            logger.warning(
+                "mkdir blocked by policy",
+                extra={"event": "mkdir_blocked", "path": path, "reason": result.reason},
+            )
             raise ToolBlockedError(f"mkdir blocked: {result.reason}")
 
         try:
             os.makedirs(path, exist_ok=True)
         except OSError as exc:
+            logger.error(
+                "mkdir OS error",
+                extra={"event": "mkdir_error", "path": path, "error": str(exc)},
+            )
             raise ToolError(f"mkdir failed: {exc}") from exc
+
+        logger.info(
+            "Directory created",
+            extra={"event": "mkdir_success", "path": path},
+        )
 
         return create_tagged_data(
             content=f"Directory created: {path}",
@@ -181,7 +249,16 @@ class ToolExecutor:
 
         result = self._engine.check_command(command)
         if result.status != PolicyResult.ALLOWED:
+            logger.warning(
+                "Shell command blocked by policy",
+                extra={"event": "shell_blocked", "command": command, "reason": result.reason},
+            )
             raise ToolBlockedError(f"shell blocked: {result.reason}")
+
+        logger.info(
+            "Shell command policy passed",
+            extra={"event": "shell_allowed", "command": command},
+        )
 
         try:
             proc = subprocess.run(
@@ -194,9 +271,21 @@ class ToolExecutor:
             output = proc.stdout
             if proc.returncode != 0:
                 output += f"\n[exit code: {proc.returncode}]\n{proc.stderr}"
+                logger.warning(
+                    "Shell command non-zero exit",
+                    extra={"event": "shell_nonzero", "command": command, "exit_code": proc.returncode},
+                )
         except subprocess.TimeoutExpired:
+            logger.error(
+                "Shell command timed out",
+                extra={"event": "shell_timeout", "command": command},
+            )
             raise ToolError(f"shell command timed out: {command}")
         except OSError as exc:
+            logger.error(
+                "Shell command OS error",
+                extra={"event": "shell_error", "command": command, "error": str(exc)},
+            )
             raise ToolError(f"shell failed: {exc}") from exc
 
         return create_tagged_data(
@@ -214,7 +303,16 @@ class ToolExecutor:
         self._check_podman_flags(cmd)
         result = self._engine.check_command(shlex.join(cmd))
         if result.status != PolicyResult.ALLOWED:
+            logger.warning(
+                "podman_build blocked by policy",
+                extra={"event": "podman_build_blocked", "tag": tag, "reason": result.reason},
+            )
             raise ToolBlockedError(f"podman_build blocked: {result.reason}")
+
+        logger.info(
+            "podman_build policy passed",
+            extra={"event": "podman_build_allowed", "tag": tag, "context_path": context_path},
+        )
 
         try:
             proc = subprocess.run(
@@ -227,9 +325,15 @@ class ToolExecutor:
             output = proc.stdout
             if proc.returncode != 0:
                 output += f"\n[exit code: {proc.returncode}]\n{proc.stderr}"
+                logger.warning(
+                    "podman_build non-zero exit",
+                    extra={"event": "podman_build_nonzero", "tag": tag, "exit_code": proc.returncode},
+                )
         except subprocess.TimeoutExpired:
+            logger.error("podman_build timed out", extra={"event": "podman_build_timeout", "tag": tag})
             raise ToolError("podman build timed out")
         except OSError as exc:
+            logger.error("podman_build OS error", extra={"event": "podman_build_error", "tag": tag, "error": str(exc)})
             raise ToolError(f"podman_build failed: {exc}") from exc
 
         return create_tagged_data(
@@ -247,7 +351,16 @@ class ToolExecutor:
         self._check_podman_flags(cmd)
         result = self._engine.check_command(shlex.join(cmd))
         if result.status != PolicyResult.ALLOWED:
+            logger.warning(
+                "podman_run blocked by policy",
+                extra={"event": "podman_run_blocked", "image": image, "name": name, "reason": result.reason},
+            )
             raise ToolBlockedError(f"podman_run blocked: {result.reason}")
+
+        logger.info(
+            "podman_run policy passed",
+            extra={"event": "podman_run_allowed", "image": image, "name": name},
+        )
 
         try:
             proc = subprocess.run(
@@ -260,9 +373,15 @@ class ToolExecutor:
             output = proc.stdout
             if proc.returncode != 0:
                 output += f"\n[exit code: {proc.returncode}]\n{proc.stderr}"
+                logger.warning(
+                    "podman_run non-zero exit",
+                    extra={"event": "podman_run_nonzero", "name": name, "exit_code": proc.returncode},
+                )
         except subprocess.TimeoutExpired:
+            logger.error("podman_run timed out", extra={"event": "podman_run_timeout", "name": name})
             raise ToolError("podman run timed out")
         except OSError as exc:
+            logger.error("podman_run OS error", extra={"event": "podman_run_error", "name": name, "error": str(exc)})
             raise ToolError(f"podman_run failed: {exc}") from exc
 
         return create_tagged_data(
@@ -279,7 +398,16 @@ class ToolExecutor:
         self._check_podman_flags(cmd)
         result = self._engine.check_command(shlex.join(cmd))
         if result.status != PolicyResult.ALLOWED:
+            logger.warning(
+                "podman_stop blocked by policy",
+                extra={"event": "podman_stop_blocked", "container": container_name, "reason": result.reason},
+            )
             raise ToolBlockedError(f"podman_stop blocked: {result.reason}")
+
+        logger.info(
+            "podman_stop policy passed",
+            extra={"event": "podman_stop_allowed", "container": container_name},
+        )
 
         try:
             proc = subprocess.run(
@@ -292,9 +420,15 @@ class ToolExecutor:
             output = proc.stdout
             if proc.returncode != 0:
                 output += f"\n[exit code: {proc.returncode}]\n{proc.stderr}"
+                logger.warning(
+                    "podman_stop non-zero exit",
+                    extra={"event": "podman_stop_nonzero", "container": container_name, "exit_code": proc.returncode},
+                )
         except subprocess.TimeoutExpired:
+            logger.error("podman_stop timed out", extra={"event": "podman_stop_timeout", "container": container_name})
             raise ToolError("podman stop timed out")
         except OSError as exc:
+            logger.error("podman_stop OS error", extra={"event": "podman_stop_error", "container": container_name, "error": str(exc)})
             raise ToolError(f"podman_stop failed: {exc}") from exc
 
         return create_tagged_data(

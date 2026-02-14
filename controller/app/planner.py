@@ -1,5 +1,6 @@
 import json
 import logging
+import time
 
 import anthropic
 
@@ -11,6 +12,80 @@ logger = logging.getLogger("sentinel.audit")
 _PLANNER_SYSTEM_PROMPT_TEMPLATE = """\
 You are a task planner for a secure execution system. Given a user request, \
 produce a JSON execution plan.
+
+SYSTEM CONTEXT:
+You are planning tasks for "thebeast" — an Ubuntu Linux server running:
+- AMD Ryzen 7 5700X (8c/16t), 64GB RAM, RTX 3060 12GB
+- Rootless Podman (not Docker) — always use Podman conventions
+- The quarantined text worker is Qwen 3 14B (air-gapped, no internet, \
+no tools, no file access)
+- All generated files go to /workspace/ inside the controller container
+
+Podman conventions to include in worker prompts when relevant:
+- Always use restart policy: always
+- Always create non-root users in Containerfiles
+- Use HEALTHCHECK where appropriate (use python/wget, not curl — slim \
+images don't include curl)
+- Use multi-stage builds to reduce image size
+- Use .containerignore (not .dockerignore)
+- Use Containerfile (not Dockerfile) as the filename
+
+ABOUT THE WORKER LLM:
+- The worker is air-gapped — it has no internet, no tools, no file access
+- It only receives your prompt text and returns text
+- It does not know the current date, the user's name, or anything about \
+the system unless you tell it
+- If the worker needs system-specific details (OS, paths, versions, \
+conventions), you must include them in your prompt
+- The worker's output is UNTRUSTED and will be security-scanned before \
+any action is taken
+
+CRITICAL — instruction detail for llm_task steps:
+When creating llm_task steps, pass through ALL detail from the user's \
+request. Do not summarise, compress, or paraphrase requirements. The \
+worker LLM has no context beyond what you give it — it cannot see the \
+original request. Adapt each prompt to the specific request — do not \
+reuse phrasing from these examples.
+
+Example 1 — Containerfile request:
+
+  BAD (too vague):
+    "prompt": "Generate a Containerfile for a Flask app with non-root user"
+
+  GOOD (preserves all detail):
+    "prompt": "Generate a Podman Containerfile for a Python Flask application.\\n\
+Requirements:\\n\
+- Use an appropriate python slim base image\\n\
+- Multi-stage build: builder stage installs dependencies, final stage \
+copies only what's needed\\n\
+- Create a non-root user called 'appuser' (UID 1000) and run the app \
+as that user\\n\
+- The app has these dependencies: flask, gunicorn, requests\\n\
+- Expose port 8080\\n\
+- Use gunicorn as the production WSGI server (not Flask dev server)\\n\
+- Add a HEALTHCHECK using python urllib (not curl — slim images \
+don't include curl)\\n\
+- Add a .containerignore for __pycache__, .git, .env, venv/"
+
+Example 2 — Python script request:
+
+  BAD (too vague):
+    "prompt": "Write a script to process CSV files"
+
+  GOOD (preserves all detail):
+    "prompt": "Write a Python script that reads a CSV file from a path \
+given as a command-line argument and produces a summary report.\\n\
+Requirements:\\n\
+- Use only the standard library (csv, argparse, collections)\\n\
+- Read the CSV with headers from the first row\\n\
+- Count unique values in each column\\n\
+- Print a formatted summary showing: total rows, column names, \
+and top 5 most frequent values per column\\n\
+- Handle errors gracefully: missing file, empty file, malformed rows\\n\
+- Use if __name__ == '__main__' guard\\n\
+- Use appropriate logging (logging module, not print statements) for \
+errors and warnings\\n\
+- Output should be human-readable plain text, not JSON"
 
 Respond ONLY with a JSON object (no markdown, no commentary) matching this schema:
 {{
@@ -47,9 +122,9 @@ Rules:
 
 Code detection — expects_code:
 - ALWAYS set expects_code=true when the LLM step may produce: shell scripts, \
-Python/JS/any code, Dockerfiles, config files with executable content (YAML \
-pipelines, nginx configs), HTML containing JavaScript, SQL statements, or \
-shell commands.
+Python/JS/any code, Dockerfiles/Containerfiles, config files with executable \
+content (YAML pipelines, nginx configs), HTML containing JavaScript, SQL \
+statements, or shell commands.
 - When in doubt, set expects_code=true. It is safer to over-flag than to miss.
 
 Security constraints — NEVER violate these:
@@ -123,6 +198,7 @@ class ClaudePlanner:
         )
 
         last_error: Exception | None = None
+        t0 = time.monotonic()
         for attempt in range(2):  # initial + 1 retry
             try:
                 response = await self._client.messages.create(
@@ -134,26 +210,53 @@ class ClaudePlanner:
                 break
             except anthropic.APIConnectionError as exc:
                 last_error = PlannerError(f"Cannot connect to Claude API: {exc}")
+                logger.warning(
+                    "Claude API connection error",
+                    extra={"event": "planner_connect_error", "attempt": attempt + 1, "error": str(exc)},
+                )
                 if attempt == 0:
                     continue
                 raise last_error from exc
             except anthropic.APITimeoutError as exc:
                 last_error = PlannerError(f"Claude API timed out: {exc}")
+                logger.warning(
+                    "Claude API timeout",
+                    extra={"event": "planner_timeout", "attempt": attempt + 1, "timeout_s": settings.claude_timeout},
+                )
                 if attempt == 0:
                     continue
                 raise last_error from exc
             except anthropic.APIStatusError as exc:
+                logger.error(
+                    "Claude API status error",
+                    extra={"event": "planner_api_error", "status_code": exc.status_code, "error_message": exc.message},
+                )
                 raise PlannerError(
                     f"Claude API error {exc.status_code}: {exc.message}"
                 ) from exc
         else:
             raise last_error  # type: ignore[misc]
 
+        api_elapsed = time.monotonic() - t0
+
         # Extract text content from response
         raw_text = ""
         for block in response.content:
             if block.type == "text":
                 raw_text += block.text
+
+        # Log API timing and token usage
+        usage = getattr(response, "usage", None)
+        logger.info(
+            "Claude API response received",
+            extra={
+                "event": "planner_response",
+                "elapsed_s": round(api_elapsed, 2),
+                "input_tokens": getattr(usage, "input_tokens", None) if usage else None,
+                "output_tokens": getattr(usage, "output_tokens", None) if usage else None,
+                "response_length": len(raw_text),
+            },
+        )
 
         if not raw_text.strip():
             raise PlannerError("Claude returned empty response")
@@ -191,6 +294,8 @@ class ClaudePlanner:
                 "event": "plan_created",
                 "summary": plan.plan_summary,
                 "step_count": len(plan.steps),
+                "step_types": [s.type for s in plan.steps],
+                "step_ids": [s.id for s in plan.steps],
             },
         )
         return plan

@@ -1,5 +1,109 @@
 # Changelog
 
+## Adversarial Stress Test (2026-02-14)
+
+Full-pipeline adversarial stress test — 741 unique requests (100 genuine + 641 adversarial) across 10 attack categories. Designed to run unattended overnight.
+
+### New: Stress Test Script (`scripts/stress_test.py`)
+- **741 unique requests** — no repetitive prompts, all generated via a template-based variation engine with substitution pools
+- **100 genuine prompts** across 14 categories: Python, Rust, Go, JavaScript, TypeScript, HTML, containers, DevOps, configs, data processing, essays, docs, bash, short queries
+- **641 adversarial prompts** across 10 attack categories:
+  - Direct injection (116): override phrases, persona-based, authority impersonation
+  - Path traversal (97): sensitive paths, traversal variants, creative framing
+  - Multi-turn chains (83): 24 chains with session IDs — boiling frog, breadcrumb, jailbreak progression, etc.
+  - Social engineering (68): pretexted requests, urgency manipulation, helpfulness exploitation, gaslighting, emotional manipulation
+  - Indirect injection (66): document-embedded payloads, subtle insertions in translations/transcripts/code
+  - Credential exfiltration (65): fake key handling, exfiltration via curl/wget/DNS
+  - Code injection (51): vulnerable code wrappers, reverse shells, supply chain, logic bombs, container escape
+  - Encoding/obfuscation (51): base64, hex, ROT13, char-by-char, URL encoding, string concatenation, mixed case
+  - Edge cases (45): Cyrillic homoglyphs, zero-width spaces, null bytes, extreme padding, emoji, hypothetical framing, RTL override
+  - Legitimate (15): false-positive canaries from adversarial prompt set
+- **~20 exact repeats** for consistency testing
+- Multi-turn chains interleaved at regular intervals among shuffled singles
+- Gradual ramp-up: warmup (5s delay) → steady (2s) → rapid (0s)
+- JSONL logging with `os.fsync()` per request (crash-safe)
+- Retry logic: 10 retries with exponential backoff, health check polling during recovery
+- Budget exhaustion detection: stops gracefully if Claude rate-limited
+- SIGINT/SIGTERM handling for graceful shutdown
+- Progress reporting every 25 requests, summary at end
+
+### New: Runner Script (`scripts/run_stress_test.sh`)
+- Handles full lifecycle: switch to auto mode → rebuild containers → health check → smoke test → run stress test → restore approval mode to full
+- `trap restore_approval EXIT` ensures approval mode is always restored, even on crash/kill
+- Health check: polls `/health` every 5s, max 2 minutes
+- Smoke test: sends "What is 2+2?" and verifies valid JSON response
+- Logs everything to `scripts/results/runner_TIMESTAMP.log`
+- Passthrough CLI args (e.g. `--max-requests 100`)
+
+### New: Adversarial Prompts Library (`controller/tests/adversarial_prompts.py`)
+- 84 handcrafted adversarial + legitimate prompts (69 adversarial + 15 legitimate)
+- 10 categories with expected catch annotations
+- 7 multi-turn attack chains
+- Used as seed data for the stress test variation engine
+
+### Config Change
+- `podman-compose.yaml`: Added `SENTINEL_OLLAMA_TIMEOUT=1800` (30 min, was default 120s) — genuine code generation requests need time to complete through the full pipeline
+
+### Bug Fix
+- `run_stress_test.sh`: Fixed `except:` → `except Exception:` in health check — bare `except` catches `SystemExit` from `sys.exit()`, causing infinite loop
+
+---
+
+## Comprehensive Logging (2026-02-14)
+
+Filled 69 logging gaps across all 11 controller modules. Every meaningful operation now emits structured JSON audit events.
+
+### Modules Updated
+- **orchestrator.py** — task_received, session_created, plan_request_start, step_start, step_complete, pipeline_complete, task_input_blocked, task_error
+- **planner.py** — planner_request, planner_response (timing + tokens), plan_created (summary + step types), planner_connect_error, planner_timeout, planner_api_error
+- **worker.py** — qwen_request (prompt length + hash), qwen_response (timing + length), qwen_error, qwen_retry
+- **pipeline.py** — scan_input (clean/dirty + scanner list), scan_output (violations), pipeline_complete (trust level)
+- **codeshield.py** — codeshield_scan_complete (issues count + CWE IDs), codeshield_scan_error, codeshield_init
+- **prompt_guard.py** — prompt_guard_result (label + score), prompt_guard_error
+- **tools.py** — tool_execute, tool_complete (timing + data_id), policy_check_failed, file_written
+- **approval.py** — approval_requested, approval_submitted (granted/denied + reason), approval_expired, approval_checked
+- **auth.py** — pin_auth_failed (path + method + remote IP + whether PIN was supplied)
+- **session.py** — session_created, session_expired, session_locked, session_retrieved
+- **conversation.py** — conversation_analysis (per-rule scores), conversation_block, conversation_warn
+
+### Logging Verification
+Manually tested via WebUI — every pipeline stage produces traceable structured JSON events:
+- Genuine request: task_received → scan_input → planner_request → planner_response → plan_created → approval → step_start → qwen_request → qwen_response → scan_output → codeshield_scan_complete → step_complete → file_written
+- Adversarial request: task_received → scan_input (clean: false) → task_input_blocked
+- Missing PIN: pin_auth_failed
+
+---
+
+## Pipeline Quality Improvements (2026-02-13)
+
+Fixes and improvements from live pipeline testing — HTML parsing bug, planner/worker prompt enrichment.
+
+### Fix: HTML output breaking JSON parsing
+- **Controller** (`main.py`): Added global exception handler — all errors now return JSON, never HTML error pages. Logs exception details for debugging
+- **UI** (`app.js`): Added `parseJsonResponse()` helper — checks `Content-Type` before calling `.json()`, shows readable error on non-JSON responses instead of crashing with "Unexpected token '<'"
+
+### Enhancement: Claude planner system prompt
+- Added **System Context** block: hardware specs (Ryzen 7, 64GB, RTX 3060), rootless Podman, workspace path
+- Added **Podman conventions**: restart:always, non-root users, HEALTHCHECK (python/wget not curl), multi-stage builds, Containerfile naming, .containerignore
+- Added **Worker Awareness**: explains Qwen is air-gapped, has no context unless provided, output is untrusted
+- Added **Instruction Detail** rule: "pass through ALL detail, do not summarise" with two worked examples (Containerfile + Python script including logging guidance)
+- Added guard: "Adapt each prompt to the specific request — do not reuse phrasing from these examples"
+
+### Enhancement: Qwen worker system prompt
+- Added Linux/Podman context: forward slash paths, LF line endings, bash-compatible syntax, Containerfile conventions
+- Spotlighting + no-tools instructions unchanged
+
+### Modified Files
+- `controller/app/main.py` — global exception handler
+- `controller/app/planner.py` — enriched system prompt
+- `controller/app/worker.py` — enriched system prompt
+- `gateway/static/app.js` — JSON response validation
+
+### Tests
+- **395 tests passing** (zero regressions, no new tests — changes are prompt/error-handling only)
+
+---
+
 ## Code Review Fixes (2026-02-13)
 
 Addressed 5 of 12 remaining code review issues (from `docs/archive/2026-02-12_code-review.md`). Items #2, #3, #10 were fixed in Phase 5. Items #6, #8, #11-15 deferred (low risk for LAN+Tailscale threat model).

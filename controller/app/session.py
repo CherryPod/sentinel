@@ -116,6 +116,11 @@ class SessionStore:
             sid for sid, s in self._sessions.items()
             if now - s.last_active > self._ttl
         ]
+        if expired:
+            logger.info(
+                "Sessions evicted (TTL)",
+                extra={"event": "session_evict_ttl", "count": len(expired)},
+            )
         for sid in expired:
             del self._sessions[sid]
 
@@ -124,4 +129,12 @@ class SessionStore:
         if not self._sessions:
             return
         oldest_id = min(self._sessions, key=lambda sid: self._sessions[sid].last_active)
+        logger.info(
+            "Session evicted (capacity)",
+            extra={
+                "event": "session_evict_capacity",
+                "evicted_session_id": oldest_id,
+                "sessions_count": len(self._sessions),
+            },
+        )
         del self._sessions[oldest_id]

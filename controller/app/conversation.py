@@ -117,6 +117,10 @@ class ConversationAnalyzer:
         """
         # First turn — no history to analyze
         if len(session.turns) == 0:
+            logger.debug(
+                "Conversation first turn — no analysis",
+                extra={"event": "conversation_first_turn", "session_id": session.session_id},
+            )
             return AnalysisResult(action="allow", total_score=0.0)
 
         scores: dict[str, float] = {}

@@ -1,4 +1,6 @@
+import hashlib
 import logging
+import time
 
 from .config import settings
 from .models import DataSource, ScanResult, TaggedData, TrustLevel
@@ -54,6 +56,7 @@ class ScanPipeline:
 
     def scan_input(self, text: str) -> PipelineScanResult:
         """Scan inbound text (Prompt Guard only)."""
+        t0 = time.monotonic()
         result = PipelineScanResult()
 
         if settings.prompt_guard_enabled:
@@ -61,18 +64,22 @@ class ScanPipeline:
                 text, threshold=settings.prompt_guard_threshold
             )
 
+        elapsed = time.monotonic() - t0
         logger.info(
             "Input scan complete",
             extra={
                 "event": "scan_input",
                 "clean": result.is_clean,
                 "scanners": list(result.results.keys()),
+                "text_length": len(text),
+                "elapsed_s": round(elapsed, 3),
             },
         )
         return result
 
     def scan_output(self, text: str) -> PipelineScanResult:
         """Scan Qwen output (Prompt Guard + credential + sensitive path)."""
+        t0 = time.monotonic()
         result = PipelineScanResult()
 
         if settings.prompt_guard_enabled:
@@ -84,6 +91,21 @@ class ScanPipeline:
         result.results["sensitive_path_scanner"] = self._path_scanner.scan(text)
         result.results["command_pattern_scanner"] = self._cmd_scanner.scan(text)
 
+        elapsed = time.monotonic() - t0
+
+        # Log detailed match info for each scanner
+        for scanner_name, sr in result.results.items():
+            if sr.found:
+                logger.warning(
+                    "Scanner found matches",
+                    extra={
+                        "event": "scanner_match",
+                        "scanner": scanner_name,
+                        "match_count": len(sr.matches),
+                        "patterns": [m.pattern_name for m in sr.matches],
+                    },
+                )
+
         logger.info(
             "Output scan complete",
             extra={
@@ -91,6 +113,8 @@ class ScanPipeline:
                 "clean": result.is_clean,
                 "scanners": list(result.results.keys()),
                 "violations": list(result.violations.keys()),
+                "text_length": len(text),
+                "elapsed_s": round(elapsed, 3),
             },
         )
         return result
@@ -131,18 +155,42 @@ class ScanPipeline:
         else:
             full_prompt = prompt
 
+        prompt_hash = hashlib.sha256(full_prompt.encode()).hexdigest()[:16]
         logger.info(
             "Sending to Qwen",
             extra={
                 "event": "qwen_request",
+                "prompt_length": len(full_prompt),
+                "prompt_hash": prompt_hash,
                 "spotlighted": bool(untrusted_data) and settings.spotlighting_enabled,
+                "model": settings.ollama_model,
             },
         )
 
         # 3. Send to Qwen
+        t0 = time.monotonic()
         response_text = await self._worker.generate(
             prompt=full_prompt,
             model=settings.ollama_model,
+        )
+        qwen_elapsed = time.monotonic() - t0
+
+        logger.info(
+            "Qwen response received",
+            extra={
+                "event": "qwen_response",
+                "response_length": len(response_text),
+                "elapsed_s": round(qwen_elapsed, 2),
+                "prompt_hash": prompt_hash,
+            },
+        )
+        logger.debug(
+            "Qwen response preview",
+            extra={
+                "event": "qwen_response_preview",
+                "content_preview": response_text[:500],
+                "prompt_hash": prompt_hash,
+            },
         )
 
         # 4. Tag output as UNTRUSTED
@@ -151,6 +199,15 @@ class ScanPipeline:
             source=DataSource.QWEN,
             trust_level=TrustLevel.UNTRUSTED,
             originated_from="qwen_pipeline",
+        )
+        logger.debug(
+            "Tagged data created",
+            extra={
+                "event": "tagged_data_created",
+                "data_id": tagged.id,
+                "source": "qwen",
+                "trust_level": "untrusted",
+            },
         )
 
         # 5. Scan output

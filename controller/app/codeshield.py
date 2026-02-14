@@ -72,6 +72,10 @@ async def scan(code: str) -> ScanResult:
     deterministic scanners still protect the pipeline).
     """
     if not _loaded or _cs_class is None:
+        logger.debug(
+            "CodeShield not loaded, skipping scan",
+            extra={"event": "codeshield_skipped", "code_length": len(code)},
+        )
         return ScanResult(
             found=False,
             matches=[],
@@ -102,11 +106,22 @@ async def scan(code: str) -> ScanResult:
                     )
                 )
 
-        return ScanResult(
+        scan_result = ScanResult(
             found=len(matches) > 0,
             matches=matches,
             scanner_name="codeshield",
         )
+        logger.info(
+            "CodeShield scan complete",
+            extra={
+                "event": "codeshield_scan_complete",
+                "code_length": len(code),
+                "is_insecure": result.is_insecure,
+                "issues_count": len(matches),
+                "cwe_ids": [m.pattern_name for m in matches] if matches else [],
+            },
+        )
+        return scan_result
     except Exception as exc:
         logger.error(
             "CodeShield scan error: %s",

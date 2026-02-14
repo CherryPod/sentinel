@@ -1,5 +1,6 @@
 import logging
 import re
+import time
 
 from .models import (
     ConversationInfo,
@@ -86,12 +87,14 @@ class Orchestrator:
         session_id: str | None = None,
     ) -> TaskResult:
         """Full CaMeL pipeline: conversation check → scan → plan → execute → return."""
+        task_t0 = time.monotonic()
         logger.info(
             "Task received",
             extra={
                 "event": "task_received",
                 "source": source,
                 "session_id": session_id,
+                "request_length": len(user_request),
                 "request_preview": user_request[:200],
             },
         )
@@ -222,6 +225,18 @@ class Orchestrator:
         result = await self._execute_plan(plan)
         result.conversation = conv_info
 
+        task_elapsed = time.monotonic() - task_t0
+        logger.info(
+            "Task completed",
+            extra={
+                "event": "task_completed",
+                "status": result.status,
+                "plan_summary": plan.plan_summary,
+                "step_count": len(plan.steps),
+                "elapsed_s": round(task_elapsed, 2),
+            },
+        )
+
         # Record turn
         if session is not None:
             turn = ConversationTurn(
@@ -256,6 +271,7 @@ class Orchestrator:
         step_results: list[StepResult] = []
 
         for step in plan.steps:
+            step_t0 = time.monotonic()
             logger.info(
                 "Executing step",
                 extra={
@@ -268,6 +284,7 @@ class Orchestrator:
 
             result = await self._execute_step(step, context)
             step_results.append(result)
+            step_elapsed = time.monotonic() - step_t0
 
             logger.info(
                 "Step completed",
@@ -275,6 +292,7 @@ class Orchestrator:
                     "event": "step_complete",
                     "step_id": step.id,
                     "status": result.status,
+                    "elapsed_s": round(step_elapsed, 2),
                 },
             )
 
@@ -283,6 +301,15 @@ class Orchestrator:
                 data = self._get_tagged_data(result.data_id)
                 if data:
                     context.set(step.output_var, data)
+                    logger.debug(
+                        "Variable stored in context",
+                        extra={
+                            "event": "context_var_set",
+                            "var_name": step.output_var,
+                            "data_id": result.data_id,
+                            "trust_level": data.trust_level.value,
+                        },
+                    )
 
             # Stop on blocking errors
             if result.status in ("blocked", "error"):

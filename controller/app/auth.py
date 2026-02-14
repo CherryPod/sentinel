@@ -17,6 +17,7 @@ class PinAuthMiddleware(BaseHTTPMiddleware):
 
     async def dispatch(self, request: Request, call_next):
         pin = self._pin_getter()
+        remote = request.client.host if request.client else "unknown"
 
         # PIN disabled (None) — pass through
         if pin is None:
@@ -33,7 +34,9 @@ class PinAuthMiddleware(BaseHTTPMiddleware):
                 extra={
                     "event": "pin_auth_failed",
                     "path": request.url.path,
-                    "remote": request.client.host if request.client else "unknown",
+                    "method": request.method,
+                    "remote": remote,
+                    "pin_supplied": bool(supplied),
                 },
             )
             return JSONResponse(
@@ -41,4 +44,13 @@ class PinAuthMiddleware(BaseHTTPMiddleware):
                 content={"detail": "Invalid or missing PIN"},
             )
 
+        logger.debug(
+            "PIN auth passed",
+            extra={
+                "event": "pin_auth_success",
+                "path": request.url.path,
+                "method": request.method,
+                "remote": remote,
+            },
+        )
         return await call_next(request)

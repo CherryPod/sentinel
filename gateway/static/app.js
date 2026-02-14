@@ -172,6 +172,15 @@
 
     // --- API calls ---
 
+    async function parseJsonResponse(resp) {
+        var contentType = resp.headers.get('content-type') || '';
+        if (!contentType.includes('application/json')) {
+            var text = await resp.text();
+            throw new Error('Server returned non-JSON response (HTTP ' + resp.status + '): ' + text.substring(0, 200));
+        }
+        return resp.json();
+    }
+
     async function apiPost(path, body) {
         const headers = { 'Content-Type': 'application/json' };
         const pin = getPin();
@@ -186,7 +195,7 @@
             showPinOverlay();
             throw new Error('Authentication required');
         }
-        return resp.json();
+        return parseJsonResponse(resp);
     }
 
     async function apiGet(path) {
@@ -199,7 +208,7 @@
             showPinOverlay();
             throw new Error('Authentication required');
         }
-        return resp.json();
+        return parseJsonResponse(resp);
     }
 
     // --- Health check ---

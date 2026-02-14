@@ -1,7 +1,8 @@
 import time
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from .approval import ApprovalManager
@@ -153,6 +154,28 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Sentinel Controller", lifespan=lifespan)
 app.add_middleware(PinAuthMiddleware, pin_getter=lambda: _pin)
+
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    """Ensure all errors return JSON, never HTML error pages."""
+    if _audit:
+        _audit.error(
+            "Unhandled exception",
+            extra={
+                "event": "unhandled_exception",
+                "path": str(request.url.path),
+                "error": str(exc),
+                "error_type": type(exc).__name__,
+            },
+        )
+    return JSONResponse(
+        status_code=500,
+        content={
+            "status": "error",
+            "reason": f"Internal server error: {type(exc).__name__}: {exc}",
+        },
+    )
 
 
 @app.get("/health")

@@ -53,6 +53,10 @@ def scan(text: str, threshold: float = 0.9) -> ScanResult:
     malicious.
     """
     if _pipeline is None:
+        logger.debug(
+            "Prompt Guard not loaded, skipping scan",
+            extra={"event": "prompt_guard_skipped", "text_length": len(text)},
+        )
         return ScanResult(
             found=False,
             matches=[],
@@ -75,6 +79,16 @@ def scan(text: str, threshold: float = 0.9) -> ScanResult:
         # Prompt Guard v1 labels: BENIGN, INJECTION, JAILBREAK
         # Prompt Guard v2 labels: LABEL_0 (benign), LABEL_1 (malicious)
         benign_labels = {"BENIGN", "LABEL_0"}
+        logger.debug(
+            "Prompt Guard chunk result",
+            extra={
+                "event": "prompt_guard_chunk",
+                "chunk_index": i,
+                "label": label,
+                "score": round(score, 4),
+                "malicious": label not in benign_labels and score >= threshold,
+            },
+        )
         if label not in benign_labels and score >= threshold:
             all_matches.append(
                 ScanMatch(

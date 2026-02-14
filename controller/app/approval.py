@@ -58,12 +58,21 @@ class ApprovalManager:
         """
         entry = self._pending.get(approval_id)
         if entry is None:
+            logger.info(
+                "Approval not found",
+                extra={"event": "approval_not_found", "approval_id": approval_id},
+            )
             return {"status": "not_found"}
 
         # Check TTL
         if time.monotonic() - entry.created_at > self._timeout:
             entry.result = ApprovalResult(
                 granted=False, reason="Expired", approved_by="system",
+            )
+            elapsed = time.monotonic() - entry.created_at
+            logger.warning(
+                "Approval expired",
+                extra={"event": "approval_expired", "approval_id": approval_id, "elapsed_s": round(elapsed, 1)},
             )
             return {
                 "status": "expired",
@@ -102,14 +111,26 @@ class ApprovalManager:
         """Submit an approval decision. Returns True if accepted, False if invalid/duplicate."""
         entry = self._pending.get(approval_id)
         if entry is None:
+            logger.warning(
+                "Approval submit — not found",
+                extra={"event": "approval_submit_not_found", "approval_id": approval_id},
+            )
             return False
 
         # Check TTL
         if time.monotonic() - entry.created_at > self._timeout:
+            logger.warning(
+                "Approval submit — expired",
+                extra={"event": "approval_submit_expired", "approval_id": approval_id},
+            )
             return False
 
         # Ignore duplicate submissions
         if entry.result is not None:
+            logger.warning(
+                "Approval submit — duplicate",
+                extra={"event": "approval_submit_duplicate", "approval_id": approval_id},
+            )
             return False
 
         entry.result = ApprovalResult(
