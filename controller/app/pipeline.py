@@ -184,6 +184,7 @@ class ScanPipeline:
         self,
         prompt: str,
         untrusted_data: str | None = None,
+        marker: str | None = None,
     ) -> TaggedData:
         """Full pipeline: scan → spotlight → Qwen → scan → tag.
 
@@ -205,7 +206,9 @@ class ScanPipeline:
             )
 
         # 2. Apply spotlighting to untrusted data + structural tags + sandwich
-        marker = _generate_marker() if settings.spotlighting_enabled else ""
+        # Use caller-provided marker, or generate a new one
+        if marker is None:
+            marker = _generate_marker() if settings.spotlighting_enabled else ""
         if untrusted_data and settings.spotlighting_enabled:
             marked_data = apply_datamarking(untrusted_data, marker=marker)
             full_prompt = (

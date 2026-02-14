@@ -74,7 +74,7 @@
 |---|-------|------|-----------------|-------|
 | 1 | **PIN Authentication** | ASGI middleware | Unauthenticated API access — `X-Sentinel-Pin` header, `/health` exempt | 5+ |
 | 2 | **Policy Engine** | Deterministic YAML | File paths, commands, credentials, network — cannot be bypassed by prompt injection. Includes relative path resolution and podman flag deny-list | 1+5+ |
-| 3 | **Spotlighting** | String manipulation | Prompt injection (~50% -> <3% success rate) — dynamic per-request marker, `<UNTRUSTED_DATA>` structural tags, sandwich defence reminder. Zero compute cost | 2+5+ |
+| 3 | **Spotlighting** | String manipulation | Prompt injection (~50% -> <3% success rate) — dynamic per-request marker, `<UNTRUSTED_DATA>` structural tags, sandwich defence, chain-safe variable substitution (P7). Zero compute cost | 2+5+ |
 | 4 | **Prompt Guard 2** | 86M BERT classifier (CPU) | Injection detection (~67% catch rate) — 512 token window | 2 |
 | 5 | **Llama Guard 4** | 12B content safety model | Harmful content (violence, hate, weapons) — GPU or CPU | 5 (skipped) |
 | 6 | **CodeShield** | Semgrep static analysis (codeshield pkg) | Malicious code patterns (os.system, eval, SQL injection, traversal, shells, weak crypto) — scans ALL Qwen output | 3+5 |
@@ -209,7 +209,7 @@ paho-mqtt>=2.1.0
 | **4** | Interfaces | Signal + WebUI integration, conversational approval |
 | **5** | Hardening | Llama Guard 4, red teaming, tuning, performance benchmarks |
 
-**Current status:** Phase 5+ — All 4 tiers complete, all 15 code review issues closed. Infrastructure hardened (TLS, CSP, CSRF, resource limits, read-only FS, pinned images, health checks). System prompt hardening P1-P3 implemented (dynamic marker, sandwich defence, structural tags). 418 tests passing
+**Current status:** Phase 5+ — All 4 tiers complete, all 15 code review issues closed. Infrastructure hardened (TLS, CSP, CSRF, resource limits, read-only FS, pinned images, health checks). System prompt hardening P1-P5, P7, P8 implemented (dynamic marker, sandwich defence, structural tags, worker prompt rewrite, chain-safe variable substitution, structured output format). P6 (thinking mode) intentionally skipped. 432 tests passing
 
 > Signal integration planned but paused. Plan archived: `docs/archive/2026-02-12_phase4a-signal-mqtt-plan.md`.
 > CodeShield fix details: `docs/archive/2026-02-13_codeshield-fix.md`

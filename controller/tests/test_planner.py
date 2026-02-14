@@ -270,3 +270,46 @@ class TestAPIErrors:
             await planner.create_plan("test")
         # Status errors should NOT retry
         assert planner._client.messages.create.call_count == 1
+
+
+class TestOutputFormatValidation:
+    """P8: Validate output_format field in plan validation."""
+
+    @pytest.mark.asyncio
+    async def test_output_format_invalid_rejected(self, planner):
+        plan_dict = {
+            "plan_summary": "Bad format",
+            "steps": [
+                {
+                    "id": "step_1",
+                    "type": "llm_task",
+                    "description": "Generate",
+                    "prompt": "Hello",
+                    "output_format": "invalid",
+                }
+            ],
+        }
+        mock_response = _make_claude_response(plan_dict)
+        planner._client.messages.create = AsyncMock(return_value=mock_response)
+
+        with pytest.raises(PlanValidationError, match="invalid output_format"):
+            await planner.create_plan("Bad format plan")
+
+    @pytest.mark.asyncio
+    async def test_valid_output_formats_accepted(self, planner):
+        """None, 'json', and 'tagged' should all pass validation."""
+        for fmt in [None, "json", "tagged"]:
+            step = {
+                "id": "step_1",
+                "type": "llm_task",
+                "description": "Test",
+                "prompt": "Hello",
+            }
+            if fmt is not None:
+                step["output_format"] = fmt
+            plan_dict = {"plan_summary": f"Format {fmt}", "steps": [step]}
+            mock_response = _make_claude_response(plan_dict)
+            planner._client.messages.create = AsyncMock(return_value=mock_response)
+
+            plan = await planner.create_plan(f"Test {fmt}")
+            assert len(plan.steps) == 1

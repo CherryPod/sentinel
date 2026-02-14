@@ -187,9 +187,19 @@ class TestHandleTask:
         assert result.status == "success"
         assert len(result.step_results) == 2
 
-        # Verify step 2 received resolved prompt
+        # Verify step 2 received resolved prompt with chain-safe wrapping
         calls = mock_pipeline.process_with_qwen.call_args_list
-        assert "print('hello')" in calls[1].kwargs["prompt"]
+        step2_prompt = calls[1].kwargs["prompt"]
+        assert "print('hello')" in step2_prompt
+        # P7: chain-safe structural markers present
+        assert "<UNTRUSTED_DATA>" in step2_prompt
+        assert "</UNTRUSTED_DATA>" in step2_prompt
+        from app.orchestrator import _CHAIN_REMINDER
+        assert _CHAIN_REMINDER in step2_prompt
+        # P7: marker was passed to process_with_qwen
+        step2_marker = calls[1].kwargs.get("marker")
+        assert step2_marker is not None
+        assert len(step2_marker) == 4
 
     @pytest.mark.asyncio
     async def test_llm_result_tagged_untrusted(self, mock_planner, mock_pipeline):
@@ -686,3 +696,271 @@ class TestExecutionContextDataIds:
         ctx = ExecutionContext()
         ids = ctx.get_referenced_data_ids_from_args({"mode": 0o644, "path": "/literal"})
         assert ids == []
+
+
+class TestOutputFormat:
+    """P8: Structured output format validation."""
+
+    @pytest.fixture(autouse=True)
+    def _disable_codeshield_requirement(self):
+        from app.config import settings
+        original = settings.require_codeshield
+        settings.require_codeshield = False
+        yield
+        settings.require_codeshield = original
+
+    @pytest.mark.asyncio
+    async def test_json_format_valid(self, mock_planner, mock_pipeline):
+        """Valid JSON output passes when output_format='json'."""
+        plan = _make_plan([
+            {
+                "id": "step_1",
+                "type": "llm_task",
+                "description": "Generate JSON",
+                "prompt": "Produce JSON",
+                "output_format": "json",
+            }
+        ])
+        mock_planner.create_plan.return_value = plan
+
+        tagged = create_tagged_data(
+            content='{"key": "value"}',
+            source=DataSource.QWEN,
+            trust_level=TrustLevel.UNTRUSTED,
+        )
+        mock_pipeline.process_with_qwen.return_value = tagged
+
+        orch = Orchestrator(planner=mock_planner, pipeline=mock_pipeline)
+        result = await orch.handle_task("Get JSON")
+
+        assert result.status == "success"
+        assert result.step_results[0].content == '{"key": "value"}'
+
+    @pytest.mark.asyncio
+    async def test_json_format_invalid(self, mock_planner, mock_pipeline):
+        """Non-JSON output fails when output_format='json'."""
+        plan = _make_plan([
+            {
+                "id": "step_1",
+                "type": "llm_task",
+                "description": "Generate JSON",
+                "prompt": "Produce JSON",
+                "output_format": "json",
+            }
+        ])
+        mock_planner.create_plan.return_value = plan
+
+        tagged = create_tagged_data(
+            content="This is not JSON at all",
+            source=DataSource.QWEN,
+            trust_level=TrustLevel.UNTRUSTED,
+        )
+        mock_pipeline.process_with_qwen.return_value = tagged
+
+        orch = Orchestrator(planner=mock_planner, pipeline=mock_pipeline)
+        result = await orch.handle_task("Get JSON")
+
+        assert result.status == "error"
+        assert "format violation" in result.step_results[0].error.lower()
+
+    @pytest.mark.asyncio
+    async def test_tagged_format_valid(self, mock_planner, mock_pipeline):
+        """<RESPONSE>content</RESPONSE> passes and content is extracted."""
+        plan = _make_plan([
+            {
+                "id": "step_1",
+                "type": "llm_task",
+                "description": "Generate tagged",
+                "prompt": "Produce tagged",
+                "output_format": "tagged",
+            }
+        ])
+        mock_planner.create_plan.return_value = plan
+
+        tagged = create_tagged_data(
+            content="<RESPONSE>extracted content</RESPONSE>",
+            source=DataSource.QWEN,
+            trust_level=TrustLevel.UNTRUSTED,
+        )
+        mock_pipeline.process_with_qwen.return_value = tagged
+
+        orch = Orchestrator(planner=mock_planner, pipeline=mock_pipeline)
+        result = await orch.handle_task("Get tagged")
+
+        assert result.status == "success"
+        assert result.step_results[0].content == "extracted content"
+
+    @pytest.mark.asyncio
+    async def test_tagged_format_invalid(self, mock_planner, mock_pipeline):
+        """Missing <RESPONSE> tags fails when output_format='tagged'."""
+        plan = _make_plan([
+            {
+                "id": "step_1",
+                "type": "llm_task",
+                "description": "Generate tagged",
+                "prompt": "Produce tagged",
+                "output_format": "tagged",
+            }
+        ])
+        mock_planner.create_plan.return_value = plan
+
+        tagged = create_tagged_data(
+            content="Just plain text without tags",
+            source=DataSource.QWEN,
+            trust_level=TrustLevel.UNTRUSTED,
+        )
+        mock_pipeline.process_with_qwen.return_value = tagged
+
+        orch = Orchestrator(planner=mock_planner, pipeline=mock_pipeline)
+        result = await orch.handle_task("Get tagged")
+
+        assert result.status == "error"
+        assert "format violation" in result.step_results[0].error.lower()
+
+    @pytest.mark.asyncio
+    async def test_null_format_no_validation(self, mock_planner, mock_pipeline):
+        """Default None output_format means no format validation."""
+        plan = _make_plan([
+            {
+                "id": "step_1",
+                "type": "llm_task",
+                "description": "Generate freeform",
+                "prompt": "Write anything",
+            }
+        ])
+        mock_planner.create_plan.return_value = plan
+
+        tagged = create_tagged_data(
+            content="Any freeform text here",
+            source=DataSource.QWEN,
+            trust_level=TrustLevel.UNTRUSTED,
+        )
+        mock_pipeline.process_with_qwen.return_value = tagged
+
+        orch = Orchestrator(planner=mock_planner, pipeline=mock_pipeline)
+        result = await orch.handle_task("Write something")
+
+        assert result.status == "success"
+        assert result.step_results[0].content == "Any freeform text here"
+
+
+class TestChainSafeResolution:
+    """P7: Chain-safe variable substitution wraps prior step output in structural tags."""
+
+    def test_resolve_text_safe_wraps_content(self):
+        """resolve_text_safe wraps substituted content in UNTRUSTED_DATA tags with marking."""
+        from app.orchestrator import _CHAIN_REMINDER
+
+        ctx = ExecutionContext()
+        data = create_tagged_data(
+            content="some output",
+            source=DataSource.QWEN,
+            trust_level=TrustLevel.UNTRUSTED,
+        )
+        ctx.set("$var", data)
+
+        result = ctx.resolve_text_safe("Process this: $var", marker="!@#$")
+        assert "<UNTRUSTED_DATA>" in result
+        assert "</UNTRUSTED_DATA>" in result
+        assert "!@#$some" in result  # datamarking applied
+        assert "!@#$output" in result
+        assert _CHAIN_REMINDER in result
+
+    def test_resolve_text_safe_no_marker(self):
+        """Empty marker still wraps in tags (structural separation without datamarking)."""
+        from app.orchestrator import _CHAIN_REMINDER
+
+        ctx = ExecutionContext()
+        data = create_tagged_data(
+            content="raw content",
+            source=DataSource.QWEN,
+            trust_level=TrustLevel.UNTRUSTED,
+        )
+        ctx.set("$var", data)
+
+        result = ctx.resolve_text_safe("Check: $var", marker="")
+        assert "<UNTRUSTED_DATA>" in result
+        assert "</UNTRUSTED_DATA>" in result
+        assert "raw content" in result  # content present, no marker prefix
+        assert _CHAIN_REMINDER in result
+
+    def test_resolve_text_safe_unresolved_refs(self):
+        """Unresolved $var_name left as-is, no tags added."""
+        from app.orchestrator import _CHAIN_REMINDER
+
+        ctx = ExecutionContext()
+        result = ctx.resolve_text_safe("Check: $missing", marker="!@#$")
+        assert "$missing" in result
+        assert "<UNTRUSTED_DATA>" not in result
+        assert _CHAIN_REMINDER not in result
+
+    def test_resolve_text_safe_multiple_vars(self):
+        """Two variables both get individual tag blocks, one sandwich at end."""
+        from app.orchestrator import _CHAIN_REMINDER
+
+        ctx = ExecutionContext()
+        d1 = create_tagged_data("first", DataSource.QWEN, TrustLevel.UNTRUSTED)
+        d2 = create_tagged_data("second", DataSource.QWEN, TrustLevel.UNTRUSTED)
+        ctx.set("$a", d1)
+        ctx.set("$b", d2)
+
+        result = ctx.resolve_text_safe("Compare $a and $b", marker="!@")
+        # Both wrapped individually
+        assert result.count("<UNTRUSTED_DATA>") == 2
+        assert result.count("</UNTRUSTED_DATA>") == 2
+        # Only one chain reminder at end
+        assert result.count(_CHAIN_REMINDER) == 1
+
+    @pytest.fixture(autouse=True)
+    def _disable_codeshield_requirement(self):
+        from app.config import settings
+        original = settings.require_codeshield
+        settings.require_codeshield = False
+        yield
+        settings.require_codeshield = original
+
+    @pytest.mark.asyncio
+    async def test_chain_marker_passed_to_pipeline(self, mock_planner, mock_pipeline):
+        """Integration test: orchestrator passes marker through to process_with_qwen."""
+        plan = _make_plan([
+            {
+                "id": "step_1",
+                "type": "llm_task",
+                "description": "Generate",
+                "prompt": "Write code",
+                "output_var": "$code",
+            },
+            {
+                "id": "step_2",
+                "type": "llm_task",
+                "description": "Review",
+                "prompt": "Review:\n$code",
+                "input_vars": ["$code"],
+            },
+        ])
+        mock_planner.create_plan.return_value = plan
+
+        step1_data = create_tagged_data(
+            content="print('hello')",
+            source=DataSource.QWEN,
+            trust_level=TrustLevel.UNTRUSTED,
+        )
+        step2_data = create_tagged_data(
+            content="Code looks good",
+            source=DataSource.QWEN,
+            trust_level=TrustLevel.UNTRUSTED,
+        )
+        mock_pipeline.process_with_qwen.side_effect = [step1_data, step2_data]
+
+        orch = Orchestrator(planner=mock_planner, pipeline=mock_pipeline)
+        result = await orch.handle_task("Write and review code")
+
+        assert result.status == "success"
+        calls = mock_pipeline.process_with_qwen.call_args_list
+        # Step 1: no input_vars, marker should be None or empty string
+        step1_marker = calls[0].kwargs.get("marker")
+        assert step1_marker is None
+        # Step 2: has input_vars, marker should be a 4-char string
+        step2_marker = calls[1].kwargs.get("marker")
+        assert step2_marker is not None
+        assert len(step2_marker) == 4

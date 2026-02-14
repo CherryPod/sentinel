@@ -293,3 +293,16 @@ class TestProcessWithQwen:
         # Extremely unlikely to collide (1/10000 chance) — if this flakes,
         # it's a sign the RNG is broken, not bad luck
         assert marker1 != marker2
+
+    @patch("app.pipeline.settings")
+    @pytest.mark.asyncio
+    async def test_caller_provided_marker_used(self, mock_settings, pipeline, mock_worker):
+        """Caller-provided marker should be passed through to worker, not a new one."""
+        mock_settings.prompt_guard_enabled = False
+        mock_settings.spotlighting_enabled = True
+        mock_settings.ollama_model = "qwen3:14b"
+
+        await pipeline.process_with_qwen("test prompt", marker="!@#$")
+        call_args = mock_worker.generate.call_args
+        marker_sent = call_args.kwargs.get("marker", "")
+        assert marker_sent == "!@#$"

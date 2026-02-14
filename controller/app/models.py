@@ -69,6 +69,7 @@ class PlanStep(BaseModel):
     expects_code: bool = False
     requires_approval: bool = False
     input_vars: list[str] = Field(default_factory=list)
+    output_format: str | None = None  # "json", "tagged", or None (freeform)
 
 
 class Plan(BaseModel):
