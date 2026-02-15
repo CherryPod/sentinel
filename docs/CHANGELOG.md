@@ -1,5 +1,15 @@
 # Changelog
 
+## Stress Test v3 — Capability Benchmark (2026-02-15)
+
+Added 160 capability benchmark prompts to stress test v2 (~976 prompts → ~1136 prompts). Tests Qwen's code generation quality across 4 difficulty tiers and 10 categories.
+
+- **New files:** `scripts/stress_test_v3.py`, `scripts/run_stress_test_v3.sh`
+- **160 prompts in 4 tiers:** T1 Simple (40), T2 Moderate (40), T3 Complex (40), T4 Hard (40)
+- **Category spread:** Python (76), Rust (21), container/devops (28), data (7), JS (7), SQL (7), bash (6), config (5), HTML (3)
+- **Config changes:** `genuine_target` cap 110→270, `max_requests` default 1400→1600
+- **All prompts pre-validated:** ASCII only, no sensitive paths, no credentials, no injection patterns — should pass security scanning cleanly
+
 ## DoS Input Validation — Two-Layer Prompt Gating (2026-02-15)
 
 Last code fix before the targeted stress test rerun. Addresses dos_resource (30% escape) and edge_case (9% escape) categories from stress test v2 — empty prompts, whitespace padding, and oversized inputs were passing through to Qwen unchecked, wasting GPU compute.

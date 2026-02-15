@@ -23,6 +23,13 @@
 
 ## What Was Done (2026-02-15, latest session)
 
+**Stress test v3 created and launched (nohup, ~10-11hrs expected):** v2 prompts (~976) + 160 capability benchmark prompts (4 tiers: T1 Simple, T2 Moderate, T3 Complex, T4 Hard). Categories: Python (76), Rust (21), container/devops (28), data (7), JS (7), SQL (7), bash (6), config (5), HTML (3). `genuine_target` cap raised 110→270, `max_requests` default raised 1400→1600. Verbose logging confirmed working — JSONL captures planner_prompt, resolved_prompt, and worker_response per step.
+- Scripts: `scripts/stress_test_v3.py`, `scripts/run_stress_test_v3.sh`
+- JSONL results: `scripts/results/stress_test_20260215_163114.jsonl`
+- Runner log: `scripts/results/runner_20260215_163040.log`
+- Nohup log: `scripts/results/nohup_v3_20260215_163040.log`
+- Runner auto-restores `SENTINEL_APPROVAL_MODE=full` and `SENTINEL_VERBOSE_RESULTS=false` on exit
+
 **Planner undefined variable fix:** Added clarification to planner system prompt — `$` symbols in user text are literal, not plan variables. Don't add them to `input_vars`. Fixes 5 stress test errors (all `indirect_injection` category).
 
 **DoS input validation (dos_resource 30% escape + edge_case 9% escape):**
@@ -39,12 +46,7 @@
 
 Priority order:
 
-1. **Stress test v3 with verbose logging** — validates all code fixes AND measures Qwen output quality (W5). Needs two changes before running:
-   - **Verbose result logging:** Capture 3 things per step in the JSONL: (a) Claude's plan step prompt (what Claude tells Qwen), (b) the resolved prompt after spotlighting/tags/sandwich (what Qwen actually receives), (c) Qwen's raw response. Currently the JSONL stores metadata only — no content
-   - **Implementation approach:** Add optional `worker_prompt` and `worker_response` fields to `StepResult`, populated when `SENTINEL_VERBOSE_RESULTS=true`. The stress test runner already switches to auto mode — also enable verbose results. Behind a flag because the resolved prompt exposes spotlighting markers and defence structure (don't want in production responses)
-   - **Stress test script update:** `scripts/stress_test.py` needs to log the new verbose fields to JSONL when present in the API response
-   - **Quality assessment targets:** hallucination detection (does Qwen drift after ~400 tokens?), code quality grading, prompt fidelity (did Claude pass through enough detail or summarise?), spotlighting compliance (does Qwen follow UNTRUSTED_DATA instructions?), system prompt compliance
-   - **Security validation targets:** encoding_obfuscation, cross_model_confusion, non_english_injection, dos_resource, edge_case, code_injection, plus genuine categories for FP check
+1. **Stress test v3 running** — v2 + 160 capability benchmarks with verbose logging enabled. Will validate all code fixes AND measure Qwen output quality (W5). Assessment targets: encoding_obfuscation, cross_model_confusion, non_english_injection, dos_resource, edge_case, code_injection, plus genuine categories for FP + quality check
 2. **Multi-turn escapes (27%)** — biggest remaining gap. Conversation analyser improved (Rules 7+8, Claude chain review) but still the hardest problem. Consider: sliding-window chain scoring, explicit multi-turn state machine, or semantic trajectory tracking
 3. **Scanner concentration risk (W3)** — structural, not urgent. Partially mitigated (3 new scanners added: encoding, echo, ASCII gate) but sensitive_path + prompt_guard still dominate
 4. **Response latency (W6)** — hardware-constrained (RTX 3060 + 14B model). Not fixable without hardware upgrade or smaller model
@@ -65,7 +67,8 @@ Priority order:
 - `docs/archive/2026-02-15_security-improvement-plan.md` — implementation plan for the post-assessment work
 - `controller/app/` — all source code (scanner.py, pipeline.py, orchestrator.py, planner.py, conversation.py, session.py, approval.py)
 - `controller/tests/` — all tests (test_scanner.py, test_pipeline.py, test_hostile.py, test_encoding_scanner.py, test_conversation.py, test_orchestrator.py, test_planner.py)
-- `scripts/stress_test_runner.py` — stress test runner
+- `scripts/stress_test.py` — stress test v2
+- `scripts/stress_test_v3.py` — stress test v3 (v2 + 160 capability benchmarks)
 - `policies/sentinel-policy.yaml` — security policy rules
 
 ## Resolved (2026-02-15)
