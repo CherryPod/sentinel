@@ -1,4 +1,8 @@
+import base64
+import codecs
+import html
 import re
+import urllib.parse
 
 from .models import ScanMatch, ScanResult
 
@@ -336,3 +340,172 @@ class VulnerabilityEchoScanner:
             matches=matches,
             scanner_name="vulnerability_echo_scanner",
         )
+
+
+class EncodingNormalizationScanner:
+    """Decodes common encodings and re-scans with existing scanners.
+
+    Only flags when a decoded variant triggers an inner scanner pattern.
+    This catches base64, hex, URL encoding, ROT13, HTML entities, and
+    character splitting used to hide dangerous payloads from regex scanners.
+    """
+
+    # Base64 candidates: 16+ chars from the base64 alphabet, optional padding
+    _BASE64_RE = re.compile(r"[A-Za-z0-9+/]{16,}={0,2}")
+    # Hex candidates: 16+ hex chars, even length
+    _HEX_RE = re.compile(r"[0-9a-fA-F]{16,}")
+    # URL encoding: at least one %XX sequence
+    _URL_ENCODED_RE = re.compile(r"%[0-9a-fA-F]{2}")
+    # HTML entities: numeric (&#123;) or named (&amp;)
+    _HTML_ENTITY_RE = re.compile(r"&#\d+;|&#x[0-9a-fA-F]+;|&[a-z]+;", re.IGNORECASE)
+    # Char splitting: 4+ single characters separated by spaces (e.g. "c a t / e t c")
+    _CHAR_SPLIT_RE = re.compile(r"(?:^|\s)((?:\S ){3,}\S)(?:\s|$)")
+
+    # Minimum printable characters for a decoded result to be considered valid
+    _MIN_PRINTABLE = 4
+
+    def __init__(
+        self,
+        cred_scanner: "CredentialScanner",
+        path_scanner: "SensitivePathScanner",
+        cmd_scanner: "CommandPatternScanner",
+    ):
+        self._cred_scanner = cred_scanner
+        self._path_scanner = path_scanner
+        self._cmd_scanner = cmd_scanner
+
+    def scan(self, text: str) -> ScanResult:
+        """Decode text through all encodings and re-scan decoded variants."""
+        return self._scan_internal(text, output_mode=False)
+
+    def scan_output_text(self, text: str) -> ScanResult:
+        """Like scan() but uses context-aware path scanning for output."""
+        return self._scan_internal(text, output_mode=True)
+
+    def _scan_internal(self, text: str, output_mode: bool) -> ScanResult:
+        """Core scan logic shared by scan() and scan_output_text()."""
+        decoded_variants = self._decode_all(text)
+        if not decoded_variants:
+            return ScanResult(found=False, scanner_name="encoding_normalization_scanner")
+
+        all_matches: list[ScanMatch] = []
+        for encoding_name, decoded_text in decoded_variants:
+            # Run all 3 inner scanners on each decoded variant
+            cred_result = self._cred_scanner.scan(decoded_text)
+            if output_mode:
+                path_result = self._path_scanner.scan_output_text(decoded_text)
+            else:
+                path_result = self._path_scanner.scan(decoded_text)
+            cmd_result = self._cmd_scanner.scan(decoded_text)
+
+            for inner_result in (cred_result, path_result, cmd_result):
+                for match in inner_result.matches:
+                    all_matches.append(
+                        ScanMatch(
+                            pattern_name=f"encoded:{encoding_name}:{match.pattern_name}",
+                            matched_text=match.matched_text,
+                            position=match.position,
+                        )
+                    )
+
+        return ScanResult(
+            found=len(all_matches) > 0,
+            matches=all_matches,
+            scanner_name="encoding_normalization_scanner",
+        )
+
+    def _decode_all(self, text: str) -> list[tuple[str, str]]:
+        """Try all decoders and return (encoding_name, decoded_text) pairs."""
+        results: list[tuple[str, str]] = []
+
+        for decoded in self._try_base64(text):
+            results.append(("base64", decoded))
+
+        for decoded in self._try_hex(text):
+            results.append(("hex", decoded))
+
+        url_decoded = self._try_url_decode(text)
+        if url_decoded is not None:
+            results.append(("url_encoding", url_decoded))
+
+        rot13_decoded = self._try_rot13(text)
+        results.append(("rot13", rot13_decoded))
+
+        html_decoded = self._try_html_entities(text)
+        if html_decoded is not None:
+            results.append(("html_entities", html_decoded))
+
+        char_decoded = self._try_char_splitting(text)
+        if char_decoded != text:
+            results.append(("char_splitting", char_decoded))
+
+        return results
+
+    def _is_valid_decoded(self, text: str) -> bool:
+        """Check if decoded text is valid UTF-8 with enough printable chars."""
+        printable_count = sum(1 for c in text if c.isprintable())
+        return printable_count >= self._MIN_PRINTABLE
+
+    def _try_base64(self, text: str) -> list[str]:
+        """Extract and decode base64 candidate substrings."""
+        results: list[str] = []
+        for match in self._BASE64_RE.finditer(text):
+            candidate = match.group()
+            try:
+                decoded_bytes = base64.b64decode(candidate, validate=True)
+                decoded_str = decoded_bytes.decode("utf-8")
+                if self._is_valid_decoded(decoded_str):
+                    results.append(decoded_str)
+            except (ValueError, UnicodeDecodeError):
+                continue
+        return results
+
+    def _try_hex(self, text: str) -> list[str]:
+        """Extract and decode hex candidate substrings (even-length only)."""
+        results: list[str] = []
+        for match in self._HEX_RE.finditer(text):
+            candidate = match.group()
+            if len(candidate) % 2 != 0:
+                continue
+            try:
+                decoded_bytes = bytes.fromhex(candidate)
+                decoded_str = decoded_bytes.decode("utf-8")
+                if self._is_valid_decoded(decoded_str):
+                    results.append(decoded_str)
+            except (ValueError, UnicodeDecodeError):
+                continue
+        return results
+
+    def _try_url_decode(self, text: str) -> str | None:
+        """URL-decode if text contains percent-encoded sequences."""
+        if not self._URL_ENCODED_RE.search(text):
+            return None
+        decoded = urllib.parse.unquote(text)
+        if decoded == text:
+            return None
+        return decoded
+
+    def _try_rot13(self, text: str) -> str:
+        """ROT13 the full text (always runs — cheap and low FP risk)."""
+        return codecs.decode(text, "rot_13")
+
+    def _try_html_entities(self, text: str) -> str | None:
+        """Unescape HTML entities if present."""
+        if not self._HTML_ENTITY_RE.search(text):
+            return None
+        decoded = html.unescape(text)
+        if decoded == text:
+            return None
+        return decoded
+
+    def _try_char_splitting(self, text: str) -> str:
+        """Collapse single-char-space patterns (e.g. 'c a t' -> 'cat')."""
+        def _collapse(match: re.Match) -> str:
+            segment = match.group(1)
+            # Only collapse if every other char is a space between single chars
+            chars = segment.split(" ")
+            if all(len(c) == 1 for c in chars):
+                return " " + "".join(chars) + " "
+            return match.group(0)
+
+        return self._CHAR_SPLIT_RE.sub(_collapse, text).strip()

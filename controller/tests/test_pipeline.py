@@ -435,3 +435,96 @@ class TestVulnerabilityEchoInPipeline:
         # No user_input → echo scanner doesn't run → passes even with eval in output
         tagged = await pipeline.process_with_qwen("eval test")
         assert tagged.content is not None
+
+
+class TestAsciiPromptGate:
+    """ASCII-only gate on planner-constructed worker prompts."""
+
+    @patch("app.pipeline.settings")
+    @pytest.mark.asyncio
+    async def test_ascii_prompt_passes(self, mock_settings, pipeline, mock_worker):
+        """Normal English prompt passes the ASCII gate."""
+        mock_settings.prompt_guard_enabled = False
+        mock_settings.spotlighting_enabled = False
+        mock_settings.ollama_model = "qwen3:14b"
+
+        tagged = await pipeline.process_with_qwen("Summarise the following text")
+        assert tagged.content == "Generated response text"
+
+    @patch("app.pipeline.settings")
+    @pytest.mark.asyncio
+    async def test_chinese_in_prompt_blocked(self, mock_settings, pipeline):
+        """Chinese characters in worker prompt raise SecurityViolation."""
+        mock_settings.prompt_guard_enabled = False
+        mock_settings.spotlighting_enabled = False
+
+        with pytest.raises(SecurityViolation, match="non-ASCII"):
+            await pipeline.process_with_qwen("Translate this: \u4f60\u597d\u4e16\u754c")
+
+    @patch("app.pipeline.settings")
+    @pytest.mark.asyncio
+    async def test_cyrillic_homoglyph_blocked(self, mock_settings, pipeline):
+        """Cyrillic \u0430 (looks like Latin a) must be blocked."""
+        mock_settings.prompt_guard_enabled = False
+        mock_settings.spotlighting_enabled = False
+
+        # \u0430 is Cyrillic Small Letter A — visually identical to Latin 'a'
+        with pytest.raises(SecurityViolation, match="non-ASCII"):
+            await pipeline.process_with_qwen("Run \u0430nalysis on the data")
+
+    @patch("app.pipeline.settings")
+    @pytest.mark.asyncio
+    async def test_arabic_in_prompt_blocked(self, mock_settings, pipeline):
+        """Arabic script in worker prompt raises SecurityViolation."""
+        mock_settings.prompt_guard_enabled = False
+        mock_settings.spotlighting_enabled = False
+
+        with pytest.raises(SecurityViolation, match="non-ASCII"):
+            await pipeline.process_with_qwen("Process: \u0645\u0631\u062d\u0628\u0627")
+
+    @patch("app.pipeline.settings")
+    @pytest.mark.asyncio
+    async def test_untrusted_data_not_checked(self, mock_settings, pipeline, mock_worker):
+        """Non-ASCII in untrusted_data should NOT trigger the gate."""
+        mock_settings.prompt_guard_enabled = False
+        mock_settings.spotlighting_enabled = True
+        mock_settings.ollama_model = "qwen3:14b"
+
+        # Chinese in untrusted_data is fine — only the prompt is checked
+        tagged = await pipeline.process_with_qwen(
+            "Translate the following text to English",
+            untrusted_data="\u4f60\u597d\u4e16\u754c means hello world",
+        )
+        assert tagged.content == "Generated response text"
+
+
+class TestEncodingScannerInPipeline:
+    """Encoding normalization scanner integration in the scan pipeline."""
+
+    @patch("app.pipeline.settings")
+    def test_encoding_scanner_in_input_scan(self, mock_settings, pipeline):
+        """Base64-encoded dangerous payload should be blocked at input."""
+        import base64
+        mock_settings.prompt_guard_enabled = False
+        # base64 of "cat /etc/shadow"
+        payload = base64.b64encode(b"cat /etc/shadow").decode()
+        result = pipeline.scan_input(payload)
+        assert result.is_clean is False
+        assert "encoding_normalization_scanner" in result.violations
+
+    @patch("app.pipeline.settings")
+    def test_encoding_scanner_in_output_scan(self, mock_settings, pipeline):
+        """Hex-encoded dangerous payload should be blocked at output."""
+        mock_settings.prompt_guard_enabled = False
+        # hex of "cat /etc/shadow"
+        payload = "cat /etc/shadow".encode().hex()
+        result = pipeline.scan_output(payload)
+        assert result.is_clean is False
+        assert "encoding_normalization_scanner" in result.violations
+
+    @patch("app.pipeline.settings")
+    def test_encoding_scanner_wired_into_pipeline(self, mock_settings, pipeline):
+        """Verify encoding scanner results appear in scan output keys."""
+        mock_settings.prompt_guard_enabled = False
+        result = pipeline.scan_input("normal safe text")
+        assert "encoding_normalization_scanner" in result.results

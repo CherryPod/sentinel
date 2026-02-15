@@ -1,5 +1,6 @@
 import hashlib
 import logging
+import re
 import secrets
 import time
 
@@ -9,6 +10,7 @@ from .provenance import create_tagged_data
 from .scanner import (
     CommandPatternScanner,
     CredentialScanner,
+    EncodingNormalizationScanner,
     SensitivePathScanner,
     VulnerabilityEchoScanner,
 )
@@ -67,14 +69,61 @@ class ScanPipeline:
         cmd_scanner: CommandPatternScanner | None = None,
         worker: OllamaWorker | None = None,
         echo_scanner: VulnerabilityEchoScanner | None = None,
+        encoding_scanner: EncodingNormalizationScanner | None = None,
     ):
         self._cred_scanner = cred_scanner
         self._path_scanner = path_scanner
         self._cmd_scanner = cmd_scanner or CommandPatternScanner()
         self._echo_scanner = echo_scanner or VulnerabilityEchoScanner()
+        self._encoding_scanner = encoding_scanner or EncodingNormalizationScanner(
+            cred_scanner, path_scanner, self._cmd_scanner
+        )
         self._worker = worker or OllamaWorker(
             base_url=settings.ollama_url,
             timeout=settings.ollama_timeout,
+        )
+
+    # Allowed: printable ASCII (0x20-0x7E) + newline + tab + carriage return
+    _ALLOWED_PROMPT_CHARS = re.compile(r"^[\x20-\x7e\n\t\r]*$")
+
+    def _check_prompt_ascii(self, prompt: str) -> None:
+        """Enforce ASCII-only worker prompts to prevent cross-model injection.
+
+        The planner should only produce English text. Any non-ASCII character
+        indicates Claude failed to translate, or an adversary injected
+        non-Latin script (CJK, Cyrillic homoglyphs, etc.).
+        """
+        if self._ALLOWED_PROMPT_CHARS.match(prompt):
+            return  # All good
+
+        # Find the offending characters for the log/error message
+        bad_chars = set()
+        for i, ch in enumerate(prompt):
+            if ch not in ('\n', '\t', '\r') and (ord(ch) < 0x20 or ord(ch) > 0x7e):
+                bad_chars.add((ch, hex(ord(ch)), i))
+
+        # Build a readable summary (limit to first 5 chars to avoid log spam)
+        samples = sorted(bad_chars, key=lambda x: x[2])[:5]
+        char_desc = ", ".join(f"U+{ord(c):04X} '{c}' at pos {p}" for c, _, p in samples)
+
+        logger.warning(
+            "Non-ASCII characters in worker prompt blocked",
+            extra={
+                "event": "prompt_ascii_violation",
+                "bad_char_count": len(bad_chars),
+                "samples": char_desc,
+            },
+        )
+        raise SecurityViolation(
+            f"Worker prompt contains non-ASCII characters: {char_desc}",
+            {"ascii_gate": ScanResult(
+                found=True,
+                matches=[ScanMatch(
+                    pattern_name="non_ascii_in_prompt",
+                    matched_text=char_desc,
+                )],
+                scanner_name="ascii_prompt_gate",
+            )},
         )
 
     def scan_input(self, text: str) -> PipelineScanResult:
@@ -105,6 +154,7 @@ class ScanPipeline:
         result.results["credential_scanner"] = self._cred_scanner.scan(text)
         result.results["sensitive_path_scanner"] = self._path_scanner.scan(text)
         result.results["command_pattern_scanner"] = self._cmd_scanner.scan(text)
+        result.results["encoding_normalization_scanner"] = self._encoding_scanner.scan(text)
 
         elapsed = time.monotonic() - t0
 
@@ -160,6 +210,7 @@ class ScanPipeline:
         # standalone lines — not educational prose mentioning paths.
         result.results["sensitive_path_scanner"] = self._path_scanner.scan_output_text(text)
         result.results["command_pattern_scanner"] = self._cmd_scanner.scan(text)
+        result.results["encoding_normalization_scanner"] = self._encoding_scanner.scan_output_text(text)
 
         elapsed = time.monotonic() - t0
 
@@ -230,6 +281,12 @@ class ScanPipeline:
                     "prompt_length": len(prompt),
                 },
             )
+
+        # 1.5. ASCII gate: verify planner prompt contains only English characters.
+        # This is the deterministic backstop for the LANGUAGE SAFETY RULE in the
+        # planner system prompt. Catches non-Latin script that Claude failed to
+        # translate (CJK, Cyrillic homoglyphs, Arabic, etc.).
+        self._check_prompt_ascii(prompt)
 
         # 2. Apply spotlighting to untrusted data + structural tags + sandwich
         # Use caller-provided marker, or generate a new one

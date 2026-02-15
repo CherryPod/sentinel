@@ -1,5 +1,53 @@
 # Changelog
 
+## W4 + W7: Encoding Scanner, Language Safety Rule, ASCII Prompt Gate (2026-02-15)
+
+Three defence-in-depth additions targeting two weaknesses from the stress test v2 assessment: W4 (encoding obfuscation, 12% escape) and W7 (cross-model confusion via bilingual injection, 27% escape).
+
+### W4: EncodingNormalizationScanner (`scanner.py`, `pipeline.py`)
+
+New scanner that decodes common obfuscation schemes and re-scans the decoded text with existing inner scanners (credential, sensitive path, command pattern). Only flags when a decoded variant triggers an inner scanner — no standalone false positives.
+
+**6 decoders:**
+- **Base64** — extracts 16+ char candidates, validates via `base64.b64decode(validate=True)`
+- **Hex** — even-length 16+ char hex strings decoded via `bytes.fromhex()`
+- **URL encoding** — `%XX` sequences via `urllib.parse.unquote()`
+- **ROT13** — always runs (cheap, low FP risk)
+- **HTML entities** — `&#123;`, `&#x7B;`, `&amp;` via `html.unescape()`
+- **Character splitting** — collapses `c a t / e t c` → `cat /etc`
+
+Wired into both `scan_input()` and `scan_output()` in the pipeline. Output mode uses context-aware path scanning (consistent with existing scanners).
+
+### W7: Planner Language Safety Rule (`planner.py`)
+
+Added `LANGUAGE SAFETY RULE` to the planner system prompt. Tells Claude to never include non-English text in worker prompts — not in instructions, data, or examples. If the user's request contains non-English text, Claude must translate everything to English before constructing the worker prompt. No exceptions, even if the user explicitly asks.
+
+This is the LLM layer for W7 — it works most of the time but is not deterministic.
+
+### W7: ASCII Prompt Gate (`pipeline.py`)
+
+Deterministic backstop for the language safety rule. Regex allowlist gate on the `prompt` parameter in `process_with_qwen()`, before the prompt reaches Qwen.
+
+**Allowlist:** Printable ASCII (`\x20`-`\x7E`) + `\n` + `\t` + `\r`. Anything else = `SecurityViolation`.
+
+- Only checks the planner-constructed `prompt` — NOT `untrusted_data` (user content, already protected by spotlighting + UNTRUSTED_DATA tags)
+- Catches CJK, Cyrillic homoglyphs, Arabic, accented Latin, and any other non-ASCII that Claude lets through
+- Runs after input scan, before spotlighting
+- Logs offending characters with codepoints and positions
+
+### Tests
+- 529 tests passing (up from 492)
+- New `test_encoding_scanner.py`: 37 tests covering all 6 encoders + false positive safety + edge cases
+- `TestAsciiPromptGate`: 5 tests (ASCII passes, Chinese blocked, Cyrillic homoglyph blocked, Arabic blocked, untrusted_data not checked)
+- `TestEncodingScannerInPipeline`: 3 integration tests (input scan, output scan, wiring check)
+- Hostile tests: `base64_hidden_credential`, `hex_hidden_etc_shadow`, `chinese_injection_in_output` (chained-step simulation with `skip_input_scan=True`)
+- `test_system_prompt_contains_language_safety_rule`: verifies planner prompt has the W7 rule
+
+### Files Changed
+`scanner.py`, `pipeline.py`, `planner.py`, `conftest.py`, `test_encoding_scanner.py` (new), `test_pipeline.py`, `test_hostile.py`, `test_planner.py`
+
+---
+
 ## Security Improvements — Post Stress Test v2 (2026-02-15)
 
 Addressed three critical findings from the stress test v2 assessment (3.0/5 overall). Drops FP rate from 14.3% to ~3.4%, adds multi-turn conversation analysis, and blocks code injection echo attacks.

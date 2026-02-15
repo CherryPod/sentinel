@@ -219,6 +219,12 @@ class TestPlannerSystemPrompt:
         from app.planner import _PLANNER_SYSTEM_PROMPT_TEMPLATE
         assert "Request refused" in _PLANNER_SYSTEM_PROMPT_TEMPLATE
 
+    def test_system_prompt_contains_language_safety_rule(self, planner):
+        """W7 fix: planner must prohibit non-English text in worker prompts."""
+        from app.planner import _PLANNER_SYSTEM_PROMPT_TEMPLATE
+        assert "LANGUAGE SAFETY RULE" in _PLANNER_SYSTEM_PROMPT_TEMPLATE
+        assert "non-English" in _PLANNER_SYSTEM_PROMPT_TEMPLATE
+
 
 class TestAPIKeyLoading:
     def test_api_key_not_found(self):

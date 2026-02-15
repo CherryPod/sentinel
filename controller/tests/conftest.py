@@ -37,3 +37,10 @@ def path_scanner(engine: PolicyEngine) -> SensitivePathScanner:
 def cmd_scanner() -> CommandPatternScanner:
     """CommandPatternScanner with default patterns."""
     return CommandPatternScanner()
+
+
+@pytest.fixture
+def encoding_scanner(cred_scanner, path_scanner, cmd_scanner):
+    """EncodingNormalizationScanner wired to real policy-based inner scanners."""
+    from app.scanner import EncodingNormalizationScanner
+    return EncodingNormalizationScanner(cred_scanner, path_scanner, cmd_scanner)

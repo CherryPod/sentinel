@@ -68,7 +68,7 @@
 
 ---
 
-## Security Layers (9 total)
+## Security Layers (10 total)
 
 | # | Layer | Type | What It Catches | Phase |
 |---|-------|------|-----------------|-------|
@@ -81,6 +81,7 @@
 | 7 | **CommandPatternScanner** | Regex patterns | Dangerous shell patterns in prose (pipe-to-shell, reverse shells, nohup, base64 decode+exec) | 5 |
 | 8 | **ConversationAnalyzer** | Multi-turn heuristics | Memory poisoning, retry-after-block, capability escalation, instruction override, context building, reconnaissance, topic shift — 8 rules, additive scoring + Claude chain-level assessment via planner | 5+ |
 | 9½| **VulnerabilityEchoScanner** | Input/output fingerprint comparison | Code injection via "review/test/debug" — detects when Qwen reproduces vulnerable code from user input instead of fixing it | 5+ |
+| 9¾| **ASCII Prompt Gate** | Regex allowlist | Non-ASCII in worker prompts (CJK, Cyrillic homoglyphs, Arabic) — deterministic backstop for planner language safety rule. Only checks `prompt`, not `untrusted_data` | 5+ |
 | 10 | **CaMeL Provenance** | Data tagging | Untrusted data reaching dangerous destinations — architectural guarantee | 1 |
 
 ---
@@ -159,6 +160,7 @@ Every data item tagged with:
 │   ├── test_codeshield.py           # CodeShield scanner tests (Phase 3+5)
 │   ├── test_approval.py             # Approval flow + integration tests (Phase 3)
 │   ├── test_hardening.py            # Phase 5 hardening regression tests
+│   ├── test_encoding_scanner.py      # Encoding normalization scanner tests (Phase 5+)
 │   ├── test_conversation.py         # Multi-turn conversation tracking tests (Phase 5+)
 │   └── test_pin_auth.py             # PIN authentication middleware tests (Phase 5+)
 ├── gateway/
@@ -210,7 +212,7 @@ paho-mqtt>=2.1.0
 | **4** | Interfaces | Signal + WebUI integration, conversational approval |
 | **5** | Hardening | Llama Guard 4, red teaming, tuning, performance benchmarks |
 
-**Current status:** Phase 5+ — All 4 tiers complete, all 15 code review issues closed. Infrastructure hardened (TLS, CSP, CSRF, resource limits, read-only FS, pinned images, health checks). System prompt hardening P1-P5, P7, P8 implemented (dynamic marker, sandwich defence, structural tags, worker prompt rewrite, chain-safe variable substitution, structured output format). P6 (thinking mode) intentionally skipped. Post stress-test v2 security improvements: context-aware output path scanning, credential URI allowlist, tightened reverse shell pattern, VulnerabilityEchoScanner, conversation Rules 7+8 (recon/topic shift), Claude-assisted chain review via planner conversation history. 492 tests passing
+**Current status:** Phase 5+ — All 4 tiers complete, all 15 code review issues closed. Infrastructure hardened (TLS, CSP, CSRF, resource limits, read-only FS, pinned images, health checks). System prompt hardening P1-P5, P7, P8 implemented (dynamic marker, sandwich defence, structural tags, worker prompt rewrite, chain-safe variable substitution, structured output format). P6 (thinking mode) intentionally skipped. Post stress-test v2 security improvements: context-aware output path scanning, credential URI allowlist, tightened reverse shell pattern, VulnerabilityEchoScanner, conversation Rules 7+8 (recon/topic shift), Claude-assisted chain review via planner conversation history. W4 fix: EncodingNormalizationScanner (base64/hex/URL/ROT13/HTML/char-split decoding). W7 fix: planner language safety rule + ASCII prompt gate (deterministic backstop for cross-model bilingual injection). 529 tests passing
 
 > Signal integration planned but paused. Plan archived: `docs/archive/2026-02-12_phase4a-signal-mqtt-plan.md`.
 > CodeShield fix details: `docs/archive/2026-02-13_codeshield-fix.md`
@@ -260,7 +262,7 @@ paho-mqtt>=2.1.0
 User request → Conversation analysis (8 heuristic rules) → Prompt Guard scan
   → Claude plans (with conversation history + chain-level assessment) → Approval gate
   → For each step:
-      llm_task: resolve vars → Qwen generates → CodeShield (all output) → output scan → vuln echo scan
+      llm_task: resolve vars → ASCII prompt gate → Qwen generates → CodeShield (all output) → output scan → vuln echo scan
       tool_call: resolve vars → policy check → execute → tag as TRUSTED
   → TaskResult returned (includes ConversationInfo)
 ```
