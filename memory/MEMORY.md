@@ -13,7 +13,7 @@
 
 ## Gotchas & Learnings
 
-- Stress test JSONL stores metadata only — no response content. Need separate quality test with full logging
+- Stress test JSONL stores metadata only — no response content. Fix planned: `SENTINEL_VERBOSE_RESULTS` config flag to add worker_prompt + worker_response to StepResult (see Next Steps #1)
 - Container uses read-only FS with files copied at build time (not bind-mounted). Must rebuild to pick up code changes — see `docs/PROJECT_DOCS.md` "Rebuilding Containers" section
 - Hostile Qwen test payloads must put sensitive paths in operational context (code blocks, shell commands) — context-aware output scanner passes prose mentions
 - When updating existing tests for scanner behavior changes, check `test_hostile.py` too — it simulates real attacks and depends on scanner behavior
@@ -22,6 +22,8 @@
 - ASCII prompt gate only checks `prompt` param, not `untrusted_data`. Hostile test for chained Chinese injection needs `skip_input_scan=True` to simulate the real scenario (orchestrator skips input scan on chained steps because output was already scanned)
 
 ## What Was Done (2026-02-15, latest session)
+
+**Planner undefined variable fix:** Added clarification to planner system prompt — `$` symbols in user text are literal, not plan variables. Don't add them to `input_vars`. Fixes 5 stress test errors (all `indirect_injection` category).
 
 **DoS input validation (dos_resource 30% escape + edge_case 9% escape):**
 - Pydantic field validators on TaskRequest, ScanRequest, ProcessRequest, ApprovalDecision — strip, NFC normalize, newline collapse, min/max length enforcement (HTTP 422 rejection)
@@ -37,18 +39,22 @@
 
 Priority order:
 
-1. **Targeted stress test rerun** — validate all code fixes (W4 encoding, W7 bilingual, DoS input validation, echo scanner, FP reduction) with real data. All code changes are complete — this is the validation step. Target categories: encoding_obfuscation, cross_model_confusion, non_english_injection, dos_resource, edge_case, code_injection, plus genuine categories for FP check
+1. **Stress test v3 with verbose logging** — validates all code fixes AND measures Qwen output quality (W5). Needs two changes before running:
+   - **Verbose result logging:** Capture 3 things per step in the JSONL: (a) Claude's plan step prompt (what Claude tells Qwen), (b) the resolved prompt after spotlighting/tags/sandwich (what Qwen actually receives), (c) Qwen's raw response. Currently the JSONL stores metadata only — no content
+   - **Implementation approach:** Add optional `worker_prompt` and `worker_response` fields to `StepResult`, populated when `SENTINEL_VERBOSE_RESULTS=true`. The stress test runner already switches to auto mode — also enable verbose results. Behind a flag because the resolved prompt exposes spotlighting markers and defence structure (don't want in production responses)
+   - **Stress test script update:** `scripts/stress_test.py` needs to log the new verbose fields to JSONL when present in the API response
+   - **Quality assessment targets:** hallucination detection (does Qwen drift after ~400 tokens?), code quality grading, prompt fidelity (did Claude pass through enough detail or summarise?), spotlighting compliance (does Qwen follow UNTRUSTED_DATA instructions?), system prompt compliance
+   - **Security validation targets:** encoding_obfuscation, cross_model_confusion, non_english_injection, dos_resource, edge_case, code_injection, plus genuine categories for FP check
 2. **Multi-turn escapes (27%)** — biggest remaining gap. Conversation analyser improved (Rules 7+8, Claude chain review) but still the hardest problem. Consider: sliding-window chain scoring, explicit multi-turn state machine, or semantic trajectory tracking
-3. **Planner undefined variable errors** — 5 errors in stress test, quick planner prompt fix
-4. **Scanner concentration risk (W3)** — structural, not urgent. Partially mitigated (3 new scanners added: encoding, echo, ASCII gate) but sensitive_path + prompt_guard still dominate
-5. **Qwen output quality (W5)** — still unmeasured. Need quality test with full response logging to grade actual output
-6. **Response latency (W6)** — hardware-constrained (RTX 3060 + 14B model). Not fixable without hardware upgrade or smaller model
+3. **Scanner concentration risk (W3)** — structural, not urgent. Partially mitigated (3 new scanners added: encoding, echo, ASCII gate) but sensitive_path + prompt_guard still dominate
+4. **Response latency (W6)** — hardware-constrained (RTX 3060 + 14B model). Not fixable without hardware upgrade or smaller model
 
 ### Considerations
 
 - W4 and W7 are now both LLM + deterministic layered. The stress test rerun will show if the encoding scanner catches the base64/hex obfuscation attacks that previously escaped, and whether the ASCII gate blocks bilingual injection that the planner rule misses
 - The EncodingNormalizationScanner runs ROT13 on all input/output — watch for FPs on normal text that happens to ROT13 into a scanner pattern. The stress test rerun will surface this if it's an issue
 - Multi-turn remains the hardest problem. The conversation analyser's heuristic rules aren't enough — each individual turn looks benign. May need to invest in a dedicated chain-assessment approach rather than iterating on heuristics
+- Verbose logging security note: resolved prompts contain spotlighting markers, sandwich defence, and UNTRUSTED_DATA tags — exposing these helps attackers understand defences. Must be behind a config flag, off by default
 
 ## Key Paths for Context Loading
 
@@ -71,3 +77,4 @@ Priority order:
 - ~~Encoding obfuscation bypasses regex (W4)~~ → Fixed: EncodingNormalizationScanner decodes before re-scanning
 - ~~Cross-model bilingual injection (W7)~~ → Fixed: planner language safety rule + ASCII prompt gate (deterministic backstop)
 - ~~DoS/edge case input validation~~ → Fixed: Pydantic field validators (min/max length, strip, NFC, newline collapse) + pipeline prompt length gate (100K limit)
+- ~~Planner undefined variable errors~~ → Fixed: planner prompt clarification — user `$` symbols are literal text, not plan variables
