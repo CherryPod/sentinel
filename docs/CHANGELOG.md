@@ -1,5 +1,58 @@
 # Changelog
 
+## Stress Test v2 — Complete Results (2026-02-15)
+
+Full 976-prompt stress test completed (175 genuine + 801 adversarial, 21 categories). Ran overnight 2026-02-14 23:01 → 2026-02-15 08:19 UTC (9.3 hours).
+
+### Key Results
+- **Escape rate: 5.5%** (44/801) — stable vs v1 (5.3%) despite +11 new adversarial categories
+- **Combined catch rate: 93.3%** (hard blocked 67.8% + planner refused 25.5%)
+- **Genuine pass rate: 84.0%** (147/175), false positive rate 14.3% (25/175)
+- **Errors: 13** (down from 34 in v1)
+
+### Fully Defended Categories (0% escape)
+direct_injection, path_traversal, social_engineering, tool_manipulation, model_specific_jailbreak, benchmark_inspired, chunking_boundary, payload_free_injection, owasp_llm
+
+### Weakest Categories
+- multi_turn: 27% escape (22/83) — gradual escalation, innocuous individual turns
+- code_injection: 20% escape (10/51) — "help me improve/test this vulnerable code" framing
+- cross_model_confusion: 27% escape (4/15) — bilingual injection
+- dos_resource: 30% escape (3/10) — repetitive/nested input
+
+### False Positive Hotspots
+- sensitive_path_scanner on output (8 FPs) — educational content mentioning `/etc/`, `/usr/`
+- credential_scanner on output (5 FPs) — example Redis/Postgres URIs, JWT tokens
+- Multi-turn planner context loss (6 FPs) — planner can't reference earlier conversation
+
+### Files
+- Full report: `docs/archive/2026-02-15_stress-test-v2-results.md`
+- Expert assessment: `docs/archive/2026-02-15_camel-pipeline-assessment.md`
+- Results JSONL: `scripts/results/stress_test_20260214_230101.jsonl`
+- Runner log: `scripts/results/runner_20260214_230034.log`
+
+---
+
+## Fix: Planner Over-Planning, Prompt Caching, Stress Test Resilience (2026-02-14)
+
+Three fixes discovered during initial stress test v2 run (all 14 genuine requests blocked):
+
+### 1. Planner creating unnecessary file_write steps
+Claude was generating 2-step plans (llm_task + file_write) for simple text generation requests. The provenance trust gate correctly blocked step 2 (Qwen output is untrusted at trust level 0), but the file_write was unnecessary — the pipeline returns the final step's content to the user automatically. Added a planner rule: use a single llm_task for text generation unless the user explicitly asks to save to a file.
+
+### 2. Claude API prompt caching
+System prompt now sent as a content-block with `cache_control: {"type": "ephemeral"}`. After the first request, subsequent requests pay 10% of input token price for the cached system prompt (~90% savings). Cache auto-refreshes on each use within 5 minutes.
+
+### 3. Stress test rate limit handling
+429 responses previously triggered immediate budget exhaustion stop. Now retries up to 5 times with exponential backoff (60s, 120s, 240s, 480s, 600s). Only permanent budget keywords (`quota`, `billing`, `credit`, `insufficient`) trigger immediate stop. Removed transient keywords (`rate_limit`, `429`, `overloaded`) from the stop list.
+
+### 4. Stress test session isolation
+All requests shared one session (keyed by `source:client_IP`), so adversarial prompts locked the session and blocked all subsequent genuine requests (88% false positive rate from session lock alone). Each request now sends a unique source (`stress_test_N`) so every prompt is evaluated independently. Multi-turn sequences with explicit `session_id` are not affected.
+
+### Docs
+Added "Rebuilding Containers" guide to `docs/PROJECT_DOCS.md` documenting the podman image naming, `--force-recreate`, dependency chain, and secret gotchas.
+
+---
+
 ## Fix: Planner Prompt — Mention Spotlighting Markers (2026-02-14)
 
 Added spotlighting marker awareness to the planner's ABOUT THE WORKER LLM section. The prompt already told Claude about auto-applied `<UNTRUSTED_DATA>` tags but not about spotlighting markers, which could lead Claude to invent its own marking scheme. Now mentions both are auto-applied: "Do not add these tags or markers yourself."

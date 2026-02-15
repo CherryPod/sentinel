@@ -213,6 +213,7 @@ paho-mqtt>=2.1.0
 
 > Signal integration planned but paused. Plan archived: `docs/archive/2026-02-12_phase4a-signal-mqtt-plan.md`.
 > CodeShield fix details: `docs/archive/2026-02-13_codeshield-fix.md`
+> Stress test v2 assessment (3.0/5): `docs/archive/2026-02-15_camel-pipeline-assessment.md` — key gaps: conversation analyser inert (0.00 on all escapes), multi-turn 27% escape, 14.3% FP rate (19/25 fixable)
 
 ---
 
