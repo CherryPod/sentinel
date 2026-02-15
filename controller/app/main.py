@@ -1,9 +1,11 @@
+import re
 import time
+import unicodedata
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from slowapi import Limiter
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
@@ -77,6 +79,26 @@ _prompt_guard_loaded: bool = False
 _codeshield_loaded: bool = False
 _planner_available: bool = False
 _audit = None
+
+# ── Input validation constants ────────────────────────────────────
+MAX_TEXT_LENGTH = 50_000
+MIN_TASK_REQUEST_LENGTH = 3
+MAX_REASON_LENGTH = 1_000
+_CONSECUTIVE_NEWLINES = re.compile(r"\n{3,}")
+
+
+def _normalize_text(v: str, *, min_length: int = 1, max_length: int = MAX_TEXT_LENGTH, field_name: str = "Text") -> str:
+    """Shared validation: strip, NFC normalize, collapse newlines, enforce length."""
+    v = v.strip()
+    v = unicodedata.normalize("NFC", v)
+    v = _CONSECUTIVE_NEWLINES.sub("\n\n", v)
+    if not v:
+        raise ValueError(f"{field_name} must not be empty")
+    if len(v) < min_length:
+        raise ValueError(f"{field_name} too short (minimum {min_length} characters)")
+    if len(v) > max_length:
+        raise ValueError(f"{field_name} too long (maximum {max_length:,} characters)")
+    return v
 
 
 @asynccontextmanager
@@ -327,10 +349,31 @@ async def validate_command(
 class ScanRequest(BaseModel):
     text: str
 
+    @field_validator("text")
+    @classmethod
+    def validate_text(cls, v: str) -> str:
+        return _normalize_text(v, min_length=1, field_name="Text")
+
 
 class ProcessRequest(BaseModel):
     text: str
     untrusted_data: str | None = None
+
+    @field_validator("text")
+    @classmethod
+    def validate_text(cls, v: str) -> str:
+        return _normalize_text(v, min_length=1, field_name="Text")
+
+    @field_validator("untrusted_data")
+    @classmethod
+    def validate_untrusted_data(cls, v: str | None) -> str | None:
+        if v is None:
+            return v
+        # No minimum — can be empty string if explicitly provided, but enforce max
+        v = unicodedata.normalize("NFC", v)
+        if len(v) > MAX_TEXT_LENGTH:
+            raise ValueError(f"Untrusted data too long (maximum {MAX_TEXT_LENGTH:,} characters)")
+        return v
 
 
 @app.post("/scan")
@@ -398,6 +441,11 @@ class TaskRequest(BaseModel):
     source: str = "api"
     session_id: str | None = None  # Accepted but ignored — server assigns sessions
 
+    @field_validator("request")
+    @classmethod
+    def validate_request(cls, v: str) -> str:
+        return _normalize_text(v, min_length=MIN_TASK_REQUEST_LENGTH, field_name="Request")
+
 
 @app.post("/task")
 @limiter.limit("10/minute")
@@ -432,6 +480,13 @@ async def check_approval(approval_id: str):
 class ApprovalDecision(BaseModel):
     granted: bool
     reason: str = ""
+
+    @field_validator("reason")
+    @classmethod
+    def validate_reason(cls, v: str) -> str:
+        if len(v) > MAX_REASON_LENGTH:
+            raise ValueError(f"Reason too long (maximum {MAX_REASON_LENGTH:,} characters)")
+        return v
 
 
 @app.post("/approve/{approval_id}")

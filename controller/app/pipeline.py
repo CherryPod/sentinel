@@ -288,6 +288,32 @@ class ScanPipeline:
         # translate (CJK, Cyrillic homoglyphs, Arabic, etc.).
         self._check_prompt_ascii(prompt)
 
+        # 1.6. Prompt length gate: reject oversized prompts before they reach Qwen.
+        # The per-field limit is 50K chars, but the orchestrator can combine
+        # prompt + untrusted_data + spotlighting markers, so we allow 2x here.
+        combined_length = len(prompt) + (len(untrusted_data) if untrusted_data else 0)
+        if combined_length > 100_000:
+            logger.warning(
+                "Oversized prompt rejected before Qwen",
+                extra={
+                    "event": "prompt_too_long",
+                    "combined_length": combined_length,
+                    "prompt_length": len(prompt),
+                    "untrusted_data_length": len(untrusted_data) if untrusted_data else 0,
+                },
+            )
+            raise SecurityViolation(
+                f"Prompt too long ({combined_length:,} chars, maximum 100,000)",
+                {"prompt_length_gate": ScanResult(
+                    found=True,
+                    matches=[ScanMatch(
+                        pattern_name="prompt_too_long",
+                        matched_text=f"combined length: {combined_length:,} chars",
+                    )],
+                    scanner_name="prompt_length_gate",
+                )},
+            )
+
         # 2. Apply spotlighting to untrusted data + structural tags + sandwich
         # Use caller-provided marker, or generate a new one
         if marker is None:

@@ -1,5 +1,57 @@
 # Changelog
 
+## DoS Input Validation — Two-Layer Prompt Gating (2026-02-15)
+
+Last code fix before the targeted stress test rerun. Addresses dos_resource (30% escape) and edge_case (9% escape) categories from stress test v2 — empty prompts, whitespace padding, and oversized inputs were passing through to Qwen unchecked, wasting GPU compute.
+
+### Layer 1: Pydantic Field Validators (`main.py`)
+
+Added `field_validator` checks to all four request models, rejecting invalid input at deserialization (HTTP 422) before any processing:
+
+**TaskRequest.request:**
+- Strip leading/trailing whitespace → NFC normalize Unicode → collapse 3+ consecutive newlines to 2
+- Reject empty/whitespace-only → "Request must not be empty"
+- Reject < 3 chars (after strip) → "Request too short (minimum 3 characters)"
+- Reject > 50,000 chars → "Request too long (maximum 50,000 characters)"
+
+**ScanRequest.text / ProcessRequest.text:**
+- Same normalization pipeline (strip, NFC, newline collapse)
+- Min 1 char, max 50,000 chars
+
+**ProcessRequest.untrusted_data:**
+- Max 50,000 chars (no minimum — can be None)
+- NFC normalized
+
+**ApprovalDecision.reason:**
+- Max 1,000 chars (human-written justification, not a prompt)
+
+**Why 50K max:** Qwen 3 14B has 32K token context. 50K chars ≈ 12K tokens — leaves headroom for system prompt and spotlighting markers. Anything larger truncates or OOMs anyway.
+
+**Why 3 char minimum on TaskRequest:** Single characters (`.`, `?`) and 2-char inputs are never legitimate requests. Stress test showed these waste Qwen compute (one `.` prompt took 22 minutes). ScanRequest/ProcessRequest use min 1 because they're internal/diagnostic endpoints.
+
+### Layer 2: Pipeline Prompt Length Gate (`pipeline.py`)
+
+After the orchestrator resolves variables and constructs the full prompt (which bypasses Pydantic models), a length check in `process_with_qwen()` catches oversized resolved prompts:
+
+- Checks `len(prompt) + len(untrusted_data)` against 100,000 char limit
+- 2x the per-field limit because orchestrator can combine prompt + untrusted_data + spotlighting markers
+- Raises `SecurityViolation` with `prompt_length_gate` scanner result
+- Sits alongside the existing ASCII gate (step 1.6, right after step 1.5)
+
+### Tests
+- 562 tests passing (up from 529)
+- New `test_input_validation.py`: 33 tests covering all validation rules
+  - TaskRequest: empty, whitespace, min/max length, strip, newline collapse, NFC normalize, massive newline bomb
+  - ScanRequest: empty, whitespace, max length, single char passes
+  - ProcessRequest: empty, whitespace, max length, untrusted_data max
+  - ApprovalDecision: empty reason, max length, at boundary
+  - Pipeline: oversized prompt, oversized combined, within limit, exactly at boundary
+
+### Files Changed
+`controller/app/main.py`, `controller/app/pipeline.py`, `controller/tests/test_input_validation.py` (new)
+
+---
+
 ## W4 + W7: Encoding Scanner, Language Safety Rule, ASCII Prompt Gate (2026-02-15)
 
 Three defence-in-depth additions targeting two weaknesses from the stress test v2 assessment: W4 (encoding obfuscation, 12% escape) and W7 (cross-model confusion via bilingual injection, 27% escape).

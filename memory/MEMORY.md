@@ -23,25 +23,26 @@
 
 ## What Was Done (2026-02-15, latest session)
 
-Three defence-in-depth additions targeting W4 (encoding obfuscation) and W7 (cross-model bilingual injection):
+**DoS input validation (dos_resource 30% escape + edge_case 9% escape):**
+- Pydantic field validators on TaskRequest, ScanRequest, ProcessRequest, ApprovalDecision — strip, NFC normalize, newline collapse, min/max length enforcement (HTTP 422 rejection)
+- Pipeline prompt length gate in `process_with_qwen()` — rejects combined prompt+data >100K chars before reaching Qwen
+- 562 tests passing (up from 529)
 
-1. **EncodingNormalizationScanner** (W4) — decodes base64/hex/URL/ROT13/HTML entities/char-splitting and re-scans decoded text with inner scanners. Wired into both input + output scan pipelines
-2. **Planner language safety rule** (W7 LLM layer) — LANGUAGE SAFETY RULE in planner system prompt tells Claude to never include non-English text in worker prompts, translate everything to English first
-3. **ASCII prompt gate** (W7 deterministic layer) — regex allowlist (`\x20`-`\x7E` + whitespace) on the `prompt` param in `process_with_qwen()`, catches anything Claude lets through
-
-529 tests passing (up from 492). All changes in scanner.py, pipeline.py, planner.py + tests.
+**Previous same-day session — W4 + W7 fixes:**
+1. **EncodingNormalizationScanner** (W4) — decodes base64/hex/URL/ROT13/HTML entities/char-splitting and re-scans decoded text with inner scanners
+2. **Planner language safety rule** (W7 LLM layer) — LANGUAGE SAFETY RULE in planner system prompt
+3. **ASCII prompt gate** (W7 deterministic layer) — regex allowlist on `prompt` param in `process_with_qwen()`
 
 ## Next Steps
 
 Priority order:
 
-1. **Targeted stress test rerun** — validate W4 + W7 improvements with real data (encoding_obfuscation, cross_model_confusion, non_english_injection, plus genuine categories for FP check). This is the most important next step — unit tests prove the logic works, but only a live stress test proves it works against real attack patterns
-2. **Edge case/DoS input validation** — empty prompts (`.`, whitespace) waste minutes of Qwen time. Add min/max length + nesting limits before pipeline. Quick win
-3. **Multi-turn escapes (27%)** — biggest remaining gap. Conversation analyser scored 0.00 on all 22 escapes. Needs fundamental rework — current heuristics don't catch gradual trust-building. Consider: sliding-window chain scoring, explicit multi-turn state machine, or dedicated Claude call for chain assessment
-4. **Planner undefined variable errors** — 5 errors in stress test, quick planner prompt fix
-5. **Scanner concentration risk (W3)** — structural, not urgent. Two scanners handle ~86% of blocks. If either has a systematic blind spot, escape rate spikes
-6. **Qwen output quality (W5)** — still unmeasured. Need quality test with full response logging to grade actual output
-7. **Response latency (W6)** — hardware-constrained (RTX 3060 + 14B model). Not fixable without hardware upgrade or smaller model
+1. **Targeted stress test rerun** — validate all code fixes (W4 encoding, W7 bilingual, DoS input validation, echo scanner, FP reduction) with real data. All code changes are complete — this is the validation step. Target categories: encoding_obfuscation, cross_model_confusion, non_english_injection, dos_resource, edge_case, code_injection, plus genuine categories for FP check
+2. **Multi-turn escapes (27%)** — biggest remaining gap. Conversation analyser improved (Rules 7+8, Claude chain review) but still the hardest problem. Consider: sliding-window chain scoring, explicit multi-turn state machine, or semantic trajectory tracking
+3. **Planner undefined variable errors** — 5 errors in stress test, quick planner prompt fix
+4. **Scanner concentration risk (W3)** — structural, not urgent. Partially mitigated (3 new scanners added: encoding, echo, ASCII gate) but sensitive_path + prompt_guard still dominate
+5. **Qwen output quality (W5)** — still unmeasured. Need quality test with full response logging to grade actual output
+6. **Response latency (W6)** — hardware-constrained (RTX 3060 + 14B model). Not fixable without hardware upgrade or smaller model
 
 ### Considerations
 
@@ -69,3 +70,4 @@ Priority order:
 - ~~Conversation analyser blind to trust-building~~ → Improved: Rules 7 (recon) + 8 (topic shift) + Claude chain-level assessment
 - ~~Encoding obfuscation bypasses regex (W4)~~ → Fixed: EncodingNormalizationScanner decodes before re-scanning
 - ~~Cross-model bilingual injection (W7)~~ → Fixed: planner language safety rule + ASCII prompt gate (deterministic backstop)
+- ~~DoS/edge case input validation~~ → Fixed: Pydantic field validators (min/max length, strip, NFC, newline collapse) + pipeline prompt length gate (100K limit)

@@ -82,6 +82,7 @@
 | 8 | **ConversationAnalyzer** | Multi-turn heuristics | Memory poisoning, retry-after-block, capability escalation, instruction override, context building, reconnaissance, topic shift — 8 rules, additive scoring + Claude chain-level assessment via planner | 5+ |
 | 9½| **VulnerabilityEchoScanner** | Input/output fingerprint comparison | Code injection via "review/test/debug" — detects when Qwen reproduces vulnerable code from user input instead of fixing it | 5+ |
 | 9¾| **ASCII Prompt Gate** | Regex allowlist | Non-ASCII in worker prompts (CJK, Cyrillic homoglyphs, Arabic) — deterministic backstop for planner language safety rule. Only checks `prompt`, not `untrusted_data` | 5+ |
+| 9⅞| **Input Validation Gate** | Pydantic field validators + pipeline length check | Empty/whitespace/oversized prompts — Pydantic rejects at deserialization (422), pipeline rejects combined prompt+data >100K before Qwen. Strip, NFC normalize, newline collapse | 5+ |
 | 10 | **CaMeL Provenance** | Data tagging | Untrusted data reaching dangerous destinations — architectural guarantee | 1 |
 
 ---
@@ -161,6 +162,7 @@ Every data item tagged with:
 │   ├── test_approval.py             # Approval flow + integration tests (Phase 3)
 │   ├── test_hardening.py            # Phase 5 hardening regression tests
 │   ├── test_encoding_scanner.py      # Encoding normalization scanner tests (Phase 5+)
+│   ├── test_input_validation.py     # DoS input validation tests — Pydantic + pipeline length gate (Phase 5+)
 │   ├── test_conversation.py         # Multi-turn conversation tracking tests (Phase 5+)
 │   └── test_pin_auth.py             # PIN authentication middleware tests (Phase 5+)
 ├── gateway/
@@ -212,7 +214,7 @@ paho-mqtt>=2.1.0
 | **4** | Interfaces | Signal + WebUI integration, conversational approval |
 | **5** | Hardening | Llama Guard 4, red teaming, tuning, performance benchmarks |
 
-**Current status:** Phase 5+ — All 4 tiers complete, all 15 code review issues closed. Infrastructure hardened (TLS, CSP, CSRF, resource limits, read-only FS, pinned images, health checks). System prompt hardening P1-P5, P7, P8 implemented (dynamic marker, sandwich defence, structural tags, worker prompt rewrite, chain-safe variable substitution, structured output format). P6 (thinking mode) intentionally skipped. Post stress-test v2 security improvements: context-aware output path scanning, credential URI allowlist, tightened reverse shell pattern, VulnerabilityEchoScanner, conversation Rules 7+8 (recon/topic shift), Claude-assisted chain review via planner conversation history. W4 fix: EncodingNormalizationScanner (base64/hex/URL/ROT13/HTML/char-split decoding). W7 fix: planner language safety rule + ASCII prompt gate (deterministic backstop for cross-model bilingual injection). 529 tests passing
+**Current status:** Phase 5+ — All 4 tiers complete, all 15 code review issues closed. Infrastructure hardened (TLS, CSP, CSRF, resource limits, read-only FS, pinned images, health checks). System prompt hardening P1-P5, P7, P8 implemented (dynamic marker, sandwich defence, structural tags, worker prompt rewrite, chain-safe variable substitution, structured output format). P6 (thinking mode) intentionally skipped. Post stress-test v2 security improvements: context-aware output path scanning, credential URI allowlist, tightened reverse shell pattern, VulnerabilityEchoScanner, conversation Rules 7+8 (recon/topic shift), Claude-assisted chain review via planner conversation history. W4 fix: EncodingNormalizationScanner (base64/hex/URL/ROT13/HTML/char-split decoding). W7 fix: planner language safety rule + ASCII prompt gate (deterministic backstop for cross-model bilingual injection). DoS input validation: Pydantic field validators (strip, NFC, newline collapse, min/max length) + pipeline prompt length gate (100K combined limit). 562 tests passing. All code fixes complete — targeted stress test rerun is next
 
 > Signal integration planned but paused. Plan archived: `docs/archive/2026-02-12_phase4a-signal-mqtt-plan.md`.
 > CodeShield fix details: `docs/archive/2026-02-13_codeshield-fix.md`
@@ -259,10 +261,10 @@ paho-mqtt>=2.1.0
 ### CaMeL Task Flow (POST /task)
 
 ```
-User request → Conversation analysis (8 heuristic rules) → Prompt Guard scan
+User request → Input validation (Pydantic: strip, NFC, length) → Conversation analysis (8 heuristic rules) → Prompt Guard scan
   → Claude plans (with conversation history + chain-level assessment) → Approval gate
   → For each step:
-      llm_task: resolve vars → ASCII prompt gate → Qwen generates → CodeShield (all output) → output scan → vuln echo scan
+      llm_task: resolve vars → prompt length gate (100K) → ASCII prompt gate → Qwen generates → CodeShield (all output) → output scan → vuln echo scan
       tool_call: resolve vars → policy check → execute → tag as TRUSTED
   → TaskResult returned (includes ConversationInfo)
 ```
