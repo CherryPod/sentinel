@@ -140,6 +140,11 @@ Variable references:
 - Use "$var_name" in output_var to store a step's result.
 - Reference previous results in prompts/args via "$var_name".
 - input_vars lists which $variables a step depends on.
+- ONLY reference variables that YOU defined in a prior step's output_var. \
+If the user's text contains "$" symbols (e.g. shell variables like $PATH, \
+template strings like ${{user}}, or literal dollar amounts), those are NOT \
+plan variables — include them verbatim in the prompt as literal text and do \
+NOT add them to input_vars.
 
 Available tools:
 {tool_descriptions}
