@@ -6,7 +6,12 @@ import time
 from .config import settings
 from .models import DataSource, ScanMatch, ScanResult, TaggedData, TrustLevel
 from .provenance import create_tagged_data
-from .scanner import CommandPatternScanner, CredentialScanner, SensitivePathScanner
+from .scanner import (
+    CommandPatternScanner,
+    CredentialScanner,
+    SensitivePathScanner,
+    VulnerabilityEchoScanner,
+)
 from . import prompt_guard
 from .spotlighting import apply_datamarking
 from .worker import OllamaWorker
@@ -61,10 +66,12 @@ class ScanPipeline:
         path_scanner: SensitivePathScanner,
         cmd_scanner: CommandPatternScanner | None = None,
         worker: OllamaWorker | None = None,
+        echo_scanner: VulnerabilityEchoScanner | None = None,
     ):
         self._cred_scanner = cred_scanner
         self._path_scanner = path_scanner
         self._cmd_scanner = cmd_scanner or CommandPatternScanner()
+        self._echo_scanner = echo_scanner or VulnerabilityEchoScanner()
         self._worker = worker or OllamaWorker(
             base_url=settings.ollama_url,
             timeout=settings.ollama_timeout,
@@ -149,7 +156,9 @@ class ScanPipeline:
             )
 
         result.results["credential_scanner"] = self._cred_scanner.scan(text)
-        result.results["sensitive_path_scanner"] = self._path_scanner.scan(text)
+        # Context-aware: only flag paths in code blocks, shell commands, or
+        # standalone lines — not educational prose mentioning paths.
+        result.results["sensitive_path_scanner"] = self._path_scanner.scan_output_text(text)
         result.results["command_pattern_scanner"] = self._cmd_scanner.scan(text)
 
         elapsed = time.monotonic() - t0
@@ -186,6 +195,7 @@ class ScanPipeline:
         untrusted_data: str | None = None,
         marker: str | None = None,
         skip_input_scan: bool = False,
+        user_input: str | None = None,
     ) -> TaggedData:
         """Full pipeline: scan → spotlight → Qwen → scan → tag.
 
@@ -314,6 +324,25 @@ class ScanPipeline:
                 "Qwen output blocked by security scan",
                 output_scan.violations,
             )
+
+        # 6. Vulnerability echo scan: compare input vs output fingerprints.
+        # Only runs when the caller provides the raw user input text.
+        if user_input:
+            echo_result = self._echo_scanner.scan(user_input, response_text)
+            tagged.scan_results["vulnerability_echo_scanner"] = echo_result
+            if echo_result.found:
+                logger.warning(
+                    "Vulnerability echo detected — Qwen reproduced vulnerable code from input",
+                    extra={
+                        "event": "vuln_echo_blocked",
+                        "matches": [m.pattern_name for m in echo_result.matches],
+                        "data_id": tagged.id,
+                    },
+                )
+                raise SecurityViolation(
+                    "Vulnerability echo: Qwen reproduced vulnerable code from input",
+                    {"vulnerability_echo_scanner": echo_result},
+                )
 
         logger.info(
             "Pipeline complete — output clean",

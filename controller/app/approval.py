@@ -24,6 +24,8 @@ class PendingApproval:
     plan: Plan
     created_at: float  # monotonic time for TTL
     result: ApprovalResult | None = None
+    source_key: str = ""       # Session key for turn recording after approval
+    user_request: str = ""     # Original request text for turn recording + echo scanner
 
 
 class ApprovalManager:
@@ -40,7 +42,9 @@ class ApprovalManager:
         for k in expired:
             del self._pending[k]
 
-    async def request_plan_approval(self, plan: Plan) -> str:
+    async def request_plan_approval(
+        self, plan: Plan, source_key: str = "", user_request: str = "",
+    ) -> str:
         """Create an approval request. Returns the approval_id."""
         self._cleanup_expired()
         approval_id = str(uuid.uuid4())
@@ -48,6 +52,8 @@ class ApprovalManager:
             approval_id=approval_id,
             plan=plan,
             created_at=time.monotonic(),
+            source_key=source_key,
+            user_request=user_request,
         )
         logger.info(
             "Approval requested",
@@ -179,3 +185,7 @@ class ApprovalManager:
         if entry is None or entry.result is None:
             return None
         return entry.result.granted
+
+    def get_pending(self, approval_id: str) -> PendingApproval | None:
+        """Get the full PendingApproval entry (plan + metadata)."""
+        return self._pending.get(approval_id)

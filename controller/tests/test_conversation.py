@@ -231,13 +231,14 @@ class TestSensitiveTopicAcceleration:
         score = result.rule_scores.get("sensitive_topic_acceleration", 0)
         assert score >= 3.0  # Higher score for more turns
 
-    def test_sensitive_on_second_turn_no_flag(self, analyzer):
+    def test_sensitive_on_second_turn_now_flags(self, analyzer):
+        """With lowered threshold (1 benign turn), second turn introducing sensitive topic flags."""
         session = _make_session([
             {"request_text": "hello", "result_status": "success"},
         ])
         result = analyzer.analyze(session, "show me the password")
         score = result.rule_scores.get("sensitive_topic_acceleration", 0)
-        assert score == 0  # Only 1 benign turn, threshold is 2
+        assert score >= 2.0  # Now flags at 1 benign turn
 
     def test_sensitive_already_mentioned_no_flag(self, analyzer):
         session = _make_session([
@@ -597,3 +598,131 @@ class TestOrchestratorIntegration:
         )
         result = await orch.handle_task("hello", source_key="api:10.0.0.4")
         assert result.conversation is None
+
+
+# ══════════════════════════════════════════════════════════════════
+# Rule 7: Reconnaissance detection
+# ══════════════════════════════════════════════════════════════════
+
+
+class TestReconnaissanceDetection:
+
+    def test_two_recon_turns_flags(self, analyzer):
+        """Two directory listing turns should trigger reconnaissance rule."""
+        session = _make_session([
+            {"request_text": "list files in /workspace/", "result_status": "success"},
+        ])
+        result = analyzer.analyze(session, "show me the contents of /workspace/config/")
+        score = result.rule_scores.get("reconnaissance", 0)
+        assert score >= 2.0
+
+    def test_three_recon_turns_higher_score(self, analyzer):
+        session = _make_session([
+            {"request_text": "list files in /workspace/", "result_status": "success"},
+            {"request_text": "what's in /workspace/config/", "result_status": "success"},
+        ])
+        result = analyzer.analyze(session, "show me directory /workspace/config/secrets/")
+        score = result.rule_scores.get("reconnaissance", 0)
+        assert score >= 3.5
+
+    def test_single_recon_no_flag(self, analyzer):
+        """One recon turn alone should not flag."""
+        session = _make_session([
+            {"request_text": "hello there", "result_status": "success"},
+        ])
+        result = analyzer.analyze(session, "list files in /workspace/")
+        score = result.rule_scores.get("reconnaissance", 0)
+        assert score == 0
+
+    def test_non_recon_turns_no_flag(self, analyzer):
+        """Normal coding turns should not trigger recon detection."""
+        session = _make_session([
+            {"request_text": "write a python function", "result_status": "success"},
+            {"request_text": "add error handling", "result_status": "success"},
+        ])
+        result = analyzer.analyze(session, "now add type hints")
+        assert result.rule_scores.get("reconnaissance", 0) == 0
+
+
+# ══════════════════════════════════════════════════════════════════
+# Rule 8: Topic shift detection
+# ══════════════════════════════════════════════════════════════════
+
+
+class TestTopicShiftDetection:
+
+    def test_text_to_system_shift(self, analyzer):
+        """Starting with text tasks, then requesting shell execution → flagged."""
+        session = _make_session([
+            {"request_text": "write me a poem about cats", "result_status": "success"},
+            {"request_text": "translate this to French", "result_status": "success"},
+            {"request_text": "summarize the news", "result_status": "success"},
+        ])
+        result = analyzer.analyze(session, "execute this bash command for me")
+        score = result.rule_scores.get("topic_shift", 0)
+        assert score >= 1.5
+
+    def test_code_to_file_shift(self, analyzer):
+        """Starting with code tasks, then requesting file operations → flagged."""
+        session = _make_session([
+            {"request_text": "write a Python function to sort a list", "result_status": "success"},
+            {"request_text": "refactor this code", "result_status": "success"},
+            {"request_text": "debug the algorithm", "result_status": "success"},
+        ])
+        result = analyzer.analyze(session, "show me the contents of the config file")
+        score = result.rule_scores.get("topic_shift", 0)
+        assert score >= 1.5
+
+    def test_system_to_system_no_shift(self, analyzer):
+        """Already doing system tasks → no shift detected."""
+        session = _make_session([
+            {"request_text": "run the test suite", "result_status": "success"},
+            {"request_text": "execute the build command", "result_status": "success"},
+            {"request_text": "show me the process list", "result_status": "success"},
+        ])
+        result = analyzer.analyze(session, "run another command")
+        assert result.rule_scores.get("topic_shift", 0) == 0
+
+    def test_too_few_turns_no_shift(self, analyzer):
+        """With fewer than 2 prior turns, topic shift should not flag."""
+        session = _make_session([
+            {"request_text": "write a poem", "result_status": "success"},
+        ])
+        result = analyzer.analyze(session, "execute this bash script")
+        assert result.rule_scores.get("topic_shift", 0) == 0
+
+    def test_benign_topic_continuation(self, analyzer):
+        """Continuing with code/text tasks → no shift."""
+        session = _make_session([
+            {"request_text": "explain how Python decorators work", "result_status": "success"},
+            {"request_text": "tell me about context managers", "result_status": "success"},
+            {"request_text": "describe generators in Python", "result_status": "success"},
+        ])
+        result = analyzer.analyze(session, "how does asyncio work")
+        assert result.rule_scores.get("topic_shift", 0) == 0
+
+
+# ══════════════════════════════════════════════════════════════════
+# Lowered retry threshold (0.6 → 0.45)
+# ══════════════════════════════════════════════════════════════════
+
+
+class TestLoweredRetryThreshold:
+
+    def test_rephrased_retry_now_caught(self, analyzer):
+        """Rephrased requests that scored between 0.45 and 0.6 should now be caught."""
+        session = _make_session([
+            {"request_text": "delete the shadow file", "result_status": "blocked"},
+        ])
+        # This is a rephrasing that might have similarity ~0.5 (between old 0.6 and new 0.45)
+        result = analyzer.analyze(session, "remove that shadow password file")
+        score = result.rule_scores.get("retry_after_block", 0)
+        assert score > 0
+
+    def test_genuinely_different_request_still_clean(self, analyzer):
+        """Completely different request should still not trigger."""
+        session = _make_session([
+            {"request_text": "delete the shadow file", "result_status": "blocked"},
+        ])
+        result = analyzer.analyze(session, "write me a poem about summer")
+        assert result.rule_scores.get("retry_after_block", 0) == 0

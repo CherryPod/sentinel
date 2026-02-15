@@ -14,7 +14,15 @@
 ## Gotchas & Learnings
 
 - Stress test JSONL stores metadata only — no response content. Need separate quality test with full logging
-- Conversation analyser heuristic rules don't fire on trust-building turns (step 0/1 of chains). Keyword-based detection is blind to innocuous-looking individual turns
-- sensitive_path_scanner is both the top blocker (47.1%) AND the top FP source (11/25). Context-aware output scanning needed
-- Planner has no session memory — each /task call is stateless. Causes 8 FPs on genuine multi-turn follow-ups ("missing context")
-- All 10 code_injection escapes use same pattern: submit vulnerable code + "review/test/debug this". Input-output vulnerability comparison needed
+- Container uses read-only FS with files copied at build time (not bind-mounted). Must rebuild to pick up code changes — see `docs/PROJECT_DOCS.md` "Rebuilding Containers" section
+- Hostile Qwen test payloads must put sensitive paths in operational context (code blocks, shell commands) — context-aware output scanner passes prose mentions
+- When updating existing tests for scanner behavior changes, check `test_hostile.py` too — it simulates real attacks and depends on scanner behavior
+- `execute_approved_plan` must record turns in the session — without this, `full` approval mode breaks multi-turn conversation history (turns never get stored, planner sees empty history)
+- Browser/nginx 504 timeout (300s) is shorter than Qwen generation time for long prompts. If Turn 1 times out in the browser and user sends Turn 2 before the server finishes Turn 1, the session has no history yet. Not a code bug — concurrency/latency issue
+
+## Resolved (2026-02-15)
+
+- ~~sensitive_path_scanner FP source (11/25)~~ → Fixed: context-aware `scan_output_text()` for output scanning
+- ~~Planner has no session memory~~ → Fixed: conversation history injected into planner prompt
+- ~~Code injection "review/test/debug" escapes~~ → Fixed: VulnerabilityEchoScanner compares input/output fingerprints
+- ~~Conversation analyser blind to trust-building~~ → Improved: Rules 7 (recon) + 8 (topic shift) + Claude chain-level assessment

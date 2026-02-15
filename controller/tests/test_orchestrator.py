@@ -991,3 +991,154 @@ class TestChainSafeResolution:
         step2_marker = calls[1].kwargs.get("marker")
         assert step2_marker is not None
         assert len(step2_marker) == 4
+
+
+class TestUserInputPassedForEchoScanner:
+    """Part 3: Orchestrator passes raw user_request to pipeline for echo comparison."""
+
+    @pytest.fixture(autouse=True)
+    def _disable_codeshield_requirement(self):
+        from app.config import settings
+        original = settings.require_codeshield
+        settings.require_codeshield = False
+        yield
+        settings.require_codeshield = original
+
+    @pytest.mark.asyncio
+    async def test_user_input_passed_to_pipeline(self, mock_planner, mock_pipeline):
+        """process_with_qwen should receive user_input for echo scanning."""
+        plan = _make_plan([
+            {
+                "id": "step_1",
+                "type": "llm_task",
+                "description": "Generate",
+                "prompt": "Write tests for eval(x)",
+            }
+        ])
+        mock_planner.create_plan.return_value = plan
+
+        tagged = create_tagged_data(
+            content="test code",
+            source=DataSource.QWEN,
+            trust_level=TrustLevel.UNTRUSTED,
+        )
+        mock_pipeline.process_with_qwen.return_value = tagged
+
+        orch = Orchestrator(planner=mock_planner, pipeline=mock_pipeline)
+        await orch.handle_task("Write tests for eval(x)")
+
+        call_kwargs = mock_pipeline.process_with_qwen.call_args.kwargs
+        assert call_kwargs.get("user_input") == "Write tests for eval(x)"
+
+
+class TestConversationHistoryToPlanner:
+    """Part 2 Layer 2: Orchestrator builds and passes conversation history to planner."""
+
+    @pytest.fixture(autouse=True)
+    def _disable_codeshield_requirement(self):
+        from app.config import settings
+        original = settings.require_codeshield
+        settings.require_codeshield = False
+        yield
+        settings.require_codeshield = original
+
+    @pytest.mark.asyncio
+    async def test_history_passed_on_second_turn(self, mock_planner, mock_pipeline):
+        """Second turn in a session should include first turn's history."""
+        from app.session import SessionStore, ConversationTurn
+
+        store = SessionStore(ttl=3600, max_count=100)
+
+        plan = _make_plan([
+            {"id": "step_1", "type": "llm_task", "description": "Do", "prompt": "Hello"}
+        ], summary="Test summary")
+        mock_planner.create_plan.return_value = plan
+        tagged = create_tagged_data("ok", DataSource.QWEN, TrustLevel.UNTRUSTED)
+        mock_pipeline.process_with_qwen.return_value = tagged
+
+        orch = Orchestrator(
+            planner=mock_planner,
+            pipeline=mock_pipeline,
+            session_store=store,
+            conversation_analyzer=MagicMock(
+                analyze=MagicMock(return_value=MagicMock(
+                    action="allow", total_score=0.0, rule_scores={}, warnings=[],
+                ))
+            ),
+        )
+
+        # First turn
+        await orch.handle_task("first request", source_key="api:test")
+        # Second turn
+        mock_planner.create_plan.reset_mock()
+        await orch.handle_task("second request", source_key="api:test")
+
+        # Planner should have received conversation_history on second call
+        call_kwargs = mock_planner.create_plan.call_args.kwargs
+        history = call_kwargs.get("conversation_history")
+        assert history is not None
+        assert len(history) == 1
+        assert history[0]["request"] == "first request"
+        assert history[0]["outcome"] == "success"
+        assert history[0]["summary"] == "Test summary"
+
+    @pytest.mark.asyncio
+    async def test_no_history_on_first_turn(self, mock_planner, mock_pipeline):
+        """First turn in a session should NOT include conversation history."""
+        from app.session import SessionStore
+
+        store = SessionStore(ttl=3600, max_count=100)
+
+        plan = _make_plan([
+            {"id": "step_1", "type": "llm_task", "description": "Do", "prompt": "Hello"}
+        ])
+        mock_planner.create_plan.return_value = plan
+        tagged = create_tagged_data("ok", DataSource.QWEN, TrustLevel.UNTRUSTED)
+        mock_pipeline.process_with_qwen.return_value = tagged
+
+        orch = Orchestrator(
+            planner=mock_planner,
+            pipeline=mock_pipeline,
+            session_store=store,
+            conversation_analyzer=MagicMock(
+                analyze=MagicMock(return_value=MagicMock(
+                    action="allow", total_score=0.0, rule_scores={}, warnings=[],
+                ))
+            ),
+        )
+
+        await orch.handle_task("first request", source_key="api:test2")
+
+        call_kwargs = mock_planner.create_plan.call_args.kwargs
+        assert call_kwargs.get("conversation_history") is None
+
+    @pytest.mark.asyncio
+    async def test_plan_summary_stored_in_turn(self, mock_planner, mock_pipeline):
+        """The plan_summary should be stored in the ConversationTurn."""
+        from app.session import SessionStore
+
+        store = SessionStore(ttl=3600, max_count=100)
+
+        plan = _make_plan([
+            {"id": "step_1", "type": "llm_task", "description": "Do", "prompt": "Hello"}
+        ], summary="Generate a greeting")
+        mock_planner.create_plan.return_value = plan
+        tagged = create_tagged_data("Hi", DataSource.QWEN, TrustLevel.UNTRUSTED)
+        mock_pipeline.process_with_qwen.return_value = tagged
+
+        orch = Orchestrator(
+            planner=mock_planner,
+            pipeline=mock_pipeline,
+            session_store=store,
+            conversation_analyzer=MagicMock(
+                analyze=MagicMock(return_value=MagicMock(
+                    action="allow", total_score=0.0, rule_scores={}, warnings=[],
+                ))
+            ),
+        )
+
+        await orch.handle_task("greet me", source_key="api:test3")
+        session = store.get("api:test3")
+        assert session is not None
+        assert len(session.turns) == 1
+        assert session.turns[0].plan_summary == "Generate a greeting"

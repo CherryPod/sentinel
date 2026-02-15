@@ -79,8 +79,9 @@
 | 5 | **Llama Guard 4** | 12B content safety model | Harmful content (violence, hate, weapons) — GPU or CPU | 5 (skipped) |
 | 6 | **CodeShield** | Semgrep static analysis (codeshield pkg) | Malicious code patterns (os.system, eval, SQL injection, traversal, shells, weak crypto) — scans ALL Qwen output | 3+5 |
 | 7 | **CommandPatternScanner** | Regex patterns | Dangerous shell patterns in prose (pipe-to-shell, reverse shells, nohup, base64 decode+exec) | 5 |
-| 8 | **ConversationAnalyzer** | Multi-turn heuristics | Memory poisoning, retry-after-block, capability escalation, instruction override, context building — 6 rules, additive scoring | 5+ |
-| 9 | **CaMeL Provenance** | Data tagging | Untrusted data reaching dangerous destinations — architectural guarantee | 1 |
+| 8 | **ConversationAnalyzer** | Multi-turn heuristics | Memory poisoning, retry-after-block, capability escalation, instruction override, context building, reconnaissance, topic shift — 8 rules, additive scoring + Claude chain-level assessment via planner | 5+ |
+| 9½| **VulnerabilityEchoScanner** | Input/output fingerprint comparison | Code injection via "review/test/debug" — detects when Qwen reproduces vulnerable code from user input instead of fixing it | 5+ |
+| 10 | **CaMeL Provenance** | Data tagging | Untrusted data reaching dangerous destinations — architectural guarantee | 1 |
 
 ---
 
@@ -127,7 +128,7 @@ Every data item tagged with:
 │       ├── auth.py                  # PIN authentication middleware (Phase 5+)
 │       ├── config.py                # Environment config (pydantic-settings)
 │       ├── policy_engine.py         # YAML policy loader + path/command validators
-│       ├── scanner.py               # Credential + sensitive path regex scanners
+│       ├── scanner.py               # Credential + sensitive path + command + vulnerability echo scanners
 │       ├── provenance.py            # TaggedData + trust inheritance + chain walking
 │       ├── audit.py                 # Structured JSON logging (daily rotation)
 │       ├── models.py                # Pydantic models (TrustLevel, ScanResult, TaggedData, Plan, etc.)
@@ -141,7 +142,7 @@ Every data item tagged with:
 │       ├── codeshield.py            # CodeShield async wrapper + semgrep patch (Phase 3+5)
 │       ├── approval.py              # HTTP approval manager with TTL queue (Phase 3)
 │       ├── session.py               # Session store + conversation turn tracking (Phase 5+)
-│       └── conversation.py          # Multi-turn conversation analyzer — 6 heuristic rules (Phase 5+)
+│       └── conversation.py          # Multi-turn conversation analyzer — 8 heuristic rules (Phase 5+)
 ├── controller/tests/
 │   ├── conftest.py                  # Shared fixtures (engine, scanners)
 │   ├── test_policy_engine.py        # Policy rule unit tests
@@ -209,7 +210,7 @@ paho-mqtt>=2.1.0
 | **4** | Interfaces | Signal + WebUI integration, conversational approval |
 | **5** | Hardening | Llama Guard 4, red teaming, tuning, performance benchmarks |
 
-**Current status:** Phase 5+ — All 4 tiers complete, all 15 code review issues closed. Infrastructure hardened (TLS, CSP, CSRF, resource limits, read-only FS, pinned images, health checks). System prompt hardening P1-P5, P7, P8 implemented (dynamic marker, sandwich defence, structural tags, worker prompt rewrite, chain-safe variable substitution, structured output format). P6 (thinking mode) intentionally skipped. 432 tests passing
+**Current status:** Phase 5+ — All 4 tiers complete, all 15 code review issues closed. Infrastructure hardened (TLS, CSP, CSRF, resource limits, read-only FS, pinned images, health checks). System prompt hardening P1-P5, P7, P8 implemented (dynamic marker, sandwich defence, structural tags, worker prompt rewrite, chain-safe variable substitution, structured output format). P6 (thinking mode) intentionally skipped. Post stress-test v2 security improvements: context-aware output path scanning, credential URI allowlist, tightened reverse shell pattern, VulnerabilityEchoScanner, conversation Rules 7+8 (recon/topic shift), Claude-assisted chain review via planner conversation history. 492 tests passing
 
 > Signal integration planned but paused. Plan archived: `docs/archive/2026-02-12_phase4a-signal-mqtt-plan.md`.
 > CodeShield fix details: `docs/archive/2026-02-13_codeshield-fix.md`
@@ -256,10 +257,10 @@ paho-mqtt>=2.1.0
 ### CaMeL Task Flow (POST /task)
 
 ```
-User request → Conversation analysis (multi-turn check) → Prompt Guard scan
-  → Claude plans → Approval gate
+User request → Conversation analysis (8 heuristic rules) → Prompt Guard scan
+  → Claude plans (with conversation history + chain-level assessment) → Approval gate
   → For each step:
-      llm_task: resolve vars → Qwen generates → CodeShield (all output) → output scan
+      llm_task: resolve vars → Qwen generates → CodeShield (all output) → output scan → vuln echo scan
       tool_call: resolve vars → policy check → execute → tag as TRUSTED
   → TaskResult returned (includes ConversationInfo)
 ```

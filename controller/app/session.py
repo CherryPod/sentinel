@@ -16,6 +16,7 @@ class ConversationTurn:
     blocked_by: list[str] = field(default_factory=list)
     risk_score: float = 0.0
     timestamp: float = field(default_factory=time.monotonic)
+    plan_summary: str = ""           # What this turn did (for conversation history)
 
 
 @dataclass

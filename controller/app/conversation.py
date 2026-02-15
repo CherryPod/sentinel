@@ -1,8 +1,9 @@
 """Multi-turn conversation analysis — deterministic heuristic-based attack detection.
 
-Six scoring rules detect patterns that span multiple conversation turns:
+Eight scoring rules detect patterns that span multiple conversation turns:
 retry_after_block, escalation, sensitive_topic_acceleration,
-instruction_override, violation_accumulation, context_building.
+instruction_override, violation_accumulation, context_building,
+reconnaissance, topic_shift.
 
 Risk accumulates within a session and never decreases.
 """
@@ -89,6 +90,28 @@ ESCALATION_LANGUAGE = [
     "what i actually need", "the important part",
 ]
 
+# ── Reconnaissance indicators ────────────────────────────────
+
+RECON_PATTERNS = [
+    re.compile(r"\b(?:ls|list|dir)\s+", re.IGNORECASE),
+    re.compile(r"\blist\s+(?:files|directories|folders)\b", re.IGNORECASE),
+    re.compile(r"\bwhat(?:'s| is)\s+in\b", re.IGNORECASE),
+    re.compile(r"\bshow\s+(?:me\s+)?(?:the\s+)?(?:files|contents|directory|folder)\b", re.IGNORECASE),
+    re.compile(r"\bcontents?\s+of\b", re.IGNORECASE),
+    re.compile(r"\btree\s+", re.IGNORECASE),
+    re.compile(r"\bfind\s+.*(?:/\w+)", re.IGNORECASE),
+]
+
+# ── Topic shift categories ────────────────────────────────────
+
+TOPIC_CATEGORIES = {
+    "code": ["write code", "function", "class", "implement", "refactor", "debug", "algorithm", "variable"],
+    "text": ["write", "essay", "summarize", "translate", "explain", "describe", "poem", "story"],
+    "file": ["file", "directory", "path", "read file", "list files", "contents of"],
+    "system": ["execute", "run", "bash", "shell", "command", "sudo", "process", "kill", "service"],
+    "question": ["what is", "how does", "why", "can you explain", "tell me about", "help me understand"],
+}
+
 
 @dataclass
 class AnalysisResult:
@@ -157,6 +180,16 @@ class ConversationAnalyzer:
             scores["context_building"] = s
             warnings.extend(w)
 
+        s, w = self._check_reconnaissance(session, current_request)
+        if s > 0:
+            scores["reconnaissance"] = s
+            warnings.extend(w)
+
+        s, w = self._check_topic_shift(session, current_request)
+        if s > 0:
+            scores["topic_shift"] = s
+            warnings.extend(w)
+
         total = sum(scores.values())
 
         # Add cumulative risk from prior turns
@@ -211,7 +244,7 @@ class ConversationAnalyzer:
             ratio = SequenceMatcher(
                 None, current_lower, turn.request_text.lower(),
             ).ratio()
-            if ratio > 0.6:
+            if ratio > 0.45:
                 score += 3.0
                 warnings.append(
                     f"Request similar to previously blocked request (similarity: {ratio:.0%})"
@@ -316,7 +349,7 @@ class ConversationAnalyzer:
 
         if benign_count >= 4:
             return 3.0, [f"Sensitive topic introduced after {benign_count} benign turns"]
-        elif benign_count >= 2:
+        elif benign_count >= 1:
             return 2.0, [f"Sensitive topic introduced after {benign_count} benign turns"]
 
         return 0.0, []
@@ -388,3 +421,72 @@ class ConversationAnalyzer:
             warnings.append("Context reference combined with escalation language")
 
         return min(score, 4.0), warnings
+
+    # ── Rule 7: Reconnaissance detection ───────────────────────
+
+    def _check_reconnaissance(
+        self, session: Session, current_request: str,
+    ) -> tuple[float, list[str]]:
+        """Detect systematic directory/file exploration across turns.
+
+        Score: 2.0 for 2 recon turns, 3.5 for 3+, max 5.0
+        """
+        # Count prior turns that match recon patterns
+        recon_count = 0
+        for turn in session.turns:
+            if any(p.search(turn.request_text) for p in RECON_PATTERNS):
+                recon_count += 1
+
+        # Check if current request is also recon
+        current_is_recon = any(p.search(current_request) for p in RECON_PATTERNS)
+        if current_is_recon:
+            recon_count += 1
+
+        if recon_count >= 3:
+            return min(3.5, 5.0), [f"Systematic reconnaissance: {recon_count} exploration turns"]
+        elif recon_count >= 2:
+            return 2.0, [f"Reconnaissance pattern: {recon_count} exploration turns"]
+
+        return 0.0, []
+
+    # ── Rule 8: Topic shift detection ──────────────────────────
+
+    def _check_topic_shift(
+        self, session: Session, current_request: str,
+    ) -> tuple[float, list[str]]:
+        """Detect shifts from benign topics to system/file operations.
+
+        Score: 1.5 if session started with code/text/question and shifts
+        to system/file requests.
+        """
+        if len(session.turns) < 2:
+            return 0.0, []
+
+        current_cat = self._classify_topic(current_request)
+        if current_cat not in ("system", "file"):
+            return 0.0, []
+
+        # Check if earlier turns were in benign categories
+        early_categories = set()
+        for turn in session.turns[:3]:  # Look at first 3 turns
+            cat = self._classify_topic(turn.request_text)
+            if cat:
+                early_categories.add(cat)
+
+        benign_start = early_categories and early_categories.issubset({"code", "text", "question"})
+        if benign_start:
+            return 1.5, [f"Topic shift from {early_categories} to {current_cat}"]
+
+        return 0.0, []
+
+    def _classify_topic(self, text: str) -> str | None:
+        """Classify text into a topic category. Returns highest-risk match."""
+        text_lower = text.lower()
+        # Check in priority order: system > file > code > text > question
+        priority = ["system", "file", "code", "text", "question"]
+        for cat in priority:
+            keywords = TOPIC_CATEGORIES[cat]
+            for kw in keywords:
+                if kw in text_lower:
+                    return cat
+        return None

@@ -277,11 +277,24 @@ class Orchestrator:
         if self._tool_executor is not None:
             available_tools = self._tool_executor.get_tool_descriptions()
 
-        # 3. Create plan via Claude
+        # 3. Create plan via Claude — include conversation history for
+        # multi-turn context and chain-level adversarial assessment.
+        conversation_history = None
+        if session is not None and len(session.turns) > 0:
+            conversation_history = []
+            for i, turn in enumerate(session.turns, 1):
+                conversation_history.append({
+                    "turn": i,
+                    "request": turn.request_text[:200],
+                    "outcome": turn.result_status or "unknown",
+                    "summary": turn.plan_summary,
+                })
+
         try:
             plan = await self._planner.create_plan(
                 user_request=user_request,
                 available_tools=available_tools,
+                conversation_history=conversation_history,
             )
         except PlannerRefusalError as exc:
             logger.info(
@@ -314,7 +327,9 @@ class Orchestrator:
 
         # 4. Check if approval is needed
         if approval_mode == "full" and self._approval_manager is not None:
-            approval_id = await self._approval_manager.request_plan_approval(plan)
+            approval_id = await self._approval_manager.request_plan_approval(
+                plan, source_key=source_key or "", user_request=user_request,
+            )
             return TaskResult(
                 status="awaiting_approval",
                 plan_summary=plan.plan_summary,
@@ -323,7 +338,7 @@ class Orchestrator:
             )
 
         # 5. Execute plan
-        result = await self._execute_plan(plan)
+        result = await self._execute_plan(plan, user_input=user_request)
         result.conversation = conv_info
 
         task_elapsed = time.monotonic() - task_t0
@@ -338,12 +353,13 @@ class Orchestrator:
             },
         )
 
-        # Record turn
+        # Record turn with plan summary for conversation history
         if session is not None:
             turn = ConversationTurn(
                 request_text=user_request,
                 result_status=result.status,
                 risk_score=conv_info.risk_score if conv_info else 0.0,
+                plan_summary=plan.plan_summary,
             )
             session.add_turn(turn)
 
@@ -360,13 +376,33 @@ class Orchestrator:
         if not is_approved:
             return TaskResult(status="denied", reason="Plan was denied")
 
-        plan = self._approval_manager.get_plan(approval_id)
-        if plan is None:
+        pending = self._approval_manager.get_pending(approval_id)
+        if pending is None or pending.plan is None:
             return TaskResult(status="error", reason="Plan not found for approval")
 
-        return await self._execute_plan(plan)
+        plan = pending.plan
+        result = await self._execute_plan(
+            plan, user_input=pending.user_request or None,
+        )
 
-    async def _execute_plan(self, plan: Plan) -> TaskResult:
+        # Record the turn in the session so conversation history builds up.
+        # In full approval mode, handle_task returns before execution, so
+        # we must record the turn here after the plan completes.
+        if pending.source_key and self._session_store is not None:
+            session = self._session_store.get(pending.source_key)
+            if session is not None:
+                turn = ConversationTurn(
+                    request_text=pending.user_request,
+                    result_status=result.status,
+                    plan_summary=plan.plan_summary,
+                )
+                session.add_turn(turn)
+
+        return result
+
+    async def _execute_plan(
+        self, plan: Plan, user_input: str | None = None,
+    ) -> TaskResult:
         """Execute all steps in a plan sequentially."""
         context = ExecutionContext()
         step_results: list[StepResult] = []
@@ -383,7 +419,7 @@ class Orchestrator:
                 },
             )
 
-            result = await self._execute_step(step, context)
+            result = await self._execute_step(step, context, user_input=user_input)
             step_results.append(result)
             step_elapsed = time.monotonic() - step_t0
 
@@ -428,11 +464,12 @@ class Orchestrator:
         )
 
     async def _execute_step(
-        self, step: PlanStep, context: ExecutionContext
+        self, step: PlanStep, context: ExecutionContext,
+        user_input: str | None = None,
     ) -> StepResult:
         """Execute a single plan step."""
         if step.type == "llm_task":
-            return await self._execute_llm_task(step, context)
+            return await self._execute_llm_task(step, context, user_input=user_input)
         elif step.type == "tool_call":
             return await self._execute_tool_call(step, context)
         else:
@@ -443,7 +480,8 @@ class Orchestrator:
             )
 
     async def _execute_llm_task(
-        self, step: PlanStep, context: ExecutionContext
+        self, step: PlanStep, context: ExecutionContext,
+        user_input: str | None = None,
     ) -> StepResult:
         """Send a prompt to Qwen via the scan pipeline."""
         if not step.prompt:
@@ -470,6 +508,7 @@ class Orchestrator:
                 prompt=resolved_prompt,
                 marker=marker or None,
                 skip_input_scan=bool(step.input_vars),
+                user_input=user_input,
             )
 
             # Fail-closed: if CodeShield is required but unavailable, block

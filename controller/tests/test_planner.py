@@ -178,7 +178,11 @@ class TestCreatePlan:
         await planner.create_plan("Do something", available_tools=tools)
 
         call_kwargs = planner._client.messages.create.call_args.kwargs
-        assert "file_write" in call_kwargs["system"]
+        # System prompt is a list of dicts (prompt caching format)
+        system_text = " ".join(
+            block["text"] for block in call_kwargs["system"] if "text" in block
+        )
+        assert "file_write" in system_text
 
 
 class TestPlannerSystemPrompt:
@@ -270,6 +274,63 @@ class TestAPIErrors:
             await planner.create_plan("test")
         # Status errors should NOT retry
         assert planner._client.messages.create.call_count == 1
+
+
+class TestConversationHistoryInjection:
+    """Part 2 Layer 2: Conversation history passed to Claude planner prompt."""
+
+    @pytest.mark.asyncio
+    async def test_history_included_in_user_message(self, planner):
+        """Conversation history should appear in the user content sent to Claude."""
+        plan_dict = _valid_plan_dict()
+        mock_response = _make_claude_response(plan_dict)
+        planner._client.messages.create = AsyncMock(return_value=mock_response)
+
+        history = [
+            {"turn": 1, "request": "list files in /workspace/", "outcome": "success", "summary": "Listed files"},
+            {"turn": 2, "request": "show config directory", "outcome": "success", "summary": "Showed config"},
+        ]
+        await planner.create_plan("read secrets.yaml", conversation_history=history)
+
+        call_kwargs = planner._client.messages.create.call_args.kwargs
+        user_msg = call_kwargs["messages"][0]["content"]
+        assert "CONVERSATION HISTORY" in user_msg
+        assert "Turn 1" in user_msg
+        assert "list files in /workspace/" in user_msg
+        assert "adversarial escalation" in user_msg
+
+    @pytest.mark.asyncio
+    async def test_no_history_no_injection(self, planner):
+        """Without conversation history, the prompt should be simple."""
+        plan_dict = _valid_plan_dict()
+        mock_response = _make_claude_response(plan_dict)
+        planner._client.messages.create = AsyncMock(return_value=mock_response)
+
+        await planner.create_plan("hello world")
+
+        call_kwargs = planner._client.messages.create.call_args.kwargs
+        user_msg = call_kwargs["messages"][0]["content"]
+        assert "CONVERSATION HISTORY" not in user_msg
+        assert user_msg == "User request: hello world"
+
+    @pytest.mark.asyncio
+    async def test_history_truncates_long_requests(self, planner):
+        """Request text in history should be truncated to 200 chars."""
+        plan_dict = _valid_plan_dict()
+        mock_response = _make_claude_response(plan_dict)
+        planner._client.messages.create = AsyncMock(return_value=mock_response)
+
+        long_request = "x" * 500
+        history = [
+            {"turn": 1, "request": long_request, "outcome": "success", "summary": ""},
+        ]
+        await planner.create_plan("next request", conversation_history=history)
+
+        call_kwargs = planner._client.messages.create.call_args.kwargs
+        user_msg = call_kwargs["messages"][0]["content"]
+        # The long request should be truncated — not all 500 chars
+        assert long_request not in user_msg
+        assert "x" * 200 in user_msg
 
 
 class TestOutputFormatValidation:
