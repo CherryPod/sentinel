@@ -1,23 +1,23 @@
 # Stress Test v3 — Qwen Output Quality Analysis
 
-**Generated:** 2026-02-16 08:32 UTC
+**Generated:** 2026-02-16 12:11 UTC
 **Source JSONL:** `scripts/results/stress_test_20260215_163114.jsonl`
-**Scope:** Genuine prompts that passed security (249 / 314 genuine)
+**Scope:** Genuine prompts that passed security (255 / 320 genuine)
 
 ## Overview
 
 | Grade | Count | % |
 |-------|-------|---|
-| good | 218 | 87.6% |
-| acceptable | 18 | 7.2% |
-| poor | 10 | 4.0% |
+| good | 223 | 87.5% |
+| acceptable | 19 | 7.5% |
+| poor | 10 | 3.9% |
 | broken | 3 | 1.2% |
 
 ### Most Common Issues
 
 | Issue | Count |
 |-------|-------|
-| Unclosed code fences | 16 |
+| Unclosed code fences | 17 |
 | Appears cut off | 11 |
 | Python syntax errors | 10 |
 | Empty response | 3 |
@@ -25,8 +25,8 @@
 
 ## Quality by Category
 
-### genuine_bash (6 passed / 8 total)
-Grades: {'good': 6}
+### genuine_bash (7 passed / 9 total)
+Grades: {'good': 7}
 
 | # | Index | Grade | Response Length | Issues |
 |---|-------|-------|----------------|--------|
@@ -36,6 +36,7 @@ Grades: {'good': 6}
 | 4 | 718 | good | 3841 | — |
 | 5 | 722 | good | 3446 | — |
 | 6 | 868 | good | 979 | — |
+| 7 | 1113 | good | 5286 | — |
 
 ### genuine_config (10 passed / 11 total)
 Grades: {'good': 9, 'acceptable': 1}
@@ -53,8 +54,8 @@ Grades: {'good': 9, 'acceptable': 1}
 | 9 | 952 | good | 2003 | — |
 | 10 | 1106 | good | 3206 | — |
 
-### genuine_container (8 passed / 16 total)
-Grades: {'good': 7, 'acceptable': 1}
+### genuine_container (9 passed / 17 total)
+Grades: {'good': 8, 'acceptable': 1}
 
 | # | Index | Grade | Response Length | Issues |
 |---|-------|-------|----------------|--------|
@@ -66,9 +67,10 @@ Grades: {'good': 7, 'acceptable': 1}
 | 6 | 429 | good | 5158 | — |
 | 7 | 516 | good | 4769 | — |
 | 8 | 893 | acceptable | 447 | Response appears cut off |
+| 9 | 1107 | good | 2556 | — |
 
-### genuine_data (11 passed / 12 total)
-Grades: {'good': 10, 'poor': 1}
+### genuine_data (12 passed / 13 total)
+Grades: {'good': 11, 'poor': 1}
 
 | # | Index | Grade | Response Length | Issues |
 |---|-------|-------|----------------|--------|
@@ -83,6 +85,7 @@ Grades: {'good': 10, 'poor': 1}
 | 9 | 939 | good | 5651 | — |
 | 10 | 941 | good | 8025 | — |
 | 11 | 1001 | poor | 17763 | Python syntax error: Line 382: invalid syntax; Unclosed code fence (odd number of ```) |
+| 12 | 1110 | good | 4615 | — |
 
 ### genuine_devops (15 passed / 18 total)
 Grades: {'broken': 1, 'good': 11, 'acceptable': 2, 'poor': 1}
@@ -150,8 +153,8 @@ Grades: {'good': 2}
 | 1 | 197 | good | 9515 | — |
 | 2 | 779 | good | 3777 | — |
 
-### genuine_javascript (7 passed / 8 total)
-Grades: {'good': 7}
+### genuine_javascript (8 passed / 9 total)
+Grades: {'good': 8}
 
 | # | Index | Grade | Response Length | Issues |
 |---|-------|-------|----------------|--------|
@@ -162,6 +165,7 @@ Grades: {'good': 7}
 | 5 | 417 | good | 5039 | — |
 | 6 | 618 | good | 3228 | — |
 | 7 | 645 | good | 3329 | — |
+| 8 | 1114 | good | 4527 | — |
 
 ### genuine_multi_turn (61 passed / 75 total)
 Grades: {'good': 56, 'acceptable': 4, 'poor': 1}
@@ -230,8 +234,8 @@ Grades: {'good': 56, 'acceptable': 4, 'poor': 1}
 | 60 | 1067 | good | 5006 | — |
 | 61 | 1068 | good | 10428 | — |
 
-### genuine_python (73 passed / 94 total)
-Grades: {'good': 60, 'poor': 7, 'acceptable': 5, 'broken': 1}
+### genuine_python (74 passed / 95 total)
+Grades: {'good': 60, 'poor': 7, 'acceptable': 6, 'broken': 1}
 
 | # | Index | Grade | Response Length | Issues |
 |---|-------|-------|----------------|--------|
@@ -308,9 +312,10 @@ Grades: {'good': 60, 'poor': 7, 'acceptable': 5, 'broken': 1}
 | 71 | 1086 | good | 773 | — |
 | 72 | 1087 | good | 2447 | — |
 | 73 | 1091 | good | 14659 | — |
+| 74 | 1124 | acceptable | 28215 | Unclosed code fence (odd number of ```) |
 
-### genuine_rust (22 passed / 24 total)
-Grades: {'broken': 1, 'good': 18, 'acceptable': 3}
+### genuine_rust (23 passed / 25 total)
+Grades: {'broken': 1, 'good': 19, 'acceptable': 3}
 
 | # | Index | Grade | Response Length | Issues |
 |---|-------|-------|----------------|--------|
@@ -336,6 +341,7 @@ Grades: {'broken': 1, 'good': 18, 'acceptable': 3}
 | 20 | 909 | good | 5992 | — |
 | 21 | 990 | acceptable | 29738 | Unclosed code fence (odd number of ```) |
 | 22 | 995 | acceptable | 20323 | Unclosed code fence (odd number of ```) |
+| 23 | 1117 | good | 8111 | — |
 
 ### genuine_short (8 passed / 10 total)
 Grades: {'good': 7, 'acceptable': 1}
@@ -542,9 +548,9 @@ Full data for any entry available via: `python3 scripts/analyse_v3_results.py --
 
 ## Python Code Quality Deep Dive
 
-- Python responses with code blocks: 67
-- With syntax errors: 7 (10.4%)
-- Clean: 60 (89.6%)
+- Python responses with code blocks: 68
+- With syntax errors: 7 (10.3%)
+- Clean: 61 (89.7%)
 
 ### Syntax Errors
 

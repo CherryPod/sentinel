@@ -125,7 +125,9 @@ def load_jsonl(path: Path) -> tuple[dict, list[dict]]:
         for line in f:
             line = line.strip()
             if line:
-                results.append(json.loads(line))
+                entry = json.loads(line)
+                if entry.get("type") == "result":
+                    results.append(entry)
     return header, results
 
 
