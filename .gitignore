@@ -5,6 +5,9 @@ secrets/
 *.secret
 *.env
 
+# Rust build artifacts
+sidecar/target/
+
 # Python
 __pycache__/
 *.pyc
