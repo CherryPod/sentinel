@@ -1,5 +1,8 @@
 # Project Sentinel
 
+## Startup Context
+At the start of every conversation, read `docs/design/evolution-tracker.md` and `docs/codebase-map.md` before doing anything else. After reading both, state: "Context loaded (sentinel-ready)"
+
 ## What This Is
 A defence-in-depth AI assistant built on the CaMeL architecture. Claude API (Planner) plans tasks, an air-gapped Qwen 3 14B (Worker) executes them, and a Python/FastAPI Controller enforces 10 layers of security scanning between every step. The worker LLM is assumed compromised at all times.
 
