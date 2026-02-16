@@ -13,6 +13,7 @@ sentinel/              # Main Python package
 ├── api/               # FastAPI app, auth middleware
 ├── audit/             # Structured logging
 ├── core/              # Config, models, approval, database, event bus
+├── memory/            # Persistent memory (embeddings, chunks, hybrid search)
 ├── planner/           # Claude planner + CaMeL orchestrator
 ├── security/          # All scanning, policy, provenance, spotlighting
 ├── session/           # Session store
@@ -48,6 +49,21 @@ container/             # Containerfile for builds
 **Key constants:**
 - `api/auth.py:14` — `_MAX_FAILED_ATTEMPTS = 5`, `_LOCKOUT_SECONDS = 60`
 - `core/config.py` — all settings with defaults (approval_mode, thresholds, timeouts, etc.)
+
+### Persistent Memory (`sentinel/memory/`)
+
+| Module | Lines | Purpose |
+|--------|-------|---------|
+| `memory/embeddings.py` | ~120 | Async Ollama embedding client (`/api/embed`), nomic-embed-text 768-dim, retry logic |
+| `memory/splitter.py` | ~95 | Text splitting: paragraph → sentence → word boundaries, configurable overlap |
+| `memory/chunks.py` | ~260 | MemoryStore CRUD with FTS5 + sqlite-vec sync, dual-mode (SQLite / in-memory fallback) |
+| `memory/search.py` | ~150 | RRF hybrid search: fts_search(), vec_search(), hybrid_search() with k=60 fusion |
+
+**Key classes:**
+- `chunks.MemoryStore` — CRUD + application-layer FTS5/vec sync, `_has_vec_table()` cached check
+- `chunks.MemoryChunk` — dataclass: chunk_id, user_id, content, source, metadata, timestamps
+- `embeddings.EmbeddingClient` — async embed()/embed_batch(), shares OllamaWorker error hierarchy
+- `search.SearchResult` — dataclass: chunk_id, content, source, score, match_type
 
 ### Security Pipeline (`sentinel/security/`)
 
@@ -159,9 +175,14 @@ Skeleton for Phase 4 WASM tool sandbox. Compiles and accepts JSON over Unix sock
 | `test_session_sqlite.py` | 13 | session/store SQLite (write-through, TTL, capacity, cascade) |
 | `test_provenance_sqlite.py` | 17 | security/provenance SQLite (recursive CTE, trust inheritance, file prov) |
 | `test_trust_router.py` | 10 | planner/trust_router (classify, allowlist immutability) |
+| `test_splitter.py` | 19 | memory/splitter (paragraph, sentence, word splits, overlap, edge cases) |
+| `test_embeddings.py` | 10 | memory/embeddings (mocked Ollama, batch, timeout, retry) |
+| `test_memory_store.py` | 24 | memory/chunks (CRUD, FTS5 sync, vec, dual-mode, user isolation) |
+| `test_memory_search.py` | 15 | memory/search (FTS5, RRF fusion, vec fallback, ranking) |
+| `test_memory_api.py` | 13 | memory API endpoints (store, search, get, delete, validation) |
 | `conftest.py` | — | Fixtures: engine, cred_scanner, path_scanner, cmd_scanner, encoding_scanner |
 
-**Total: 662 tests passing** (`pytest tests/` from project root)
+**Total: 752 tests passing** (`pytest tests/` from project root)
 
 ---
 
@@ -227,7 +248,7 @@ User → HTTPS (uvicorn TLS) or HTTP (redirect.HTTPSRedirectApp → 301)
 ## Module Dependency Graph
 
 ```
-sentinel/api/app.py [lifespan: init_db → SessionStore, ApprovalManager, ProvenanceStore]
+sentinel/api/app.py [lifespan: init_db → SessionStore, ApprovalManager, ProvenanceStore, MemoryStore, EmbeddingClient]
   ├── api/middleware.py (SecurityHeaders, CSRF, RequestSizeLimit)
   ├── api/auth.py (PinAuth middleware)
   ├── api/redirect.py (HTTPSRedirectApp — background uvicorn for HTTP→HTTPS)
@@ -235,9 +256,14 @@ sentinel/api/app.py [lifespan: init_db → SessionStore, ApprovalManager, Proven
   ├── core/db.py (init_db — SQLite schema, WAL mode, FK enforcement)
   ├── core/models.py (shared data types)
   ├── audit/logger.py (logging)
+  ├── memory/chunks.py (MemoryStore — CRUD + FTS5/vec sync)
+  ├── memory/embeddings.py (EmbeddingClient — Ollama /api/embed)
+  ├── memory/search.py (hybrid_search — RRF fusion)
+  ├── memory/splitter.py (split_text — paragraph/sentence/word)
   ├── planner/orchestrator.py
   │     ├── planner/planner.py → Claude API
   │     ├── planner/trust_router.py (skeleton — SAFE_OPS allowlist, Phase 2+)
+  │     ├── memory/chunks.py + memory/embeddings.py (auto-memory after task completion)
   │     ├── security/pipeline.py
   │     │     ├── security/scanner.py (5 scanners)
   │     │     ├── security/prompt_guard.py → HuggingFace model

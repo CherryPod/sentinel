@@ -80,16 +80,16 @@ Progress checklist for the evolution plan. Design rationale lives in `evolution-
 
 ---
 
-## Phase 2: Persistent Memory
+## Phase 2: Persistent Memory — COMPLETE (2026-02-16)
 
 > Goal: Hybrid search memory — store context, search with RRF.
 
-- [ ] **2.1 — Embedding pipeline** — nomic-embed-text via Ollama on CPU
-- [ ] **2.2 — Chunk management** — store/update/delete, paragraph splitting, FTS5 + vector sync
-- [ ] **2.3 — RRF hybrid search** — FTS5 keyword + sqlite-vec semantic, k=60 fusion
-- [ ] **2.4 — Memory API + auto-memory** — CRUD endpoints, auto-store conversation summaries
+- [x] **2.1 — Embedding pipeline** — `sentinel/memory/embeddings.py`, EmbeddingClient for Ollama /api/embed (nomic-embed-text, 768 dims)
+- [x] **2.2 — Chunk management** — `sentinel/memory/chunks.py`, MemoryStore CRUD + FTS5/vec sync, `sentinel/memory/splitter.py` paragraph/sentence/word splitting
+- [x] **2.3 — RRF hybrid search** — `sentinel/memory/search.py`, FTS5 + sqlite-vec with RRF fusion (k=60), graceful vec fallback
+- [x] **2.4 — Memory API + auto-memory** — POST/GET/DELETE /api/memory, GET /api/memory/search, auto-store summaries after task completion
 
-**Verify:** store/search/delete roundtrip, RRF better than either method alone, CPU embeddings don't impact GPU inference
+**Verified:** 90 new tests (752 total, all pass). Store/search/delete roundtrip, FTS5 sync on CRUD, graceful vec degradation, embedding fallback, RRF fusion scoring
 
 ---
 

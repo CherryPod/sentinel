@@ -29,6 +29,10 @@ from sentinel.security.policy_engine import PolicyEngine
 from sentinel.security import codeshield, prompt_guard
 from sentinel.security.provenance import ProvenanceStore, set_default_store
 from sentinel.security.scanner import CommandPatternScanner, CredentialScanner, SensitivePathScanner
+from sentinel.memory.chunks import MemoryStore
+from sentinel.memory.embeddings import EmbeddingClient
+from sentinel.memory.search import hybrid_search
+from sentinel.memory.splitter import split_text
 from sentinel.session.store import SessionStore
 from sentinel.tools.executor import ToolExecutor
 
@@ -47,6 +51,8 @@ _session_store: SessionStore | None = None
 _prompt_guard_loaded: bool = False
 _codeshield_loaded: bool = False
 _planner_available: bool = False
+_memory_store: MemoryStore | None = None
+_embedding_client: EmbeddingClient | None = None
 _audit = None
 
 # ── Input validation constants ────────────────────────────────────
@@ -165,6 +171,23 @@ async def lifespan(app: FastAPI):
         },
     )
 
+    # Initialize memory store + embedding client (Phase 2)
+    global _memory_store, _embedding_client
+    _memory_store = MemoryStore(db=db_conn)
+    _embedding_client = EmbeddingClient(
+        base_url=settings.ollama_url,
+        model=settings.embeddings_model,
+        timeout=settings.embeddings_timeout,
+    )
+    _audit.info(
+        "Memory store initialized",
+        extra={
+            "event": "memory_init",
+            "embeddings_model": settings.embeddings_model,
+            "auto_memory": settings.auto_memory,
+        },
+    )
+
     # Initialize Claude planner + orchestrator (Phase 3)
     global _orchestrator, _planner_available
     try:
@@ -178,6 +201,8 @@ async def lifespan(app: FastAPI):
             approval_manager=approval_mgr,
             session_store=_session_store,
             conversation_analyzer=conversation_analyzer,
+            memory_store=_memory_store,
+            embedding_client=_embedding_client,
         )
         _planner_available = True
         _audit.info(
@@ -577,6 +602,173 @@ async def get_session(session_id: str):
             for t in session.turns
         ],
     }
+
+
+# ── Memory endpoints (Phase 2) ────────────────────────────────
+
+
+class MemoryStoreRequest(BaseModel):
+    text: str
+    source: str = ""
+    metadata: dict | None = None
+
+    @field_validator("text")
+    @classmethod
+    def validate_text(cls, v: str) -> str:
+        return _normalize_text(v, min_length=1, field_name="Text")
+
+
+@api_router.post("/memory")
+async def store_memory(req: MemoryStoreRequest):
+    """Store text in memory — splits large texts into chunks automatically."""
+    if _memory_store is None or _embedding_client is None:
+        return JSONResponse(
+            status_code=503,
+            content={"status": "error", "reason": "Memory system not initialized"},
+        )
+
+    # Split text into chunks
+    chunks = split_text(req.text)
+    if not chunks:
+        return JSONResponse(
+            status_code=400,
+            content={"status": "error", "reason": "Text produced no chunks after splitting"},
+        )
+
+    # Embed all chunks in a single batch call
+    try:
+        embeddings = await _embedding_client.embed_batch(chunks)
+    except Exception as exc:
+        # Graceful degradation: store without embeddings if Ollama is unavailable
+        if _audit:
+            _audit.warning(
+                "Embedding failed, storing without vectors",
+                extra={"event": "memory_embed_fallback", "error": str(exc)},
+            )
+        chunk_ids = []
+        for chunk_text in chunks:
+            cid = _memory_store.store(
+                content=chunk_text,
+                source=req.source,
+                metadata=req.metadata,
+            )
+            chunk_ids.append(cid)
+        return {
+            "status": "ok",
+            "chunk_ids": chunk_ids,
+            "chunks_stored": len(chunk_ids),
+            "embedded": False,
+        }
+
+    # Store each chunk with its embedding
+    chunk_ids = []
+    for chunk_text, embedding in zip(chunks, embeddings):
+        cid = _memory_store.store_with_embedding(
+            content=chunk_text,
+            embedding=embedding,
+            source=req.source,
+            metadata=req.metadata,
+        )
+        chunk_ids.append(cid)
+
+    return {
+        "status": "ok",
+        "chunk_ids": chunk_ids,
+        "chunks_stored": len(chunk_ids),
+        "embedded": True,
+    }
+
+
+@api_router.get("/memory/search")
+async def search_memory(
+    query: str = Query(..., min_length=1, description="Search query"),
+    k: int = Query(10, ge=1, le=100, description="Number of results"),
+):
+    """Hybrid search across memory — FTS5 keyword + vector semantic with RRF fusion."""
+    if _memory_store is None or _memory_store._db is None:
+        return JSONResponse(
+            status_code=503,
+            content={"status": "error", "reason": "Memory system not initialized"},
+        )
+
+    # Try to embed the query for vector search; fall back to FTS5-only
+    query_embedding = None
+    if _embedding_client is not None:
+        try:
+            query_embedding = await _embedding_client.embed(query)
+        except Exception:
+            pass  # graceful degradation to FTS5-only
+
+    results = hybrid_search(
+        db=_memory_store._db,
+        query=query,
+        embedding=query_embedding,
+        k=k,
+    )
+
+    return {
+        "status": "ok",
+        "results": [
+            {
+                "chunk_id": r.chunk_id,
+                "content": r.content,
+                "source": r.source,
+                "score": round(r.score, 6),
+                "match_type": r.match_type,
+            }
+            for r in results
+        ],
+        "count": len(results),
+    }
+
+
+@api_router.get("/memory/{chunk_id}")
+async def get_memory_chunk(chunk_id: str):
+    """Get a specific memory chunk by ID."""
+    if _memory_store is None:
+        return JSONResponse(
+            status_code=503,
+            content={"status": "error", "reason": "Memory system not initialized"},
+        )
+
+    chunk = _memory_store.get(chunk_id)
+    if chunk is None:
+        return JSONResponse(
+            status_code=404,
+            content={"status": "error", "reason": "Chunk not found"},
+        )
+
+    return {
+        "status": "ok",
+        "chunk": {
+            "chunk_id": chunk.chunk_id,
+            "user_id": chunk.user_id,
+            "content": chunk.content,
+            "source": chunk.source,
+            "metadata": chunk.metadata,
+            "created_at": chunk.created_at,
+            "updated_at": chunk.updated_at,
+        },
+    }
+
+
+@api_router.delete("/memory/{chunk_id}")
+async def delete_memory_chunk(chunk_id: str):
+    """Delete a memory chunk and its FTS5/vec index entries."""
+    if _memory_store is None:
+        return JSONResponse(
+            status_code=503,
+            content={"status": "error", "reason": "Memory system not initialized"},
+        )
+
+    deleted = _memory_store.delete(chunk_id)
+    if not deleted:
+        return JSONResponse(
+            status_code=404,
+            content={"status": "error", "reason": "Chunk not found"},
+        )
+
+    return {"status": "ok", "deleted": chunk_id}
 
 
 # Include API router before static file mount — API routes take priority

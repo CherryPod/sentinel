@@ -13,8 +13,8 @@ from sentinel.core.models import (
     TaskResult,
     TrustLevel,
 )
-from sentinel.security import codeshield
 from sentinel.core.config import settings
+from sentinel.security import codeshield
 from sentinel.security.conversation import ConversationAnalyzer
 from sentinel.security.pipeline import ScanPipeline, SecurityViolation, _generate_marker
 from .planner import ClaudePlanner, PlannerError, PlannerRefusalError
@@ -144,6 +144,8 @@ class Orchestrator:
         approval_manager=None,
         session_store: SessionStore | None = None,
         conversation_analyzer: ConversationAnalyzer | None = None,
+        memory_store=None,
+        embedding_client=None,
     ):
         self._planner = planner
         self._pipeline = pipeline
@@ -151,6 +153,8 @@ class Orchestrator:
         self._approval_manager = approval_manager
         self._session_store = session_store
         self._conversation_analyzer = conversation_analyzer
+        self._memory_store = memory_store
+        self._embedding_client = embedding_client
 
     async def handle_task(
         self,
@@ -353,6 +357,14 @@ class Orchestrator:
             },
         )
 
+        # Auto-memory: store a brief summary of successful tasks
+        if (
+            result.status == "success"
+            and settings.auto_memory
+            and self._memory_store is not None
+        ):
+            await self._auto_store_memory(user_request, plan.plan_summary)
+
         # Record turn with plan summary for conversation history
         if session is not None:
             turn = ConversationTurn(
@@ -400,6 +412,42 @@ class Orchestrator:
                 session.add_turn(turn)
 
         return result
+
+    async def _auto_store_memory(self, user_request: str, plan_summary: str) -> None:
+        """Store a brief summary of a completed task in persistent memory.
+
+        The summary is the user's request + the plan summary — not a full
+        conversation replay. Keeps chunks small and useful for future context.
+        """
+        summary = f"Task: {user_request}\nResult: {plan_summary}"
+        try:
+            if self._embedding_client is not None:
+                embedding = await self._embedding_client.embed(summary)
+                self._memory_store.store_with_embedding(
+                    content=summary,
+                    embedding=embedding,
+                    source="conversation",
+                    metadata={"auto": True},
+                )
+            else:
+                self._memory_store.store(
+                    content=summary,
+                    source="conversation",
+                    metadata={"auto": True},
+                )
+            logger.info(
+                "Auto-memory stored",
+                extra={
+                    "event": "auto_memory_stored",
+                    "summary_length": len(summary),
+                },
+            )
+        except Exception as exc:
+            # Auto-memory is best-effort — never fail the task because of it
+            logger.warning(
+                "Auto-memory storage failed",
+                extra={"event": "auto_memory_failed", "error": str(exc)},
+            )
 
     async def _execute_plan(
         self, plan: Plan, user_input: str | None = None,

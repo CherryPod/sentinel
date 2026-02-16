@@ -66,6 +66,11 @@ class Settings(BaseSettings):
     conversation_block_threshold: float = 5.0
     conversation_enabled: bool = True
 
+    # Embeddings (Phase 2) — uses Ollama /api/embed with a lightweight model on CPU
+    embeddings_model: str = "nomic-embed-text"
+    embeddings_timeout: int = 30
+    auto_memory: bool = True  # auto-store conversation summaries after tasks
+
     # Verbose results (stress testing) — exposes defence internals (spotlighting
     # markers, sandwich text, UNTRUSTED_DATA structure). Off by default.
     verbose_results: bool = False
