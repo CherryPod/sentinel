@@ -6,23 +6,48 @@ Developer reference for navigating the Sentinel codebase. Module responsibilitie
 
 ---
 
-## Source Modules (`controller/app/`)
+## Package Structure
 
-### API & Configuration
+```
+sentinel/              # Main Python package
+├── api/               # FastAPI app, auth middleware
+├── audit/             # Structured logging
+├── core/              # Config, models, approval, database, event bus
+├── planner/           # Claude planner + CaMeL orchestrator
+├── security/          # All scanning, policy, provenance, spotlighting
+├── session/           # Session store
+├── tools/             # Tool executor (policy-checked)
+└── worker/            # Ollama/Qwen client
+
+tests/                 # All test files (project root)
+sidecar/               # Rust WASM sidecar (Phase 4)
+ui/                    # Frontend (HTML/JS/CSS)
+policies/              # Security policy YAML
+container/             # Containerfile for builds
+```
+
+---
+
+## Source Modules (`sentinel/`)
+
+### API & Configuration (`sentinel/api/`, `sentinel/core/`, `sentinel/audit/`)
 
 | Module | Lines | Purpose |
 |--------|-------|---------|
-| `main.py` | ~200 | FastAPI app, all endpoints, CSRF middleware, request size limit, Pydantic request models with validators |
-| `auth.py` | ~131 | PIN authentication ASGI middleware, per-IP lockout (5 failures / 60s), constant-time comparison |
-| `config.py` | ~76 | Pydantic Settings — all config via `SENTINEL_*` env vars |
-| `models.py` | ~150 | Data models: TrustLevel, DataSource, ScanResult, TaggedData, PlanStep, Plan, TaskResult, etc. |
-| `audit.py` | ~52 | Structured JSON logging with daily rotation |
+| `api/app.py` | ~200 | FastAPI app, all endpoints, CSRF middleware, request size limit, Pydantic request models with validators |
+| `api/auth.py` | ~131 | PIN authentication ASGI middleware, per-IP lockout (5 failures / 60s), constant-time comparison |
+| `core/config.py` | ~76 | Pydantic Settings — all config via `SENTINEL_*` env vars |
+| `core/models.py` | ~150 | Data models: TrustLevel, DataSource, ScanResult, TaggedData, PlanStep, Plan, TaskResult, etc. |
+| `core/approval.py` | ~192 | In-memory approval queue with 5-min TTL |
+| `core/db.py` | ~165 | SQLite schema: sessions, turns, provenance, approvals, memory_chunks (FTS5 + sqlite-vec), routines, audit_log |
+| `core/bus.py` | ~105 | Async pub/sub event bus with wildcard topic matching |
+| `audit/logger.py` | ~52 | Structured JSON logging with daily rotation |
 
 **Key constants:**
-- `auth.py:14` — `_MAX_FAILED_ATTEMPTS = 5`, `_LOCKOUT_SECONDS = 60`
-- `config.py` — all settings with defaults (approval_mode, thresholds, timeouts, etc.)
+- `api/auth.py:14` — `_MAX_FAILED_ATTEMPTS = 5`, `_LOCKOUT_SECONDS = 60`
+- `core/config.py` — all settings with defaults (approval_mode, thresholds, timeouts, etc.)
 
-### Security Pipeline
+### Security Pipeline (`sentinel/security/`)
 
 | Module | Lines | Purpose |
 |--------|-------|---------|
@@ -33,6 +58,7 @@ Developer reference for navigating the Sentinel codebase. Module responsibilitie
 | `codeshield.py` | ~136 | CodeShield/Semgrep wrapper — insecure code detection, async, fail-closed |
 | `spotlighting.py` | ~33 | Per-word character prefix marking for untrusted data |
 | `conversation.py` | ~493 | 8 heuristic rules for multi-turn attack detection (retry, escalation, recon, topic shift, etc.) |
+| `provenance.py` | ~115 | Trust tagging, chain walking, file provenance registry, trust-safe-for-execution check |
 
 **Key constants:**
 - `pipeline.py:24` — `_MARKER_POOL = "~!@#%*+=|;:"` (spotlighting alphabet)
@@ -48,35 +74,35 @@ Developer reference for navigating the Sentinel codebase. Module responsibilitie
 - `scanner.SensitivePathScanner.scan_output_text()` — context-aware (only flags in code/shell, not prose)
 - `scanner.EncodingNormalizationScanner` — decodes base64/hex/URL/ROT13/HTML/char-split, re-scans
 
-### Execution Engine
+### Execution Engine (`sentinel/planner/`, `sentinel/tools/`)
 
 | Module | Lines | Purpose |
 |--------|-------|---------|
-| `orchestrator.py` | ~350 | CaMeL execution loop: plan → approve → per-step execute → scan. Variable substitution across steps |
-| `planner.py` | ~220 | Claude API client, JSON plan generation, validation, refusal detection |
-| `worker.py` | ~143 | Ollama/Qwen async HTTP client, retry logic |
-| `tools.py` | ~462 | Tool executor: file_write/read, mkdir, shell, podman_build/run/stop — all policy-checked |
-| `approval.py` | ~192 | In-memory approval queue with 5-min TTL |
+| `planner/orchestrator.py` | ~350 | CaMeL execution loop: plan → approve → per-step execute → scan. Variable substitution across steps |
+| `planner/planner.py` | ~220 | Claude API client, JSON plan generation, validation, refusal detection |
+| `tools/executor.py` | ~462 | Tool executor: file_write/read, mkdir, shell, podman_build/run/stop — all policy-checked |
 
 **Key constants:**
-- `planner.py:12-191` — `_PLANNER_SYSTEM_PROMPT_TEMPLATE` (Claude's full instructions)
-- `worker.py:12-35` — `QWEN_SYSTEM_PROMPT_TEMPLATE` (Qwen's system prompt with `{marker}` placeholder)
-- `orchestrator.py` — `_FORMAT_INSTRUCTIONS`, `_CHAIN_REMINDER` (chained step safety text)
-- `tools.py:14-20` — `_DANGEROUS_PODMAN_FLAG_NAMES/VALUES` (blocked flags)
+- `planner/planner.py:12-191` — `_PLANNER_SYSTEM_PROMPT_TEMPLATE` (Claude's full instructions)
+- `planner/orchestrator.py` — `_FORMAT_INSTRUCTIONS`, `_CHAIN_REMINDER` (chained step safety text)
+- `tools/executor.py:14-20` — `_DANGEROUS_PODMAN_FLAG_NAMES/VALUES` (blocked flags)
 
 **Key functions:**
 - `orchestrator.handle_task()` — main entry point from `/task` endpoint
 - `orchestrator.execute_approved_plan()` — runs after human approval
 - `orchestrator.ExecutionContext.resolve_text_safe()` — wraps variable content with UNTRUSTED_DATA tags + markers
 - `planner.ClaudePlanner.create_plan()` — calls Claude API, validates JSON response
-- `tools.ToolExecutor.execute()` — dispatches to tool handler with policy check
+- `executor.ToolExecutor.execute()` — dispatches to tool handler with policy check
 
-### State Management
+### Worker & State (`sentinel/worker/`, `sentinel/session/`)
 
 | Module | Lines | Purpose |
 |--------|-------|---------|
-| `session.py` | ~142 | In-memory session store, TTL eviction, conversation turn tracking |
-| `provenance.py` | ~115 | Trust tagging, chain walking, file provenance registry, trust-safe-for-execution check |
+| `worker/ollama.py` | ~143 | Ollama/Qwen async HTTP client, retry logic |
+| `session/store.py` | ~142 | In-memory session store, TTL eviction, conversation turn tracking |
+
+**Key constants:**
+- `worker/ollama.py:12-35` — `QWEN_SYSTEM_PROMPT_TEMPLATE` (Qwen's system prompt with `{marker}` placeholder)
 
 **Key functions:**
 - `provenance.create_tagged_data()` — creates entry, inherits UNTRUSTED from any parent
@@ -84,37 +110,61 @@ Developer reference for navigating the Sentinel codebase. Module responsibilitie
 - `provenance.record_file_write()` / `get_file_writer()` — file trust inheritance
 - `session.SessionStore.get_or_create()` — per-source sessions with TTL
 
+### New Phase 0 Components
+
+| Module | Lines | Purpose |
+|--------|-------|---------|
+| `core/db.py` | ~165 | SQLite schema — 8 tables + FTS5 + sqlite-vec (schema only, no migration yet) |
+| `core/bus.py` | ~105 | Async event bus — publish/subscribe/unsubscribe with `fnmatch` wildcard matching |
+
 ---
 
-## Test Files (`controller/tests/`)
+## Rust Sidecar (`sidecar/`)
+
+Skeleton for Phase 4 WASM tool sandbox. Compiles and accepts JSON over Unix socket.
+
+| File | Purpose |
+|------|---------|
+| `src/main.rs` | Unix socket listener, connection handler |
+| `src/protocol.rs` | JSON request/response types (serde) |
+| `src/sandbox.rs` | Wasmtime engine stub |
+| `src/registry.rs` | Tool metadata stub |
+| `src/capabilities.rs` | Capability model stub (ReadFile, WriteFile, HttpRequest, UseCredential, InvokeTool) |
+| `src/config.rs` | Resource limits (memory, fuel, timeout) |
+
+---
+
+## Test Files (`tests/`)
 
 | File | Tests | Source Module(s) |
 |------|-------|-----------------|
-| `test_policy_engine.py` | ~60 | policy_engine (paths, commands, traversal, globs) |
-| `test_scanner.py` | ~50 | scanner (credentials, paths, commands, echo) |
-| `test_encoding_scanner.py` | ~25 | scanner (base64, hex, URL, ROT13, HTML, char-split) |
-| `test_pipeline.py` | ~30 | pipeline (input/output scan, SecurityViolation, ASCII gate) |
-| `test_spotlighting.py` | ~10 | spotlighting (apply/remove markers) |
-| `test_prompt_guard.py` | ~15 | prompt_guard (init, chunking, classification) |
-| `test_codeshield.py` | ~10 | codeshield (init, scan parsing) |
-| `test_planner.py` | ~40 | planner (plan creation, validation, refusals) |
-| `test_orchestrator.py` | ~50 | orchestrator (context, steps, trust gates, chain-safe) |
-| `test_tools.py` | ~40 | tools (file I/O, shell, Podman, flag deny-list) |
-| `test_provenance.py` | ~20 | provenance (trust inheritance, chains, file tracking) |
-| `test_approval.py` | ~15 | approval (lifecycle, TTL, submit) |
-| `test_conversation.py` | ~40 | conversation (all 8 rules, combined scoring, FP prevention) |
-| `test_pin_auth.py` | ~20 | auth (PIN validation, lockout, timing) |
+| `test_policy_engine.py` | ~60 | security/policy_engine (paths, commands, traversal, globs) |
+| `test_scanner.py` | ~50 | security/scanner (credentials, paths, commands, echo) |
+| `test_encoding_scanner.py` | ~25 | security/scanner (base64, hex, URL, ROT13, HTML, char-split) |
+| `test_pipeline.py` | ~30 | security/pipeline (input/output scan, SecurityViolation, ASCII gate) |
+| `test_spotlighting.py` | ~10 | security/spotlighting (apply/remove markers) |
+| `test_prompt_guard.py` | ~15 | security/prompt_guard (init, chunking, classification) |
+| `test_codeshield.py` | ~10 | security/codeshield (init, scan parsing) |
+| `test_planner.py` | ~40 | planner/planner (plan creation, validation, refusals) |
+| `test_orchestrator.py` | ~50 | planner/orchestrator (context, steps, trust gates, chain-safe) |
+| `test_tools.py` | ~40 | tools/executor (file I/O, shell, Podman, flag deny-list) |
+| `test_provenance.py` | ~20 | security/provenance (trust inheritance, chains, file tracking) |
+| `test_approval.py` | ~15 | core/approval (lifecycle, TTL, submit) |
+| `test_conversation.py` | ~40 | security/conversation (all 8 rules, combined scoring, FP prevention) |
+| `test_pin_auth.py` | ~20 | api/auth (PIN validation, lockout, timing) |
 | `test_hardening.py` | ~30 | Cross-module hardening regression tests |
-| `test_input_validation.py` | ~15 | main.py Pydantic validators + pipeline length gate |
+| `test_input_validation.py` | ~15 | api/app Pydantic validators + pipeline length gate |
 | `test_hostile.py` | ~50 | Cross-module adversarial attack simulations |
-| `test_worker.py` | ~10 | worker (mocked Ollama connection/timeout) |
+| `test_worker.py` | ~10 | worker/ollama (mocked Ollama connection/timeout) |
+| `test_db.py` | 17 | core/db (schema creation, tables, constraints, FTS5) |
+| `test_bus.py` | 19 | core/bus (subscribe, unsubscribe, publish, wildcards) |
 | `conftest.py` | — | Fixtures: engine, cred_scanner, path_scanner, cmd_scanner, encoding_scanner |
 
-**Total: 562 tests passing** (1 known failure: `test_system_prompt_includes_tool_descriptions` in test_planner.py:181)
+**Total: 598 tests passing** (`pytest tests/` from project root)
 
 ---
 
-## Frontend (`gateway/static/`)
+## Frontend (`ui/`)
 
 | File | Lines | Purpose |
 |------|-------|---------|
@@ -124,6 +174,8 @@ Developer reference for navigating the Sentinel codebase. Module responsibilitie
 
 **Key JS functions:** `submitTask()`, `submitApproval()`, `checkStatus()`, `buildStepsHtml()`, `bindStepToggles()`
 
+> Note: `gateway/static/` still contains the originals used by the running nginx container. `ui/` is the canonical location going forward.
+
 ---
 
 ## Infrastructure
@@ -132,56 +184,59 @@ Developer reference for navigating the Sentinel codebase. Module responsibilitie
 |------|---------|
 | `podman-compose.yaml` | 3 services, 2 networks, 2 secrets, 2 volumes |
 | `policies/sentinel-policy.yaml` | ~130 lines — file access, commands, network, credential patterns, sensitive paths |
-| `controller/Dockerfile` | Multi-stage: Python 3.12 (pinned) + Prompt Guard download + semgrep workaround |
-| `gateway/Dockerfile` | Nginx (pinned) + self-signed TLS cert |
+| `container/Containerfile` | New: Python 3.12 (pinned) + Prompt Guard + semgrep, uses `sentinel/` package layout |
+| `controller/Dockerfile` | Legacy: used by currently running containers (to be replaced) |
+| `gateway/Dockerfile` | Nginx (pinned) + self-signed TLS cert (to be eliminated in Phase 1) |
+| `pyproject.toml` | Package metadata, dependencies, pytest config |
 
 ---
 
 ## Cross-Module Data Flow
 
 ```
-User → main.py (validate, CSRF, size limit, Pydantic)
-     → orchestrator.handle_task()
-       → session.get_or_create()
-       → conversation.analyze() [8 rules]
-       → pipeline.scan_input() [Prompt Guard + 4 scanners]
-       → planner.create_plan() [Claude API]
-       → approval.request_plan_approval() [if full mode]
+User → api/app.py (validate, CSRF, size limit, Pydantic)
+     → planner/orchestrator.handle_task()
+       → session/store.get_or_create()
+       → security/conversation.analyze() [8 rules]
+       → security/pipeline.scan_input() [Prompt Guard + 4 scanners]
+       → planner/planner.create_plan() [Claude API]
+       → core/approval.request_plan_approval() [if full mode]
        → for each step:
            llm_task → orchestrator._execute_llm_task()
-                    → pipeline.process_with_qwen()
-                      → pipeline._check_prompt_ascii()
-                      → spotlighting.apply_datamarking()
-                      → worker.generate() → sentinel-qwen:11434
-                      → provenance.create_tagged_data() [UNTRUSTED]
-                      → codeshield.scan()
-                      → pipeline.scan_output()
-                      → scanner.VulnerabilityEchoScanner.scan()
-           tool_call → provenance.is_trust_safe_for_execution()
-                     → tools.execute() → policy_engine.check_*()
+                    → security/pipeline.process_with_qwen()
+                      → security/pipeline._check_prompt_ascii()
+                      → security/spotlighting.apply_datamarking()
+                      → worker/ollama.generate() → sentinel-qwen:11434
+                      → security/provenance.create_tagged_data() [UNTRUSTED]
+                      → security/codeshield.scan()
+                      → security/pipeline.scan_output()
+                      → security/scanner.VulnerabilityEchoScanner.scan()
+           tool_call → security/provenance.is_trust_safe_for_execution()
+                     → tools/executor.execute() → security/policy_engine.check_*()
      → TaskResult returned
 ```
 
 ## Module Dependency Graph
 
 ```
-main.py
-  ├── auth.py (middleware)
-  ├── config.py (settings)
-  ├── orchestrator.py
-  │     ├── planner.py → Claude API
-  │     ├── pipeline.py
-  │     │     ├── scanner.py (5 scanners)
-  │     │     ├── prompt_guard.py → HuggingFace model
-  │     │     ├── spotlighting.py
-  │     │     └── worker.py → Ollama/Qwen
-  │     ├── tools.py
-  │     │     ├── policy_engine.py → sentinel-policy.yaml
-  │     │     └── provenance.py
-  │     ├── approval.py
-  │     ├── session.py
-  │     ├── conversation.py
-  │     └── codeshield.py → semgrep
-  ├── models.py (shared data types)
-  └── audit.py (logging)
+sentinel/api/app.py
+  ├── api/auth.py (middleware)
+  ├── core/config.py (settings)
+  ├── core/models.py (shared data types)
+  ├── audit/logger.py (logging)
+  ├── planner/orchestrator.py
+  │     ├── planner/planner.py → Claude API
+  │     ├── security/pipeline.py
+  │     │     ├── security/scanner.py (5 scanners)
+  │     │     ├── security/prompt_guard.py → HuggingFace model
+  │     │     ├── security/spotlighting.py
+  │     │     └── worker/ollama.py → Ollama/Qwen
+  │     ├── tools/executor.py
+  │     │     ├── security/policy_engine.py → sentinel-policy.yaml
+  │     │     └── security/provenance.py
+  │     ├── core/approval.py
+  │     ├── session/store.py
+  │     ├── security/conversation.py
+  │     └── security/codeshield.py → semgrep
+  └── core/bus.py (event bus — not yet wired)
 ```

@@ -8,21 +8,25 @@ Sentinel's evolution from a security gateway to a full AI assistant platform.
 - Air-gapped worker LLM with zero trust
 - WebUI chat interface with human approval flow
 - PIN authentication + CSRF protection
-- 435 unit tests, v3 stress test benchmarked (1,136 prompts, 0.12% real risk)
+- 598 unit tests, v3 stress test benchmarked (1,136 prompts, 0.12% real risk)
 - Trust level 0 operational (text generation only)
+- Proper `sentinel/` Python package with domain-driven sub-packages
+- SQLite schema ready for persistent state (Phase 1 migration)
+- Rust WASM sidecar skeleton (Phase 4 implementation)
+- Async event bus for internal pub/sub
 
 ## Planned Evolution
 
 The evolution plan consolidates Sentinel from three containers to two, adds assistant features (memory, channels, tools), and prepares for open-source release. See [docs/design/evolution-plan.md](design/evolution-plan.md) for the full implementation plan.
 
-### Phase 0: Foundation
+### Phase 0: Foundation — COMPLETE
 
 Project restructuring and infrastructure preparation. No running container changes.
 
-- Restructure `controller/app/` from flat modules to domain-driven packages
-- SQLite + sqlite-vec database schema (replacing in-memory stores)
-- Rust WASM sidecar skeleton (tool sandbox)
-- Internal asyncio pub/sub (replacing MQTT dependency)
+- ~~Restructure `controller/app/` to `sentinel/` domain-driven packages~~ Done
+- ~~SQLite + sqlite-vec database schema~~ Done (`sentinel/core/db.py`)
+- ~~Rust WASM sidecar skeleton~~ Done (`sidecar/`)
+- ~~Internal asyncio event bus~~ Done (`sentinel/core/bus.py`)
 
 ### Phase 1: Container Consolidation
 

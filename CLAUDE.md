@@ -6,9 +6,9 @@ At the start of every conversation, read `docs/design/evolution-tracker.md` and 
 ## What This Is
 A defence-in-depth AI assistant built on the CaMeL architecture. Claude API (Planner) plans tasks, an air-gapped Qwen 3 14B (Worker) executes them, and a Python/FastAPI Controller enforces 10 layers of security scanning between every step. The worker LLM is assumed compromised at all times.
 
-Phases 1-5 are complete: full pipeline operational, 562 unit tests, v3 stress test benchmarked (1,136 prompts, 0.12% real risk rate), infrastructure hardened. The project is being prepared for open-source release on GitHub (Apache-2.0).
+Phases 1-5 complete, Phase 0 (foundation restructure) complete: proper `sentinel/` Python package, 598 unit tests, v3 stress test benchmarked (1,136 prompts, 0.12% real risk rate), SQLite schema, Rust sidecar skeleton, async event bus. Preparing for open-source release on GitHub (Apache-2.0).
 
-**Next:** Code restructuring (Phase 0 of evolution plan) → memory system → multi-channel access → WASM tool sandbox. See `docs/roadmap.md` and `docs/design/evolution-plan.md`.
+**Next:** Phase 1 — Infrastructure Consolidation (nginx elimination, SQLite migration, trust router). See `docs/roadmap.md` and `docs/design/evolution-plan.md`.
 
 ## Tech Stack
 - Python 3.12 / FastAPI (Controller)
@@ -33,7 +33,8 @@ Phases 1-5 are complete: full pipeline operational, 562 unit tests, v3 stress te
 - GPU is shared — Ollama load/unload handles VRAM contention
 
 ## Testing
-- `podman exec sentinel-controller pytest /app/tests/` — 562 tests
+- Local: `.venv/bin/pytest tests/` — 598 tests
+- Container (legacy layout): `podman exec sentinel-controller pytest /app/tests/`
 - Stress test: `python3 scripts/analyse_v3_results.py` (reads `benchmarks/v3-results.jsonl`)
 
 ## Documentation
@@ -51,7 +52,9 @@ Phases 1-5 are complete: full pipeline operational, 562 unit tests, v3 stress te
 
 ## Key Files
 - `policies/sentinel-policy.yaml` — all security rules (deterministic layer)
-- `controller/app/orchestrator.py` — CaMeL execution loop
-- `controller/app/planner.py` — Claude planner system prompt
-- `controller/app/pipeline.py` — security scan pipeline
+- `sentinel/planner/orchestrator.py` — CaMeL execution loop
+- `sentinel/planner/planner.py` — Claude planner system prompt
+- `sentinel/security/pipeline.py` — security scan pipeline
+- `sentinel/core/db.py` — SQLite database schema
+- `sentinel/core/bus.py` — async event bus
 - `scripts/analyse_v3_results.py` — benchmark analysis

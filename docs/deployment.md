@@ -186,8 +186,8 @@ curl -X POST http://localhost:8000/scan \
 # In-container (recommended)
 podman exec sentinel-controller pytest /app/tests/ -v
 
-# Local (requires Python 3.12 + venv)
-PYTHONPATH=controller .venv/bin/python -m pytest controller/tests/ -v
+# Local (requires Python 3.12 + venv with `pip install -e ".[dev]"`)
+.venv/bin/pytest tests/ -v
 ```
 
 ## Stress Testing
