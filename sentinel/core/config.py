@@ -17,7 +17,19 @@ class Settings(BaseSettings):
     # Approval
     approval_mode: str = "full"  # full | smart | auto
 
-    # Qwen worker (Phase 2)
+    # Database
+    db_path: str = "/data/sentinel.db"
+
+    # Static files + TLS
+    static_dir: str = "/app/ui"
+    tls_cert_file: str = ""  # empty = no TLS (plain HTTP)
+    tls_key_file: str = ""
+    https_port: int = 8443
+    http_port: int = 8080
+    redirect_enabled: bool = True  # HTTP→HTTPS redirect
+    external_https_port: int = 3001  # external-facing port for redirect Location header
+
+    # Qwen worker — model is user-configurable (any Ollama-served model)
     ollama_url: str = "http://sentinel-qwen:11434"
     ollama_model: str = "qwen3:14b"
     ollama_timeout: int = 120
@@ -39,13 +51,6 @@ class Settings(BaseSettings):
 
     # Approval (Phase 3)
     approval_timeout: int = 300
-
-    # MQTT (Phase 3)
-    mqtt_broker: str = "host.containers.internal"
-    mqtt_port: int = 1883
-    mqtt_topic_in: str = "sentinel/tasks"
-    mqtt_topic_out: str = "sentinel/results"
-    mqtt_topic_approval: str = "sentinel/approval"
 
     # PIN authentication
     pin_required: bool = True

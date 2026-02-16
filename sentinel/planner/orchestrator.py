@@ -377,22 +377,23 @@ class Orchestrator:
             return TaskResult(status="denied", reason="Plan was denied")
 
         pending = self._approval_manager.get_pending(approval_id)
-        if pending is None or pending.plan is None:
+        if pending is None or pending.get("plan") is None:
             return TaskResult(status="error", reason="Plan not found for approval")
 
-        plan = pending.plan
+        plan = pending["plan"]
         result = await self._execute_plan(
-            plan, user_input=pending.user_request or None,
+            plan, user_input=pending.get("user_request") or None,
         )
 
         # Record the turn in the session so conversation history builds up.
         # In full approval mode, handle_task returns before execution, so
         # we must record the turn here after the plan completes.
-        if pending.source_key and self._session_store is not None:
-            session = self._session_store.get(pending.source_key)
+        source_key = pending.get("source_key", "")
+        if source_key and self._session_store is not None:
+            session = self._session_store.get(source_key)
             if session is not None:
                 turn = ConversationTurn(
-                    request_text=pending.user_request,
+                    request_text=pending.get("user_request", ""),
                     result_status=result.status,
                     plan_summary=plan.plan_summary,
                 )

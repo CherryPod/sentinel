@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from sentinel.core.approval import ApprovalManager, ApprovalResult
+from sentinel.core.db import init_db
 from sentinel.core.models import DataSource, Plan, PlanStep, TrustLevel
 from sentinel.planner.orchestrator import Orchestrator
 from sentinel.security.pipeline import ScanPipeline
@@ -16,6 +17,14 @@ def _reset_provenance():
     reset_store()
     yield
     reset_store()
+
+
+@pytest.fixture
+def db():
+    """In-memory SQLite database for testing."""
+    conn = init_db(":memory:")
+    yield conn
+    conn.close()
 
 
 def _make_plan(summary: str = "Test plan") -> Plan:
@@ -35,16 +44,16 @@ def _make_plan(summary: str = "Test plan") -> Plan:
 
 class TestApprovalManager:
     @pytest.mark.asyncio
-    async def test_create_returns_id(self):
-        mgr = ApprovalManager(timeout=300)
+    async def test_create_returns_id(self, db):
+        mgr = ApprovalManager(db=db, timeout=300)
         plan = _make_plan()
         approval_id = await mgr.request_plan_approval(plan)
         assert isinstance(approval_id, str)
         assert len(approval_id) > 0
 
     @pytest.mark.asyncio
-    async def test_check_pending(self):
-        mgr = ApprovalManager(timeout=300)
+    async def test_check_pending(self, db):
+        mgr = ApprovalManager(db=db, timeout=300)
         plan = _make_plan("My plan")
         approval_id = await mgr.request_plan_approval(plan)
 
@@ -53,8 +62,8 @@ class TestApprovalManager:
         assert status["plan_summary"] == "My plan"
 
     @pytest.mark.asyncio
-    async def test_submit_approval_granted(self):
-        mgr = ApprovalManager(timeout=300)
+    async def test_submit_approval_granted(self, db):
+        mgr = ApprovalManager(db=db, timeout=300)
         plan = _make_plan()
         approval_id = await mgr.request_plan_approval(plan)
 
@@ -66,8 +75,8 @@ class TestApprovalManager:
         assert status["reason"] == "Looks good"
 
     @pytest.mark.asyncio
-    async def test_submit_denial(self):
-        mgr = ApprovalManager(timeout=300)
+    async def test_submit_denial(self, db):
+        mgr = ApprovalManager(db=db, timeout=300)
         plan = _make_plan()
         approval_id = await mgr.request_plan_approval(plan)
 
@@ -79,8 +88,8 @@ class TestApprovalManager:
         assert status["reason"] == "Too risky"
 
     @pytest.mark.asyncio
-    async def test_expired_approval(self):
-        mgr = ApprovalManager(timeout=0)  # immediate expiry
+    async def test_expired_approval(self, db):
+        mgr = ApprovalManager(db=db, timeout=0)  # immediate expiry
         plan = _make_plan()
         approval_id = await mgr.request_plan_approval(plan)
 
@@ -91,8 +100,8 @@ class TestApprovalManager:
         assert status["status"] == "expired"
 
     @pytest.mark.asyncio
-    async def test_duplicate_submission_ignored(self):
-        mgr = ApprovalManager(timeout=300)
+    async def test_duplicate_submission_ignored(self, db):
+        mgr = ApprovalManager(db=db, timeout=300)
         plan = _make_plan()
         approval_id = await mgr.request_plan_approval(plan)
 
@@ -104,32 +113,59 @@ class TestApprovalManager:
         assert status["status"] == "approved"  # first decision stands
 
     @pytest.mark.asyncio
-    async def test_invalid_approval_id(self):
-        mgr = ApprovalManager(timeout=300)
+    async def test_invalid_approval_id(self, db):
+        mgr = ApprovalManager(db=db, timeout=300)
         status = mgr.check_approval("nonexistent-id")
         assert status["status"] == "not_found"
 
     @pytest.mark.asyncio
-    async def test_submit_invalid_id(self):
-        mgr = ApprovalManager(timeout=300)
+    async def test_submit_invalid_id(self, db):
+        mgr = ApprovalManager(db=db, timeout=300)
         accepted = mgr.submit_approval("nonexistent", granted=True)
         assert accepted is False
 
     @pytest.mark.asyncio
-    async def test_is_approved_pending(self):
-        mgr = ApprovalManager(timeout=300)
+    async def test_is_approved_pending(self, db):
+        mgr = ApprovalManager(db=db, timeout=300)
         plan = _make_plan()
         approval_id = await mgr.request_plan_approval(plan)
         assert mgr.is_approved(approval_id) is None  # still pending
 
     @pytest.mark.asyncio
-    async def test_get_plan(self):
-        mgr = ApprovalManager(timeout=300)
+    async def test_get_plan(self, db):
+        mgr = ApprovalManager(db=db, timeout=300)
         plan = _make_plan("Retrieve me")
         approval_id = await mgr.request_plan_approval(plan)
         retrieved = mgr.get_plan(approval_id)
         assert retrieved is not None
         assert retrieved.plan_summary == "Retrieve me"
+
+    @pytest.mark.asyncio
+    async def test_persistence_across_manager_instances(self, db):
+        """Data persists in SQLite even when creating a new ApprovalManager."""
+        mgr1 = ApprovalManager(db=db, timeout=300)
+        plan = _make_plan("Persistent")
+        approval_id = await mgr1.request_plan_approval(plan)
+
+        # Create a new manager pointing to the same db
+        mgr2 = ApprovalManager(db=db, timeout=300)
+        status = mgr2.check_approval(approval_id)
+        assert status["status"] == "pending"
+        assert status["plan_summary"] == "Persistent"
+
+    @pytest.mark.asyncio
+    async def test_get_pending_returns_metadata(self, db):
+        """get_pending returns plan, source_key, and user_request."""
+        mgr = ApprovalManager(db=db, timeout=300)
+        plan = _make_plan("With metadata")
+        approval_id = await mgr.request_plan_approval(
+            plan, source_key="api:127.0.0.1", user_request="Build something"
+        )
+        pending = mgr.get_pending(approval_id)
+        assert pending is not None
+        assert pending["plan"].plan_summary == "With metadata"
+        assert pending["source_key"] == "api:127.0.0.1"
+        assert pending["user_request"] == "Build something"
 
 
 class TestApprovalWithOrchestrator:
@@ -143,7 +179,7 @@ class TestApprovalWithOrchestrator:
         settings.require_codeshield = original
 
     @pytest.mark.asyncio
-    async def test_full_approval_flow(self):
+    async def test_full_approval_flow(self, db):
         """Task → awaiting_approval → approve → execution proceeds."""
         mock_planner = MagicMock(spec=ClaudePlanner)
         mock_planner.create_plan = AsyncMock(return_value=_make_plan("Full flow"))
@@ -159,7 +195,7 @@ class TestApprovalWithOrchestrator:
         )
         mock_pipeline.process_with_qwen = AsyncMock(return_value=tagged)
 
-        approval_mgr = ApprovalManager(timeout=300)
+        approval_mgr = ApprovalManager(db=db, timeout=300)
         orch = Orchestrator(
             planner=mock_planner,
             pipeline=mock_pipeline,
@@ -184,7 +220,7 @@ class TestApprovalWithOrchestrator:
         assert len(exec_result.step_results) == 1
 
     @pytest.mark.asyncio
-    async def test_denied_plan_not_executed(self):
+    async def test_denied_plan_not_executed(self, db):
         """Denied plan returns denied status."""
         mock_planner = MagicMock(spec=ClaudePlanner)
         mock_planner.create_plan = AsyncMock(return_value=_make_plan())
@@ -193,7 +229,7 @@ class TestApprovalWithOrchestrator:
         from sentinel.security.pipeline import PipelineScanResult
         mock_pipeline.scan_input.return_value = PipelineScanResult()
 
-        approval_mgr = ApprovalManager(timeout=300)
+        approval_mgr = ApprovalManager(db=db, timeout=300)
         orch = Orchestrator(
             planner=mock_planner,
             pipeline=mock_pipeline,

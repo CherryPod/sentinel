@@ -1,5 +1,6 @@
+import json
 import logging
-import time
+import sqlite3
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -18,29 +19,20 @@ class ApprovalResult:
     timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
 
-@dataclass
-class PendingApproval:
-    approval_id: str
-    plan: Plan
-    created_at: float  # monotonic time for TTL
-    result: ApprovalResult | None = None
-    source_key: str = ""       # Session key for turn recording after approval
-    user_request: str = ""     # Original request text for turn recording + echo scanner
-
-
 class ApprovalManager:
-    """HTTP-based approval with in-memory pending queue and TTL."""
+    """SQLite-backed approval queue with configurable TTL."""
 
-    def __init__(self, timeout: int | None = None):
+    def __init__(self, db: sqlite3.Connection, timeout: int | None = None):
+        self._db = db
         self._timeout = timeout if timeout is not None else settings.approval_timeout
-        self._pending: dict[str, PendingApproval] = {}
 
     def _cleanup_expired(self) -> None:
-        """Remove entries older than the configured timeout."""
-        now = time.monotonic()
-        expired = [k for k, v in self._pending.items() if now - v.created_at > self._timeout]
-        for k in expired:
-            del self._pending[k]
+        """Mark entries as expired if past their expires_at time."""
+        self._db.execute(
+            "UPDATE approvals SET status = 'expired' "
+            "WHERE status = 'pending' AND expires_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now')"
+        )
+        self._db.commit()
 
     async def request_plan_approval(
         self, plan: Plan, source_key: str = "", user_request: str = "",
@@ -48,13 +40,18 @@ class ApprovalManager:
         """Create an approval request. Returns the approval_id."""
         self._cleanup_expired()
         approval_id = str(uuid.uuid4())
-        self._pending[approval_id] = PendingApproval(
-            approval_id=approval_id,
-            plan=plan,
-            created_at=time.monotonic(),
-            source_key=source_key,
-            user_request=user_request,
+        self._db.execute(
+            "INSERT INTO approvals (approval_id, plan_json, expires_at, source_key, user_request) "
+            "VALUES (?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?), ?, ?)",
+            (
+                approval_id,
+                plan.model_dump_json(),
+                f"+{self._timeout} seconds",
+                source_key,
+                user_request,
+            ),
         )
+        self._db.commit()
         logger.info(
             "Approval requested",
             extra={
@@ -70,33 +67,32 @@ class ApprovalManager:
 
         Returns dict with "status" key: "pending", "approved", "denied", "expired", or "not_found".
         """
-        entry = self._pending.get(approval_id)
-        if entry is None:
+        self._cleanup_expired()
+        row = self._db.execute(
+            "SELECT status, plan_json, decided_reason, decided_by FROM approvals WHERE approval_id = ?",
+            (approval_id,),
+        ).fetchone()
+        if row is None:
             logger.info(
                 "Approval not found",
                 extra={"event": "approval_not_found", "approval_id": approval_id},
             )
             return {"status": "not_found"}
 
-        # Check TTL
-        if time.monotonic() - entry.created_at > self._timeout:
-            entry.result = ApprovalResult(
-                granted=False, reason="Expired", approved_by="system",
-            )
-            elapsed = time.monotonic() - entry.created_at
+        status, plan_json, decided_reason, decided_by = row
+
+        if status == "expired":
             logger.warning(
                 "Approval expired",
-                extra={"event": "approval_expired", "approval_id": approval_id, "elapsed_s": round(elapsed, 1)},
+                extra={"event": "approval_expired", "approval_id": approval_id},
             )
-            return {
-                "status": "expired",
-                "reason": "Approval request expired",
-            }
+            return {"status": "expired", "reason": "Approval request expired"}
 
-        if entry.result is None:
+        if status == "pending":
+            plan = Plan.model_validate_json(plan_json)
             return {
                 "status": "pending",
-                "plan_summary": entry.plan.plan_summary,
+                "plan_summary": plan.plan_summary,
                 "steps": [
                     {
                         "id": s.id,
@@ -107,21 +103,19 @@ class ApprovalManager:
                         "args": s.args if s.args else None,
                         "expects_code": s.expects_code,
                     }
-                    for s in entry.plan.steps
+                    for s in plan.steps
                 ],
             }
 
-        if entry.result.granted:
+        if status == "approved":
             return {
                 "status": "approved",
-                "reason": entry.result.reason,
-                "approved_by": entry.result.approved_by,
+                "reason": decided_reason,
+                "approved_by": decided_by,
             }
-        else:
-            return {
-                "status": "denied",
-                "reason": entry.result.reason,
-            }
+
+        # status == "denied"
+        return {"status": "denied", "reason": decided_reason}
 
     def submit_approval(
         self,
@@ -131,35 +125,49 @@ class ApprovalManager:
         approved_by: str = "api",
     ) -> bool:
         """Submit an approval decision. Returns True if accepted, False if invalid/duplicate."""
-        entry = self._pending.get(approval_id)
-        if entry is None:
+        row = self._db.execute(
+            "SELECT status, expires_at FROM approvals WHERE approval_id = ?",
+            (approval_id,),
+        ).fetchone()
+        if row is None:
             logger.warning(
                 "Approval submit — not found",
                 extra={"event": "approval_submit_not_found", "approval_id": approval_id},
             )
             return False
 
-        # Check TTL
-        if time.monotonic() - entry.created_at > self._timeout:
+        status, expires_at = row
+
+        # Check if expired via SQL comparison
+        is_expired = self._db.execute(
+            "SELECT ? < strftime('%Y-%m-%dT%H:%M:%fZ', 'now')", (expires_at,)
+        ).fetchone()[0]
+        if is_expired:
+            self._db.execute(
+                "UPDATE approvals SET status = 'expired' WHERE approval_id = ?",
+                (approval_id,),
+            )
+            self._db.commit()
             logger.warning(
                 "Approval submit — expired",
                 extra={"event": "approval_submit_expired", "approval_id": approval_id},
             )
             return False
 
-        # Ignore duplicate submissions
-        if entry.result is not None:
+        if status != "pending":
             logger.warning(
                 "Approval submit — duplicate",
                 extra={"event": "approval_submit_duplicate", "approval_id": approval_id},
             )
             return False
 
-        entry.result = ApprovalResult(
-            granted=granted,
-            reason=reason,
-            approved_by=approved_by,
+        new_status = "approved" if granted else "denied"
+        self._db.execute(
+            "UPDATE approvals SET status = ?, decided_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), "
+            "decided_reason = ?, decided_by = ? WHERE approval_id = ?",
+            (new_status, reason, approved_by, approval_id),
         )
+        self._db.commit()
 
         logger.info(
             "Approval submitted",
@@ -174,18 +182,45 @@ class ApprovalManager:
 
     def get_plan(self, approval_id: str) -> Plan | None:
         """Get the plan associated with an approval ID."""
-        entry = self._pending.get(approval_id)
-        if entry is None:
+        row = self._db.execute(
+            "SELECT plan_json FROM approvals WHERE approval_id = ?",
+            (approval_id,),
+        ).fetchone()
+        if row is None:
             return None
-        return entry.plan
+        return Plan.model_validate_json(row[0])
 
     def is_approved(self, approval_id: str) -> bool | None:
         """Check if an approval was granted. Returns None if still pending/not found."""
-        entry = self._pending.get(approval_id)
-        if entry is None or entry.result is None:
+        self._cleanup_expired()
+        row = self._db.execute(
+            "SELECT status FROM approvals WHERE approval_id = ?",
+            (approval_id,),
+        ).fetchone()
+        if row is None:
             return None
-        return entry.result.granted
+        status = row[0]
+        if status == "approved":
+            return True
+        if status == "denied":
+            return False
+        return None  # pending or expired
 
-    def get_pending(self, approval_id: str) -> PendingApproval | None:
-        """Get the full PendingApproval entry (plan + metadata)."""
-        return self._pending.get(approval_id)
+    def get_pending(self, approval_id: str) -> dict | None:
+        """Get the full approval entry (plan + metadata).
+
+        Returns a dict with plan, source_key, user_request — or None if not found.
+        Replaces the old PendingApproval dataclass.
+        """
+        row = self._db.execute(
+            "SELECT plan_json, source_key, user_request FROM approvals WHERE approval_id = ?",
+            (approval_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        plan_json, source_key, user_request = row
+        return {
+            "plan": Plan.model_validate_json(plan_json),
+            "source_key": source_key,
+            "user_request": user_request,
+        }

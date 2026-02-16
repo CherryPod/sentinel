@@ -95,11 +95,15 @@ def _create_tables(conn: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS approvals (
             approval_id     TEXT PRIMARY KEY,
             user_id         TEXT NOT NULL DEFAULT 'default',
-            task_id         TEXT NOT NULL,
+            task_id         TEXT NOT NULL DEFAULT '',
             plan_json       TEXT NOT NULL,
             status          TEXT NOT NULL DEFAULT 'pending',
             decided_at      TEXT,
+            decided_reason  TEXT NOT NULL DEFAULT '',
+            decided_by      TEXT NOT NULL DEFAULT '',
             expires_at      TEXT NOT NULL,
+            source_key      TEXT NOT NULL DEFAULT '',
+            user_request    TEXT NOT NULL DEFAULT '',
             created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
         )
     """)

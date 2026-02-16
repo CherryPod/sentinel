@@ -1,18 +1,23 @@
+import asyncio
 import re
 import time
 import unicodedata
 from contextlib import asynccontextmanager
+from pathlib import Path
 
-from fastapi import FastAPI, Query, Request
+from fastapi import APIRouter, FastAPI, Query, Request
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, field_validator
 from slowapi import Limiter
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
-from starlette.middleware.base import BaseHTTPMiddleware
 
 from sentinel.core.approval import ApprovalManager
+from sentinel.core.db import init_db
 from .auth import PinAuthMiddleware
+from .middleware import CSRFMiddleware, RequestSizeLimitMiddleware, SecurityHeadersMiddleware
+from .redirect import HTTPSRedirectApp
 from sentinel.audit.logger import setup_audit_logger
 from sentinel.core.config import settings
 from sentinel.security.conversation import ConversationAnalyzer
@@ -22,46 +27,10 @@ from sentinel.security.pipeline import ScanPipeline, SecurityViolation
 from sentinel.planner.planner import ClaudePlanner, PlannerError
 from sentinel.security.policy_engine import PolicyEngine
 from sentinel.security import codeshield, prompt_guard
+from sentinel.security.provenance import ProvenanceStore, set_default_store
 from sentinel.security.scanner import CommandPatternScanner, CredentialScanner, SensitivePathScanner
 from sentinel.session.store import SessionStore
 from sentinel.tools.executor import ToolExecutor
-
-
-class CSRFMiddleware(BaseHTTPMiddleware):
-    """Validate Origin header on state-changing requests to prevent CSRF."""
-
-    def __init__(self, app, allowed_origins: list[str]):
-        super().__init__(app)
-        self._allowed = set(o.rstrip("/").lower() for o in allowed_origins)
-
-    async def dispatch(self, request: Request, call_next):
-        if request.method in ("POST", "PUT", "DELETE", "PATCH"):
-            origin = request.headers.get("origin", "")
-            if origin:
-                normalised = origin.rstrip("/").lower()
-                if normalised not in self._allowed:
-                    return JSONResponse(
-                        status_code=403,
-                        content={"status": "error", "reason": "CSRF: invalid origin"},
-                    )
-        return await call_next(request)
-
-
-class RequestSizeLimitMiddleware(BaseHTTPMiddleware):
-    """Reject requests with Content-Length exceeding the configured limit."""
-
-    def __init__(self, app, max_bytes: int):
-        super().__init__(app)
-        self._max_bytes = max_bytes
-
-    async def dispatch(self, request: Request, call_next):
-        content_length = request.headers.get("content-length")
-        if content_length and int(content_length) > self._max_bytes:
-            return JSONResponse(
-                status_code=413,
-                content={"status": "error", "reason": "Request too large"},
-            )
-        return await call_next(request)
 
 # Rate limiter — per-IP, in-memory storage
 limiter = Limiter(key_func=get_remote_address)
@@ -111,6 +80,16 @@ async def lifespan(app: FastAPI):
         log_level=settings.log_level,
     )
     _audit.info("Starting sentinel-controller", extra={"event": "startup"})
+
+    # Initialize SQLite database
+    db_conn = init_db(settings.db_path)
+    _audit.info(
+        "Database initialized",
+        extra={"event": "db_init", "db_path": settings.db_path},
+    )
+
+    # Switch provenance to SQLite-backed store
+    set_default_store(ProvenanceStore(db=db_conn))
 
     # Load PIN for authentication
     if settings.pin_required:
@@ -175,7 +154,7 @@ async def lifespan(app: FastAPI):
 
     # Initialize session store + conversation analyzer (Phase 5)
     global _session_store
-    _session_store = SessionStore()
+    _session_store = SessionStore(db=db_conn)
     conversation_analyzer = ConversationAnalyzer()
     _audit.info(
         "Conversation tracking initialized",
@@ -190,7 +169,7 @@ async def lifespan(app: FastAPI):
     global _orchestrator, _planner_available
     try:
         planner = ClaudePlanner()
-        approval_mgr = ApprovalManager()
+        approval_mgr = ApprovalManager(db=db_conn)
         tool_executor = ToolExecutor(policy_engine=_engine)
         _orchestrator = Orchestrator(
             planner=planner,
@@ -213,7 +192,42 @@ async def lifespan(app: FastAPI):
         )
         _planner_available = False
 
+    # Start HTTP→HTTPS redirect server (only when TLS is active)
+    redirect_server = None
+    if settings.redirect_enabled and settings.tls_cert_file:
+        try:
+            import uvicorn
+            redirect_config = uvicorn.Config(
+                app=HTTPSRedirectApp(),
+                host=settings.host,
+                port=settings.http_port,
+                log_level="warning",
+            )
+            redirect_server = uvicorn.Server(redirect_config)
+            asyncio.create_task(redirect_server.serve())
+            _audit.info(
+                "HTTP redirect server started",
+                extra={
+                    "event": "redirect_started",
+                    "http_port": settings.http_port,
+                    "https_port": settings.external_https_port,
+                },
+            )
+        except Exception as exc:
+            _audit.warning(
+                "Failed to start redirect server: %s",
+                exc,
+                extra={"event": "redirect_failed", "error": str(exc)},
+            )
+
     yield
+
+    # Shutdown redirect server if running
+    if redirect_server is not None:
+        redirect_server.should_exit = True
+
+    # Close database connection
+    db_conn.close()
 
     _audit.info("Shutting down sentinel-controller", extra={"event": "shutdown"})
 
@@ -221,13 +235,15 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Sentinel Controller", lifespan=lifespan)
 app.state.limiter = limiter
 
-# Middleware stack (outermost first): size limit → CSRF → PIN auth
+# Middleware stack (outermost first): SecurityHeaders → RequestSizeLimit → CSRF → PinAuth
+# Starlette adds middleware as a stack: last added = outermost = runs first.
 app.add_middleware(PinAuthMiddleware, pin_getter=lambda: _pin)
 app.add_middleware(
     CSRFMiddleware,
     allowed_origins=[o.strip() for o in settings.allowed_origins.split(",") if o.strip()],
 )
 app.add_middleware(RequestSizeLimitMiddleware, max_bytes=settings.max_request_bytes)
+app.add_middleware(SecurityHeadersMiddleware)
 
 
 @app.exception_handler(RateLimitExceeded)
@@ -273,6 +289,8 @@ async def global_exception_handler(request: Request, exc: Exception):
     )
 
 
+# ── Root health endpoint (container probes, always outside /api/) ──
+
 @app.get("/health")
 async def health():
     return {
@@ -286,7 +304,26 @@ async def health():
     }
 
 
-@app.get("/validate/path")
+# ── API router (all client-facing endpoints under /api/) ──────────
+
+api_router = APIRouter(prefix="/api")
+
+
+@api_router.get("/health")
+async def api_health():
+    """Client-facing health check at /api/health."""
+    return {
+        "status": "ok",
+        "policy_loaded": _engine is not None,
+        "prompt_guard_loaded": _prompt_guard_loaded,
+        "codeshield_loaded": _codeshield_loaded,
+        "planner_available": _planner_available,
+        "conversation_tracking": settings.conversation_enabled,
+        "pin_auth_enabled": _pin is not None,
+    }
+
+
+@api_router.get("/validate/path")
 async def validate_path(
     path: str = Query(..., description="File path to validate"),
     operation: str = Query("read", description="'read' or 'write'"),
@@ -317,7 +354,7 @@ async def validate_path(
     return result
 
 
-@app.get("/validate/command")
+@api_router.get("/validate/command")
 async def validate_command(
     command: str = Query(..., description="Shell command to validate"),
 ) -> ValidationResult:
@@ -376,7 +413,7 @@ class ProcessRequest(BaseModel):
         return v
 
 
-@app.post("/scan")
+@api_router.post("/scan")
 async def scan_text(req: ScanRequest):
     """Run full scan pipeline on text (Prompt Guard + credential + path)."""
     if _pipeline is None:
@@ -395,7 +432,7 @@ async def scan_text(req: ScanRequest):
     }
 
 
-@app.post("/process")
+@api_router.post("/process")
 async def process_text(req: ProcessRequest):
     """Send text through the full Qwen pipeline (scan → spotlight → Qwen → scan)."""
     if _pipeline is None:
@@ -447,7 +484,7 @@ class TaskRequest(BaseModel):
         return _normalize_text(v, min_length=MIN_TASK_REQUEST_LENGTH, field_name="Request")
 
 
-@app.post("/task")
+@api_router.post("/task")
 @limiter.limit("10/minute")
 async def handle_task(req: TaskRequest, request: Request):
     """Full CaMeL pipeline: user request → Claude plans → Qwen executes → scanned result."""
@@ -468,7 +505,7 @@ async def handle_task(req: TaskRequest, request: Request):
     return result.model_dump()
 
 
-@app.get("/approval/{approval_id}")
+@api_router.get("/approval/{approval_id}")
 async def check_approval(approval_id: str):
     """Check the status of an approval request."""
     if _orchestrator is None or _orchestrator._approval_manager is None:
@@ -489,7 +526,7 @@ class ApprovalDecision(BaseModel):
         return v
 
 
-@app.post("/approve/{approval_id}")
+@api_router.post("/approve/{approval_id}")
 async def submit_approval(approval_id: str, decision: ApprovalDecision):
     """Submit an approval decision, then execute the plan if approved."""
     if _orchestrator is None or _orchestrator._approval_manager is None:
@@ -513,7 +550,7 @@ async def submit_approval(approval_id: str, decision: ApprovalDecision):
 # ── Session debug endpoint ─────────────────────────────────────
 
 
-@app.get("/session/{session_id}")
+@api_router.get("/session/{session_id}")
 async def get_session(session_id: str):
     """Debug endpoint: view session state and conversation history."""
     if _session_store is None:
@@ -540,3 +577,13 @@ async def get_session(session_id: str):
             for t in session.turns
         ],
     }
+
+
+# Include API router before static file mount — API routes take priority
+app.include_router(api_router)
+
+# Serve static files (UI) at / — catch-all after API routes.
+# html=True provides SPA fallback (unmatched paths serve index.html).
+# Guarded so tests without a ui/ directory don't crash.
+if Path(settings.static_dir).is_dir():
+    app.mount("/", StaticFiles(directory=settings.static_dir, html=True), name="static")

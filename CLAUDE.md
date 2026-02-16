@@ -6,23 +6,28 @@ At the start of every conversation, read `docs/design/evolution-tracker.md` and 
 ## What This Is
 A defence-in-depth AI assistant built on the CaMeL architecture. Claude API (Planner) plans tasks, an air-gapped Qwen 3 14B (Worker) executes them, and a Python/FastAPI Controller enforces 10 layers of security scanning between every step. The worker LLM is assumed compromised at all times.
 
-Phases 1-5 complete, Phase 0 (foundation restructure) complete: proper `sentinel/` Python package, 598 unit tests, v3 stress test benchmarked (1,136 prompts, 0.12% real risk rate), SQLite schema, Rust sidecar skeleton, async event bus. Preparing for open-source release on GitHub (Apache-2.0).
+Phase 0 (foundation) and Phase 1 (infrastructure consolidation) complete: proper `sentinel/` Python package, 662 unit tests, v3 stress test benchmarked (1,136 prompts, 0.12% real risk rate), SQLite-backed stores (sessions, provenance, approvals), security headers middleware, 2-container deployment (nginx eliminated), trust router skeleton. Preparing for open-source release on GitHub (Apache-2.0).
 
-**Next:** Phase 1 — Infrastructure Consolidation (nginx elimination, SQLite migration, trust router). See `docs/roadmap.md` and `docs/design/evolution-plan.md`.
+**Next:** Phase 2 — Persistent Memory (embedding pipeline, chunk management, RRF hybrid search). See `docs/roadmap.md` and `docs/design/evolution-plan.md`.
 
 ## Tech Stack
 - Python 3.12 / FastAPI (Controller)
 - Podman (all containers, rootless, user kifterz)
 - Ollama (Qwen 3 14B Q4_K_M, GPU-shared RTX 3060 12GB)
 
-## Container Names
-- `sentinel-controller` — security gateway + orchestrator
+## Container Names (Phase 1 — not yet deployed)
+- `sentinel-v2` — controller + UI + TLS (ports 3003/3004)
+- `sentinel-ollama-v2` — air-gapped local LLM (sentinel_internal_v2 network ONLY)
+- Compose: `podman-compose.phase1.yaml`
+
+## Container Names (Legacy — still running)
+- `sentinel-controller` — security gateway + orchestrator (port 8000)
 - `sentinel-qwen` — air-gapped local LLM (sentinel_internal network ONLY)
-- `sentinel-ui` — WebUI frontend (nginx, HTTPS)
+- `sentinel-ui` — WebUI frontend (nginx, HTTPS, ports 3001/3002)
 
 ## Networks
-- `sentinel_internal` — air-gapped, internal: true, no external routing
-- `sentinel_egress` — internet access for Claude API
+- `sentinel_internal` / `sentinel_internal_v2` — air-gapped, internal: true, no external routing
+- `sentinel_egress` / `sentinel_egress_v2` — internet access for Claude API
 
 ## Critical Safety Rules
 - NEVER give sentinel-qwen internet access — the air gap is a core security layer
@@ -33,7 +38,7 @@ Phases 1-5 complete, Phase 0 (foundation restructure) complete: proper `sentinel
 - GPU is shared — Ollama load/unload handles VRAM contention
 
 ## Testing
-- Local: `.venv/bin/pytest tests/` — 598 tests
+- Local: `.venv/bin/pytest tests/` — 662 tests
 - Container (legacy layout): `podman exec sentinel-controller pytest /app/tests/`
 - Stress test: `python3 scripts/analyse_v3_results.py` (reads `benchmarks/v3-results.jsonl`)
 

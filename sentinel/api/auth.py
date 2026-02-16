@@ -77,8 +77,8 @@ class PinAuthMiddleware(BaseHTTPMiddleware):
         if pin is None:
             return await call_next(request)
 
-        # /health is always exempt
-        if request.url.path == "/health":
+        # Health endpoints are always exempt (root for container probes, /api for clients)
+        if request.url.path in ("/health", "/api/health"):
             return await call_next(request)
 
         # Check lockout before doing any comparison

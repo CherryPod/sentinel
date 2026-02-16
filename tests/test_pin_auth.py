@@ -15,6 +15,10 @@ def _make_app(pin_getter):
     async def health():
         return {"status": "ok"}
 
+    @app.get("/api/health")
+    async def api_health():
+        return {"status": "ok"}
+
     @app.get("/protected")
     async def protected():
         return {"data": "secret"}
@@ -36,6 +40,11 @@ class TestPinAuthEnabled:
 
     def test_health_exempt(self, client):
         resp = client.get("/health")
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "ok"
+
+    def test_api_health_exempt(self, client):
+        resp = client.get("/api/health")
         assert resp.status_code == 200
         assert resp.json()["status"] == "ok"
 

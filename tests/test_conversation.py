@@ -79,13 +79,13 @@ class TestSessionStore:
         assert store.count == 1
 
     def test_ttl_eviction(self, store):
-        store.get_or_create("s1")
+        session = store.get_or_create("s1")
         assert store.count == 1
 
-        # Simulate time passing beyond TTL
-        with patch("sentinel.session.store.time.monotonic", return_value=time.monotonic() + 20):
-            result = store.get("s1")
-            assert result is None
+        # Simulate time passing beyond TTL by backdating last_active
+        session.last_active = "2020-01-01T00:00:00.000000Z"
+        result = store.get("s1")
+        assert result is None
 
     def test_max_capacity_evicts_oldest(self, store):
         for i in range(5):
