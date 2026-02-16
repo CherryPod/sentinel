@@ -12,6 +12,7 @@ Developer reference for navigating the Sentinel codebase. Module responsibilitie
 sentinel/              # Main Python package
 ├── api/               # FastAPI app, auth middleware
 ├── audit/             # Structured logging
+├── channels/          # Multi-channel access (WebSocket, SSE, Signal, MCP)
 ├── core/              # Config, models, approval, database, event bus
 ├── memory/            # Persistent memory (embeddings, chunks, hybrid search)
 ├── planner/           # Claude planner + CaMeL orchestrator
@@ -35,7 +36,7 @@ container/             # Containerfile for builds
 
 | Module | Lines | Purpose |
 |--------|-------|---------|
-| `api/app.py` | ~280 | FastAPI app, `/api/` router, lifespan (SQLite init), static file mount, Pydantic request models |
+| `api/app.py` | ~900 | FastAPI app, `/api/` router, `/ws` WebSocket, `/api/events` SSE, `/mcp/` MCP mount, lifespan, Pydantic models |
 | `api/auth.py` | ~131 | PIN authentication ASGI middleware, per-IP lockout (5 failures / 60s), exempts `/health` + `/api/health` |
 | `api/middleware.py` | ~70 | SecurityHeadersMiddleware (6 headers), CSRFMiddleware, RequestSizeLimitMiddleware |
 | `api/redirect.py` | ~35 | HTTPSRedirectApp — minimal ASGI app for HTTP→HTTPS 301 redirect |
@@ -64,6 +65,24 @@ container/             # Containerfile for builds
 - `chunks.MemoryChunk` — dataclass: chunk_id, user_id, content, source, metadata, timestamps
 - `embeddings.EmbeddingClient` — async embed()/embed_batch(), shares OllamaWorker error hierarchy
 - `search.SearchResult` — dataclass: chunk_id, content, source, score, match_type
+
+### Multi-Channel Access (`sentinel/channels/`)
+
+| Module | Lines | Purpose |
+|--------|-------|---------|
+| `channels/base.py` | ~120 | Channel ABC (start, stop, send, receive), IncomingMessage, OutgoingMessage, ChannelRouter |
+| `channels/web.py` | ~170 | WebSocketChannel (PIN auth, JSON protocol), SSEWriter (event bus → SSE stream) |
+| `channels/mcp_server.py` | ~130 | FastMCP server: search_memory, store_memory, run_task, health_check tools |
+| `channels/signal_channel.py` | ~200 | SignalChannel (signal-cli JSON-RPC subprocess), ExponentialBackoff, SignalConfig |
+
+**Key classes:**
+- `base.Channel` — ABC all transport backends implement
+- `base.ChannelRouter` — routes messages to orchestrator, manages bus subscriptions
+- `web.WebSocketChannel` — PIN auth + JSON protocol over WebSocket
+- `web.SSEWriter` — event bus → SSE stream with keepalive and auto-cleanup
+- `mcp_server.create_mcp_server()` — factory for FastMCP with Sentinel tools
+- `signal_channel.SignalChannel` — signal-cli subprocess with crash recovery
+- `signal_channel.ExponentialBackoff` — 1s, 2s, 4s, ... up to max_delay
 
 ### Security Pipeline (`sentinel/security/`)
 
@@ -180,9 +199,14 @@ Skeleton for Phase 4 WASM tool sandbox. Compiles and accepts JSON over Unix sock
 | `test_memory_store.py` | 24 | memory/chunks (CRUD, FTS5 sync, vec, dual-mode, user isolation) |
 | `test_memory_search.py` | 15 | memory/search (FTS5, RRF fusion, vec fallback, ranking) |
 | `test_memory_api.py` | 13 | memory API endpoints (store, search, get, delete, validation) |
+| `test_channels.py` | 19 | Channel ABC, ChannelRouter, event bus wiring in orchestrator |
+| `test_websocket.py` | 12 | WebSocket auth, send, receive, endpoint integration |
+| `test_sse.py` | 10 | SSEWriter stream, event delivery, endpoint tests |
+| `test_mcp.py` | 16 | MCP tools, trust tiers, search/store/run_task/health |
+| `test_signal_channel.py` | 17 | Signal subprocess, backoff, JSON-RPC protocol, crash recovery |
 | `conftest.py` | — | Fixtures: engine, cred_scanner, path_scanner, cmd_scanner, encoding_scanner |
 
-**Total: 752 tests passing** (`pytest tests/` from project root)
+**Total: 826 tests passing** (`pytest tests/` from project root)
 
 ---
 
@@ -221,8 +245,8 @@ User → HTTPS (uvicorn TLS) or HTTP (redirect.HTTPSRedirectApp → 301)
      → api/middleware.SecurityHeadersMiddleware [6 headers]
      → api/middleware.RequestSizeLimitMiddleware [1MB gate]
      → api/middleware.CSRFMiddleware [origin check]
-     → api/auth.PinAuthMiddleware [PIN + lockout]
-     → api/app.py api_router (/api/* endpoints, Pydantic validation)
+     → api/auth.PinAuthMiddleware [PIN + lockout; exempts /ws, /mcp]
+     → Transport: /api/* (REST) | /ws (WebSocket) | /api/events (SSE) | /mcp/* (MCP)
        → planner/orchestrator.handle_task()
          → session/store.get_or_create() [SQLite write-through]
          → security/conversation.analyze() [8 rules]
@@ -276,5 +300,9 @@ sentinel/api/app.py [lifespan: init_db → SessionStore, ApprovalManager, Proven
   │     ├── session/store.py [SQLite write-through + in-memory fallback]
   │     ├── security/conversation.py
   │     └── security/codeshield.py → semgrep
-  └── core/bus.py (event bus — not yet wired)
+  ├── core/bus.py (event bus — wired to orchestrator + channels)
+  ├── channels/base.py (Channel ABC, ChannelRouter)
+  ├── channels/web.py (WebSocketChannel, SSEWriter)
+  ├── channels/mcp_server.py (FastMCP server — mounted at /mcp/)
+  └── channels/signal_channel.py (SignalChannel — signal-cli subprocess)
 ```

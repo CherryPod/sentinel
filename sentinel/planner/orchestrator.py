@@ -2,7 +2,9 @@ import json
 import logging
 import re
 import time
+import uuid
 
+from sentinel.core.bus import EventBus
 from sentinel.core.models import (
     ConversationInfo,
     DataSource,
@@ -146,6 +148,7 @@ class Orchestrator:
         conversation_analyzer: ConversationAnalyzer | None = None,
         memory_store=None,
         embedding_client=None,
+        event_bus: EventBus | None = None,
     ):
         self._planner = planner
         self._pipeline = pipeline
@@ -155,6 +158,15 @@ class Orchestrator:
         self._conversation_analyzer = conversation_analyzer
         self._memory_store = memory_store
         self._embedding_client = embedding_client
+        self._event_bus = event_bus
+
+    async def _emit(self, task_id: str, event: str, data: dict | None = None) -> None:
+        """Fire-and-forget event publish. No-op if event bus not configured."""
+        if self._event_bus is not None and task_id:
+            try:
+                await self._event_bus.publish(f"task.{task_id}.{event}", data or {})
+            except Exception:
+                pass  # event publishing must never break the pipeline
 
     async def handle_task(
         self,
@@ -162,8 +174,10 @@ class Orchestrator:
         source: str = "api",
         approval_mode: str = "auto",
         source_key: str | None = None,
+        task_id: str | None = None,
     ) -> TaskResult:
         """Full CaMeL pipeline: conversation check → scan → plan → execute → return."""
+        task_id = task_id or str(uuid.uuid4())
         task_t0 = time.monotonic()
         logger.info(
             "Task received",
@@ -276,6 +290,12 @@ class Orchestrator:
                 conversation=conv_info,
             )
 
+        # Event: task started (input scan passed)
+        await self._emit(task_id, "started", {
+            "source": source,
+            "request_preview": user_request[:200],
+        })
+
         # 2. Get tool descriptions if a tool executor is available
         available_tools = []
         if self._tool_executor is not None:
@@ -329,12 +349,25 @@ class Orchestrator:
                 conversation=conv_info,
             )
 
+        # Event: plan created
+        await self._emit(task_id, "planned", {
+            "plan_summary": plan.plan_summary,
+            "steps": [{"id": s.id, "type": s.type, "description": s.description} for s in plan.steps],
+        })
+
         # 4. Check if approval is needed
         if approval_mode == "full" and self._approval_manager is not None:
             approval_id = await self._approval_manager.request_plan_approval(
                 plan, source_key=source_key or "", user_request=user_request,
             )
+            # Event: approval requested
+            await self._emit(task_id, "approval_requested", {
+                "approval_id": approval_id,
+                "plan_summary": plan.plan_summary,
+                "steps": [{"id": s.id, "type": s.type, "description": s.description} for s in plan.steps],
+            })
             return TaskResult(
+                task_id=task_id,
                 status="awaiting_approval",
                 plan_summary=plan.plan_summary,
                 approval_id=approval_id,
@@ -342,7 +375,8 @@ class Orchestrator:
             )
 
         # 5. Execute plan
-        result = await self._execute_plan(plan, user_input=user_request)
+        result = await self._execute_plan(plan, user_input=user_request, task_id=task_id)
+        result.task_id = task_id
         result.conversation = conv_info
 
         task_elapsed = time.monotonic() - task_t0
@@ -350,12 +384,20 @@ class Orchestrator:
             "Task completed",
             extra={
                 "event": "task_completed",
+                "task_id": task_id,
                 "status": result.status,
                 "plan_summary": plan.plan_summary,
                 "step_count": len(plan.steps),
                 "elapsed_s": round(task_elapsed, 2),
             },
         )
+
+        # Event: task completed
+        await self._emit(task_id, "completed", {
+            "status": result.status,
+            "plan_summary": result.plan_summary,
+            "elapsed_s": round(task_elapsed, 2),
+        })
 
         # Auto-memory: store a brief summary of successful tasks
         if (
@@ -451,6 +493,7 @@ class Orchestrator:
 
     async def _execute_plan(
         self, plan: Plan, user_input: str | None = None,
+        task_id: str = "",
     ) -> TaskResult:
         """Execute all steps in a plan sequentially."""
         context = ExecutionContext()
@@ -481,6 +524,14 @@ class Orchestrator:
                     "elapsed_s": round(step_elapsed, 2),
                 },
             )
+
+            # Event: step completed
+            await self._emit(task_id, "step_completed", {
+                "step_id": step.id,
+                "status": result.status,
+                "content_preview": result.content[:200] if result.content else "",
+                "error": result.error,
+            })
 
             # Store result in context if step has output_var
             if result.status == "success" and step.output_var and result.data_id:

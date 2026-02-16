@@ -99,6 +99,7 @@ class ConversationInfo(BaseModel):
 
 
 class TaskResult(BaseModel):
+    task_id: str = ""                    # UUID for event bus correlation
     status: str                          # "success", "blocked", "denied", "refused", "error"
     plan_summary: str = ""
     step_results: list[StepResult] = Field(default_factory=list)

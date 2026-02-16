@@ -6,14 +6,16 @@ Sentinel's evolution from a security gateway to a full AI assistant platform.
 
 - CaMeL defence-in-depth pipeline (Claude planner + Qwen worker + 10-layer scanning)
 - Air-gapped worker LLM with zero trust
-- WebUI chat interface with human approval flow
+- WebUI chat interface with human approval flow (WebSocket + SSE + HTTP polling)
 - PIN authentication + CSRF protection
-- 598 unit tests, v3 stress test benchmarked (1,136 prompts, 0.12% real risk)
+- 826 unit tests, v3 stress test benchmarked (1,136 prompts, 0.12% real risk)
 - Trust level 0 operational (text generation only)
 - Proper `sentinel/` Python package with domain-driven sub-packages
-- SQLite schema ready for persistent state (Phase 1 migration)
+- SQLite-backed stores (sessions, provenance, approvals)
+- Persistent memory with RRF hybrid search (FTS5 + sqlite-vec)
+- Multi-channel access: WebSocket, SSE, Signal (mocked), MCP server
 - Rust WASM sidecar skeleton (Phase 4 implementation)
-- Async event bus for internal pub/sub
+- Async event bus with orchestrator wiring (5 task lifecycle events)
 
 ## Planned Evolution
 
@@ -28,31 +30,36 @@ Project restructuring and infrastructure preparation. No running container chang
 - ~~Rust WASM sidecar skeleton~~ Done (`sidecar/`)
 - ~~Internal asyncio event bus~~ Done (`sentinel/core/bus.py`)
 
-### Phase 1: Container Consolidation
+### Phase 1: Container Consolidation — COMPLETE
 
-Merge `sentinel-controller` and `sentinel-ui` into a single `sentinel` container. FastAPI serves the static UI directly — no more nginx reverse proxy.
+Merged `sentinel-controller` and `sentinel-ui` into a single `sentinel` container. FastAPI serves the static UI directly — no more nginx reverse proxy.
 
-- TLS handled by FastAPI/uvicorn
-- Eliminates proxy timeout issues and simplifies deployment
-- Two containers total: `sentinel` + `ollama`
+- ~~TLS handled by FastAPI/uvicorn~~ Done
+- ~~Eliminates proxy timeout issues and simplifies deployment~~ Done
+- ~~Two containers total: `sentinel` + `ollama`~~ Done
+- ~~SQLite-backed stores (sessions, provenance, approvals)~~ Done
+- ~~Security headers as middleware~~ Done
+- ~~Trust router skeleton~~ Done
 
-### Phase 2: Memory System
+### Phase 2: Memory System — COMPLETE
 
 Persistent semantic memory using SQLite + sqlite-vec.
 
-- Conversation memory (auto-summarised)
-- Factual memory (user-correctable)
-- Procedural memory (learned workflows)
-- RRF hybrid search (keyword + vector)
-- Embeddings via Ollama on CPU (nomic-embed-text, avoids VRAM contention)
+- ~~Embedding pipeline via Ollama on CPU (nomic-embed-text)~~ Done
+- ~~Chunk management with paragraph/sentence/word splitting~~ Done
+- ~~RRF hybrid search (FTS5 keyword + sqlite-vec vector)~~ Done
+- ~~Memory API (POST/GET/DELETE + search)~~ Done
+- ~~Auto-memory (store summaries after task completion)~~ Done
 
-### Phase 3: Multi-Channel Access
+### Phase 3: Multi-Channel Access — COMPLETE
 
-Connect Sentinel to messaging platforms. Each channel is a thin adapter — all messages route through the same security pipeline.
+Real-time communication channels — all messages route through the same security pipeline.
 
-- **Signal** — via signal-cli as managed subprocess (JSON-RPC)
-- **WebSocket** — real-time chat from the WebUI
-- **Telegram / Slack** — webhook-based adapters
+- ~~Channel abstraction (ABC + ChannelRouter + event bus wiring)~~ Done
+- ~~WebSocket with PIN auth + SSE streaming~~ Done
+- ~~MCP server (4 tools: search_memory, store_memory, run_task, health_check)~~ Done
+- ~~Signal channel via signal-cli subprocess (mocked, not yet registered)~~ Done
+- ~~UI transport cascade: WebSocket → SSE → HTTP polling~~ Done
 
 ### Phase 4: WASM Tool Sandbox
 

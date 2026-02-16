@@ -14,13 +14,11 @@ A defence-in-depth AI assistant built on the [CaMeL architecture](https://arxiv.
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                     sentinel-ui (nginx)                      │
-│                   HTTPS :3001 / HTTP :3002                   │
-│              Static chat UI + reverse proxy to API           │
-└───────────────────────────┬─────────────────────────────────┘
-                            │ /api/* → :8000
-┌───────────────────────────▼─────────────────────────────────┐
-│               sentinel-controller (Python/FastAPI)           │
+│                    sentinel (Python/FastAPI)                  │
+│                  HTTPS :8443 / HTTP :8080                     │
+│                                                              │
+│  Static UI (/)  │  REST API (/api/*)  │  WebSocket (/ws)     │
+│  SSE (/api/events)  │  MCP server (/mcp/)                    │
 │                                                              │
 │  POST /task  ─→  Input validation  ─→  Conversation analysis │
 │              ─→  Prompt Guard scan ─→  Claude plans          │
@@ -30,22 +28,23 @@ A defence-in-depth AI assistant built on the [CaMeL architecture](https://arxiv.
 │     tool_call: policy check → execute → tag provenance       │
 │                                                              │
 │  10 security layers  │  Policy engine  │  Provenance store   │
+│  Memory (SQLite+vec) │  Event bus      │  Channel router     │
 └───────────────────────────┬─────────────────────────────────┘
                             │ sentinel_internal (air-gapped)
 ┌───────────────────────────▼─────────────────────────────────┐
-│                sentinel-qwen (Ollama, GPU)                    │
+│              sentinel-ollama (Ollama, GPU)                    │
 │                                                              │
-│           Qwen 3 14B Q4_K_M — text in, text out             │
-│           No internet  │  No tools  │  No file access        │
+│     Qwen 3 14B Q4_K_M — text in, text out (GPU)             │
+│     nomic-embed-text — embeddings for memory search (CPU)    │
+│     No internet  │  No tools  │  No file access              │
 └─────────────────────────────────────────────────────────────┘
 ```
 
 | Component | Role | Trust Level | Network |
 |-----------|------|-------------|---------|
-| Claude API (Anthropic) | Privileged planner | Trusted | Internet (via controller) |
+| Claude API (Anthropic) | Privileged planner | Trusted | Internet (via sentinel) |
 | Qwen 3 14B (Ollama) | Quarantined worker | **Never trusted** | Air-gapped only |
-| Controller (FastAPI) | Security gateway | Deterministic | Both networks |
-| UI (nginx) | Chat interface | Static files | Egress only |
+| Sentinel (FastAPI) | Security gateway + UI + channels | Deterministic | Both networks |
 
 ## Security Model
 
@@ -134,31 +133,34 @@ sentinel/
 ├── LICENSE                     Apache-2.0
 ├── CONTRIBUTING.md             Contributor guide
 ├── SECURITY.md                 Vulnerability reporting
-├── podman-compose.yaml         Container orchestration
+├── pyproject.toml              Python package config
 ├── CLAUDE.md                   Claude Code project instructions
 │
-├── controller/                 Python security gateway + orchestrator
-│   ├── app/                    20 source modules (FastAPI)
-│   ├── tests/                  21 test files (435 unit tests)
-│   ├── Dockerfile
-│   └── requirements.txt
+├── sentinel/                   Python package (security gateway + orchestrator)
+│   ├── core/                   Config, database, event bus, models
+│   ├── security/               Scanners, policy engine, pipeline
+│   ├── planner/                Claude planner, orchestrator, trust router
+│   ├── worker/                 Ollama/Qwen client
+│   ├── tools/                  Policy-checked tool executor
+│   ├── session/                Session + conversation tracking
+│   ├── api/                    FastAPI app, auth, middleware
+│   ├── audit/                  Structured JSON logging
+│   ├── memory/                 Embeddings, chunks, RRF search
+│   └── channels/               WebSocket, SSE, MCP, Signal
 │
-├── gateway/                    WebUI (nginx + static files)
-│   ├── static/                 HTML/JS/CSS chat interface
-│   ├── Dockerfile
-│   └── nginx.conf
+├── tests/                      826 unit tests
+├── ui/                         Static chat UI (HTML/JS/CSS)
 │
+├── container/                  Containerfile + TLS config
+├── podman-compose.phase1.yaml  2-container deployment
+│
+├── controller/                 Legacy source (pre-Phase 0)
+├── gateway/                    Legacy UI (pre-Phase 1)
+│
+├── sidecar/                    Rust WASM sidecar skeleton
 ├── policies/                   Deterministic security rules
-│   └── sentinel-policy.yaml
-│
 ├── benchmarks/                 Stress test data + analysis
-│   ├── v3-results.jsonl        1,136-prompt benchmark (6.9MB)
-│   └── v3-runner.log
-│
 ├── scripts/                    Test runners + analysis
-│   ├── analyse_v3_results.py   Benchmark analysis script
-│   ├── stress_test_v3.py       Adversarial prompt generator
-│   └── run_stress_test_v3.sh   Unattended test runner
 │
 └── docs/                       Documentation
     ├── architecture.md         Technical reference
@@ -183,14 +185,16 @@ sentinel/
 
 ## Current Status
 
-**Phase 5+ complete.** All 4 development tiers delivered, all 15 code review issues closed. The system is operational with:
+**Phase 3 complete.** Phases 0-3 delivered, all 15 code review issues closed. The system is operational with:
 
-- 435 unit tests passing
+- 826 unit tests passing
 - v3 stress test benchmarked (1,136 prompts, 0.12% real risk rate)
 - Infrastructure hardened (TLS, CSP, CSRF, resource limits, read-only FS, pinned images, health checks)
+- Persistent memory with RRF hybrid search (FTS5 + sqlite-vec)
+- Multi-channel access: WebSocket, SSE, MCP server, Signal (code ready)
 - Trust level 0 (text in/out only — no file writes or tool execution by the worker)
 
-Next steps: code restructuring (Phase 0), memory system, multi-channel access (Signal, Telegram), WASM tool sandbox. See [docs/roadmap.md](docs/roadmap.md).
+Next steps: WASM tool sandbox (Phase 4), routines + multi-provider (Phase 5), hardening + open-source release (Phase 6). See [docs/roadmap.md](docs/roadmap.md).
 
 ## License
 

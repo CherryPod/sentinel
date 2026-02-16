@@ -20,7 +20,9 @@ class TrustTier(str, Enum):
 SAFE_OPS = frozenset({
     "health_check",
     "session_info",
-    # Phase 2 adds: "memory_search", "memory_list"
+    "memory_search",
+    "memory_list",
+    "memory_store",
     # Phase 5 adds: "routine_list", "routine_status"
 })
 

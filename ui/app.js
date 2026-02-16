@@ -15,6 +15,15 @@
 
     let isProcessing = false;
 
+    // --- Transport layer (WS → SSE → HTTP polling) ---
+
+    let transport = null;  // 'ws' | 'sse' | 'http'
+    let ws = null;
+    let wsReconnectAttempts = 0;
+    const WS_MAX_RECONNECT = 5;
+    const WS_RECONNECT_BASE_MS = 1000;
+    let wsTaskResolvers = {};  // task_id → {resolve, statusId}
+
     // --- PIN management (sessionStorage — cleared on tab close) ---
 
     function getPin() {
@@ -280,6 +289,175 @@
         return parseJsonResponse(resp);
     }
 
+    // --- Transport initialization ---
+
+    function getWsUrl() {
+        var proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+        return proto + '//' + location.host + '/ws';
+    }
+
+    function initWebSocket() {
+        return new Promise(function (resolve) {
+            try {
+                var socket = new WebSocket(getWsUrl());
+                var authTimeout = setTimeout(function () {
+                    socket.close();
+                    resolve(false);
+                }, 5000);
+
+                socket.onopen = function () {
+                    // Send auth message
+                    var pin = getPin();
+                    socket.send(JSON.stringify({ type: 'auth', pin: pin || '' }));
+                };
+
+                socket.onmessage = function (event) {
+                    var msg;
+                    try { msg = JSON.parse(event.data); } catch { return; }
+
+                    if (msg.type === 'auth_ok') {
+                        clearTimeout(authTimeout);
+                        ws = socket;
+                        transport = 'ws';
+                        wsReconnectAttempts = 0;
+                        // Switch to normal message handling
+                        socket.onmessage = handleWsMessage;
+                        socket.onclose = handleWsClose;
+                        console.log('[Sentinel] WebSocket connected');
+                        resolve(true);
+                    } else if (msg.type === 'auth_error') {
+                        clearTimeout(authTimeout);
+                        socket.close();
+                        resolve(false);
+                    }
+                };
+
+                socket.onerror = function () {
+                    clearTimeout(authTimeout);
+                    resolve(false);
+                };
+
+                socket.onclose = function () {
+                    clearTimeout(authTimeout);
+                    resolve(false);
+                };
+            } catch (e) {
+                resolve(false);
+            }
+        });
+    }
+
+    function handleWsMessage(event) {
+        var msg;
+        try { msg = JSON.parse(event.data); } catch { return; }
+
+        var type = msg.type || '';
+        var data = msg.data || {};
+
+        // Extract task_id from event type: "task.<id>.started" → task_id from data
+        // Or it may just be a direct type like "error"
+        if (type === 'error') {
+            addErrorMessage(msg.reason || data.reason || 'Unknown WebSocket error');
+            return;
+        }
+
+        // Route events to the correct task handler
+        // The event_type from bus will be like "task.<task_id>.started"
+        var parts = type.split('.');
+        if (parts.length >= 3 && parts[0] === 'task') {
+            var taskId = parts[1];
+            var eventName = parts[2];
+            var resolver = wsTaskResolvers[taskId];
+
+            if (eventName === 'started' && resolver) {
+                updateStatusMessage(resolver.statusId, 'Planning task...');
+            } else if (eventName === 'planned' && resolver) {
+                updateStatusMessage(resolver.statusId, 'Executing plan...');
+            } else if (eventName === 'approval_requested' && resolver) {
+                removeElement(resolver.statusId);
+                renderPlan(
+                    data.plan_summary || 'Plan ready',
+                    data.steps || [],
+                    data.approval_id || ''
+                );
+            } else if (eventName === 'step_completed' && resolver) {
+                // Show incremental progress
+                var stepStatus = data.status === 'success' ? 'completed' : data.status;
+                updateStatusMessage(resolver.statusId, 'Step ' + (data.step_id || '?') + ' ' + stepStatus);
+            } else if (eventName === 'completed' && resolver) {
+                removeElement(resolver.statusId);
+                delete wsTaskResolvers[taskId];
+                // The full result comes in data
+                if (data.status === 'success') {
+                    addSystemMessage(data.plan_summary || 'Task completed.');
+                } else if (data.status === 'blocked') {
+                    addErrorMessage('Blocked: ' + (data.reason || 'Policy violation'));
+                }
+            }
+        }
+
+        // Approval result
+        if (type === 'approval_result') {
+            var result = data;
+            if (result.status === 'success') {
+                addSystemMessage(result.plan_summary || 'Plan executed successfully.');
+                renderStepResults(result.step_results);
+            } else if (result.status === 'denied') {
+                addSystemMessage('Plan denied.');
+            } else if (result.status === 'error') {
+                addErrorMessage(result.reason || 'Approval error');
+            }
+        }
+    }
+
+    function handleWsClose() {
+        console.log('[Sentinel] WebSocket disconnected');
+        ws = null;
+        // Try to reconnect with backoff
+        if (wsReconnectAttempts < WS_MAX_RECONNECT) {
+            wsReconnectAttempts++;
+            var delay = WS_RECONNECT_BASE_MS * Math.pow(2, wsReconnectAttempts - 1);
+            console.log('[Sentinel] Reconnecting in ' + delay + 'ms (attempt ' + wsReconnectAttempts + ')');
+            setTimeout(function () {
+                initWebSocket().then(function (ok) {
+                    if (!ok) {
+                        transport = 'http';
+                        updateTransportStatus();
+                    }
+                });
+            }, delay);
+        } else {
+            transport = 'http';
+            updateTransportStatus();
+        }
+    }
+
+    function updateStatusMessage(id, text) {
+        var el = document.getElementById(id);
+        if (el) el.innerHTML = '<span class="spinner"></span>' + escapeHtml(text);
+    }
+
+    function updateTransportStatus() {
+        var label = transport === 'ws' ? 'Controller online (WebSocket)' :
+                    transport === 'sse' ? 'Controller online (SSE)' :
+                    'Controller online (polling)';
+        statusText.textContent = label;
+    }
+
+    async function initTransport() {
+        // Try WebSocket first
+        if (getPin()) {
+            var ok = await initWebSocket();
+            if (ok) {
+                updateTransportStatus();
+                return;
+            }
+        }
+        // Fall back to HTTP polling (SSE used per-task when available)
+        transport = 'http';
+        updateTransportStatus();
+    }
+
     // --- Health check ---
 
     async function checkHealth() {
@@ -317,6 +495,32 @@
         const statusId = 'status-' + Date.now();
         addStatusMessage('Sending task to planner...', statusId);
 
+        // WebSocket transport: send via WS, events arrive in handleWsMessage
+        if (transport === 'ws' && ws && ws.readyState === WebSocket.OPEN) {
+            wsTaskResolvers['pending-' + statusId] = { statusId: statusId };
+            try {
+                ws.send(JSON.stringify({ type: 'task', request: text }));
+                // The WS message handler will update the UI as events arrive.
+                // We set a timeout to fall back if no events come.
+                setTimeout(function () {
+                    if (wsTaskResolvers['pending-' + statusId]) {
+                        // No task_id received — the handler hasn't picked it up
+                        // Events will still route by task_id from the server
+                    }
+                }, 30000);
+            } catch (err) {
+                removeElement(statusId);
+                delete wsTaskResolvers['pending-' + statusId];
+                addErrorMessage('WebSocket send failed: ' + err.message);
+                isProcessing = false;
+                setInputEnabled(true);
+            }
+            // WS flow handles completion asynchronously
+            // We'll re-enable input when the completed event arrives
+            return;
+        }
+
+        // HTTP transport (with SSE streaming if available)
         try {
             const data = await apiPost('task', { request: text, source: 'webui', session_id: getSessionId() });
             removeElement(statusId);
@@ -337,6 +541,8 @@
                 renderStepResults(data.step_results);
             } else if (data.status === 'blocked') {
                 addErrorMessage('Blocked: ' + (data.reason || 'Policy violation'));
+            } else if (data.status === 'refused') {
+                addErrorMessage('Refused: ' + (data.reason || 'Request refused by planner'));
             } else if (data.status === 'error') {
                 addErrorMessage('Error: ' + (data.reason || 'Unknown error'));
             } else {
@@ -550,6 +756,8 @@
 
     restoreHistory();
     checkHealth();
+    // Initialize transport after health check confirms server is up
+    setTimeout(initTransport, 1000);
     // Re-check health every 30s
     setInterval(checkHealth, 30000);
 })();

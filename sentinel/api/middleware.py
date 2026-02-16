@@ -18,7 +18,7 @@ _SECURITY_HEADERS = {
     "Referrer-Policy": "strict-origin-when-cross-origin",
     "Content-Security-Policy": (
         "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
-        "img-src 'self' data:; connect-src 'self'; frame-ancestors 'none';"
+        "img-src 'self' data:; connect-src 'self' wss: ws:; frame-ancestors 'none';"
     ),
     "Strict-Transport-Security": "max-age=31536000; includeSubDomains",
 }

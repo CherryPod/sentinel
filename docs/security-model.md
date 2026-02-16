@@ -145,9 +145,26 @@ The architectural guarantee. Every data item is tagged with source and trust lev
 - Compromise of the Claude API itself
 - Supply chain attacks on container base images (mitigated by pinned digests)
 
+## Multi-Channel Security
+
+All communication channels (WebSocket, SSE, HTTP, MCP, Signal) route through the same CaMeL security pipeline. No channel bypasses scanning, provenance tracking, or approval gates.
+
+| Channel | Authentication | Dangerous Operations |
+|---------|---------------|---------------------|
+| HTTP REST | PIN header (`X-Sentinel-Pin`) | Full CaMeL pipeline |
+| WebSocket | First-message PIN auth + failure lockout | Full CaMeL pipeline via ChannelRouter |
+| SSE | PIN header (existing middleware) | Read-only event stream |
+| MCP | Transport-level (exempt from PIN middleware) | `run_task` tool → full CaMeL pipeline |
+| Signal | Phone number (not yet registered) | Full CaMeL pipeline via ChannelRouter |
+
+**Trust tiering:** The trust router classifies operations as SAFE (memory search, health check, session info) or DANGEROUS (everything else). SAFE operations execute directly. DANGEROUS operations route through the full CaMeL pipeline with scanning, planning, approval, and provenance tracking.
+
+**Event bus isolation:** Each task gets a unique UUID. Channels subscribe only to events for their active task. No cross-task or cross-channel event leakage.
+
 ## Known Limitations
 
 - **False positive rate:** 18.8% of genuine requests are blocked (mostly sensitive path scanner being overzealous on educational content)
 - **ASCII gate is broad:** blocks all non-ASCII in worker prompts, which means genuine requests involving non-English content need translation
 - **Single-user:** no multi-tenant isolation (planned for future phases)
 - **No Llama Guard:** content safety model (violence, hate, weapons) was intentionally skipped — not the primary threat model
+- **MCP auth:** currently exempt from PIN middleware — relies on transport-level auth. Will need strengthening for remote access

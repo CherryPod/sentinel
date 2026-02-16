@@ -12,10 +12,13 @@ from pydantic import BaseModel, field_validator
 from slowapi import Limiter
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
+from sse_starlette.sse import EventSourceResponse
+from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from sentinel.core.approval import ApprovalManager
+from sentinel.core.bus import EventBus
 from sentinel.core.db import init_db
-from .auth import PinAuthMiddleware
+from .auth import PinAuthMiddleware, _FailureTracker
 from .middleware import CSRFMiddleware, RequestSizeLimitMiddleware, SecurityHeadersMiddleware
 from .redirect import HTTPSRedirectApp
 from sentinel.audit.logger import setup_audit_logger
@@ -34,6 +37,8 @@ from sentinel.memory.embeddings import EmbeddingClient
 from sentinel.memory.search import hybrid_search
 from sentinel.memory.splitter import split_text
 from sentinel.session.store import SessionStore
+from sentinel.channels.base import ChannelRouter, IncomingMessage
+from sentinel.channels.web import SSEWriter, WebSocketChannel
 from sentinel.tools.executor import ToolExecutor
 
 # Rate limiter — per-IP, in-memory storage
@@ -53,6 +58,9 @@ _codeshield_loaded: bool = False
 _planner_available: bool = False
 _memory_store: MemoryStore | None = None
 _embedding_client: EmbeddingClient | None = None
+_event_bus: EventBus | None = None
+_mcp_server = None
+_ws_failure_tracker = _FailureTracker()
 _audit = None
 
 # ── Input validation constants ────────────────────────────────────
@@ -188,6 +196,11 @@ async def lifespan(app: FastAPI):
         },
     )
 
+    # Initialize event bus (Phase 3)
+    global _event_bus
+    _event_bus = EventBus()
+    _audit.info("Event bus initialized", extra={"event": "bus_init"})
+
     # Initialize Claude planner + orchestrator (Phase 3)
     global _orchestrator, _planner_available
     try:
@@ -203,6 +216,7 @@ async def lifespan(app: FastAPI):
             conversation_analyzer=conversation_analyzer,
             memory_store=_memory_store,
             embedding_client=_embedding_client,
+            event_bus=_event_bus,
         )
         _planner_available = True
         _audit.info(
@@ -216,6 +230,27 @@ async def lifespan(app: FastAPI):
             extra={"event": "planner_init_failed", "error": str(exc)},
         )
         _planner_available = False
+
+    # Initialize MCP server (Phase 3)
+    global _mcp_server
+    if settings.mcp_enabled:
+        try:
+            from sentinel.channels.mcp_server import create_mcp_server
+            _mcp_server = create_mcp_server(
+                orchestrator=_orchestrator,
+                memory_store=_memory_store,
+                embedding_client=_embedding_client,
+                event_bus=_event_bus,
+            )
+            # Mount MCP transport at /mcp/ — streamable HTTP is the modern approach
+            app.mount("/mcp", _mcp_server.streamable_http_app())
+            _audit.info("MCP server initialized", extra={"event": "mcp_init"})
+        except Exception as exc:
+            _audit.warning(
+                "MCP server init failed: %s",
+                exc,
+                extra={"event": "mcp_init_failed", "error": str(exc)},
+            )
 
     # Start HTTP→HTTPS redirect server (only when TLS is active)
     redirect_server = None
@@ -771,8 +806,98 @@ async def delete_memory_chunk(chunk_id: str):
     return {"status": "ok", "deleted": chunk_id}
 
 
+# ── WebSocket endpoint (Phase 3) ────────────────────────────────
+
+
+@api_router.get("/events")
+async def sse_events(request: Request, task_id: str = Query(..., min_length=1)):
+    """SSE stream for real-time task updates. PIN auth enforced by middleware."""
+    if _event_bus is None:
+        return JSONResponse(
+            status_code=503,
+            content={"status": "error", "reason": "Event bus not initialized"},
+        )
+
+    writer = SSEWriter(_event_bus)
+    await writer.subscribe(task_id)
+    return EventSourceResponse(writer.event_generator())
+
+
 # Include API router before static file mount — API routes take priority
 app.include_router(api_router)
+
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    """WebSocket endpoint with PIN auth and real-time task execution."""
+    await websocket.accept()
+
+    channel = WebSocketChannel(
+        websocket=websocket,
+        pin_getter=lambda: _pin,
+        failure_tracker=_ws_failure_tracker,
+    )
+
+    if not await channel.authenticate():
+        return  # Connection closed with 4001
+
+    if _orchestrator is None or _event_bus is None:
+        try:
+            await websocket.send_json({
+                "type": "error",
+                "reason": "Orchestrator not initialized",
+            })
+        except Exception:
+            pass
+        await channel.stop()
+        return
+
+    router = ChannelRouter(_orchestrator, _event_bus, _audit)
+
+    try:
+        async for message in channel.receive():
+            msg_type = message.metadata.get("type", "")
+
+            if msg_type == "task":
+                # Add source_key for session binding
+                client_ip = websocket.client.host if websocket.client else "unknown"
+                message.metadata["source_key"] = f"websocket:{client_ip}"
+                try:
+                    task_id = await router.handle_message(channel, message)
+                except Exception as exc:
+                    await websocket.send_json({
+                        "type": "error",
+                        "reason": str(exc),
+                    })
+
+            elif msg_type == "approval":
+                try:
+                    result = await router.handle_approval(
+                        channel,
+                        approval_id=message.metadata.get("approval_id", ""),
+                        granted=message.metadata.get("granted", False),
+                        reason=message.metadata.get("reason", ""),
+                    )
+                    await websocket.send_json({
+                        "type": "approval_result",
+                        "data": result,
+                    })
+                except Exception as exc:
+                    await websocket.send_json({
+                        "type": "error",
+                        "reason": str(exc),
+                    })
+
+            else:
+                await websocket.send_json({
+                    "type": "error",
+                    "reason": f"Unknown message type: {msg_type}",
+                })
+
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        pass
 
 # Serve static files (UI) at / — catch-all after API routes.
 # html=True provides SPA fallback (unmatched paths serve index.html).

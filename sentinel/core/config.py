@@ -71,6 +71,14 @@ class Settings(BaseSettings):
     embeddings_timeout: int = 30
     auto_memory: bool = True  # auto-store conversation summaries after tasks
 
+    # MCP server (Phase 3)
+    mcp_enabled: bool = True
+
+    # Signal channel (Phase 3) — disabled until registered
+    signal_enabled: bool = False
+    signal_cli_path: str = "/usr/bin/signal-cli"
+    signal_account: str = ""
+
     # Verbose results (stress testing) — exposes defence internals (spotlighting
     # markers, sandwich text, UNTRUSTED_DATA structure). Off by default.
     verbose_results: bool = False

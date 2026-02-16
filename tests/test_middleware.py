@@ -21,7 +21,7 @@ EXPECTED_HEADERS = {
     "referrer-policy": "strict-origin-when-cross-origin",
     "content-security-policy": (
         "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
-        "img-src 'self' data:; connect-src 'self'; frame-ancestors 'none';"
+        "img-src 'self' data:; connect-src 'self' wss: ws:; frame-ancestors 'none';"
     ),
     "strict-transport-security": "max-age=31536000; includeSubDomains",
 }

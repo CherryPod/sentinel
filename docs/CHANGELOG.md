@@ -1,5 +1,105 @@
 # Changelog
 
+## Phase 3: Multi-Channel Access (2026-02-16)
+
+Real-time communication channels — WebSocket, SSE, Signal messaging, and MCP server. All channels route through the existing CaMeL security pipeline. 74 new tests (826 total).
+
+### 3.1 — Channel Abstraction + Event Bus Wiring
+
+- **`sentinel/channels/base.py`** — `Channel` ABC with `start()`, `stop()`, `send()`, `receive()` + `IncomingMessage` / `OutgoingMessage` dataclasses
+- **`ChannelRouter`** — routes incoming messages through orchestrator, subscribes channels to task events via event bus
+- **Orchestrator event bus wiring** — publishes 5 lifecycle events: `task.{id}.started`, `planned`, `approval_requested`, `step_completed`, `completed`
+- **`TaskResult.task_id`** — new UUID field for event bus correlation
+- **`EventBus`** created in app lifespan, passed to orchestrator
+
+### 3.2 — WebSocket + SSE + UI Transport Cascade
+
+- **`sentinel/channels/web.py`** — `WebSocketChannel` (first-message PIN auth, failure tracker) + `SSEWriter` (event bus subscription, keepalive)
+- **`/ws` endpoint** — WebSocket with JSON protocol: auth → task → approval → events
+- **`/api/events` endpoint** — SSE stream for real-time task updates (task_id query param)
+- **UI transport cascade** — WebSocket → SSE → HTTP polling fallback. Auto-reconnection with exponential backoff
+- **CSP updated** — `connect-src 'self' wss: ws:` for WebSocket connections
+- **Auth exemptions** — `/ws` and `/mcp` paths exempt from PIN middleware (handle their own auth)
+
+### 3.4 — MCP Server
+
+- **`sentinel/channels/mcp_server.py`** — FastMCP server with 4 tools:
+  - `search_memory` — hybrid search (SAFE tier)
+  - `store_memory` — store text in memory (SAFE tier)
+  - `run_task` — full CaMeL pipeline (DANGEROUS tier)
+  - `health_check` — system status (SAFE tier)
+- Mounted at `/mcp/` via ASGI
+- **Trust router** — added `memory_search`, `memory_list`, `memory_store` to SAFE_OPS
+
+### 3.3 — Signal Channel
+
+- **`sentinel/channels/signal_channel.py`** — signal-cli subprocess management in JSON-RPC mode
+- **`ExponentialBackoff`** — 1s, 2s, 4s, ... up to 300s max delay
+- **Crash recovery** — `_health_monitor` detects subprocess exit and restarts with backoff
+- **All tests mocked** — no signal-cli binary needed
+- Config: `signal_enabled` (default False), `signal_cli_path`, `signal_account`
+
+### Dependencies
+
+- Added `sse-starlette>=2.0.0,<3.0.0` to dependencies
+- Added `mcp>=1.0.0` as optional dependency (`[mcp]`)
+
+### Files Created
+
+- `sentinel/channels/__init__.py`, `sentinel/channels/base.py`, `sentinel/channels/web.py`
+- `sentinel/channels/mcp_server.py`, `sentinel/channels/signal_channel.py`
+- `tests/test_channels.py` (19), `tests/test_websocket.py` (12), `tests/test_sse.py` (10)
+- `tests/test_mcp.py` (16), `tests/test_signal_channel.py` (17)
+
+### Files Modified
+
+- `sentinel/planner/orchestrator.py` — event bus + task_id
+- `sentinel/core/models.py` — TaskResult.task_id
+- `sentinel/core/config.py` — MCP + Signal settings
+- `sentinel/api/app.py` — WebSocket, SSE, MCP endpoints
+- `sentinel/api/auth.py` — /ws and /mcp exemptions
+- `sentinel/api/middleware.py` — CSP connect-src
+- `sentinel/planner/trust_router.py` — memory SAFE_OPS
+- `ui/app.js` — transport cascade
+- `pyproject.toml` — sse-starlette + mcp dependencies
+
+---
+
+## Phase 2: Persistent Memory (2026-02-16)
+
+Hybrid search memory system — store context, search with RRF fusion. 90 new tests (752 total).
+
+- **Embedding pipeline** — `sentinel/memory/embeddings.py`, Ollama `/api/embed` (nomic-embed-text, 768 dims)
+- **Chunk management** — `sentinel/memory/chunks.py`, MemoryStore CRUD + FTS5/vec sync, paragraph/sentence/word splitter
+- **RRF hybrid search** — `sentinel/memory/search.py`, FTS5 + sqlite-vec with RRF fusion (k=60), graceful vec fallback
+- **Memory API** — POST/GET/DELETE `/api/memory`, GET `/api/memory/search`
+- **Auto-memory** — auto-store conversation summaries after task completion
+
+---
+
+## Phase 1: Infrastructure Consolidation (2026-02-16)
+
+3 containers → 2. Merged UI into controller, SQLite backends, security middleware. 64 new tests (662 total).
+
+- **Eliminated nginx container** — FastAPI serves static files, security headers as middleware, TLS via uvicorn
+- **SQLite backends** — SessionStore, ProvenanceStore, ApprovalManager all migrated from in-memory dicts
+- **Trust router skeleton** — `classify_operation()` → SAFE or DANGEROUS
+- **Two-container compose** — `podman-compose.phase1.yaml` (sentinel-v2 + sentinel-ollama-v2)
+- **Config additions** — `db_path`, `static_dir`, TLS settings, MQTT settings removed
+
+---
+
+## Phase 0: Foundation (2026-02-16)
+
+Package restructure and infrastructure preparation. 598 tests.
+
+- **Package restructure** — `controller/app/` → `sentinel/` domain-driven package
+- **SQLite + sqlite-vec** — full schema for sessions, turns, provenance, approvals, memory, routines, audit
+- **Rust WASM sidecar skeleton** — `sidecar/` with Cargo.toml, compiles and accepts JSON over Unix socket
+- **Internal event bus** — `sentinel/core/bus.py`, asyncio pub/sub with wildcard matching
+
+---
+
 ## Stress Test v3 — Capability Benchmark (2026-02-15)
 
 Added 160 capability benchmark prompts to stress test v2 (~976 prompts → ~1136 prompts). Tests Qwen's code generation quality across 4 difficulty tiers and 10 categories.

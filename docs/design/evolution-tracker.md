@@ -93,16 +93,16 @@ Progress checklist for the evolution plan. Design rationale lives in `evolution-
 
 ---
 
-## Phase 3: Multi-Channel Access
+## Phase 3: Multi-Channel Access — COMPLETE (2026-02-16)
 
 > Goal: WebSocket/SSE web upgrade, Signal messaging, MCP server.
 
-- [ ] **3.1 — Channel abstraction** — ABC: receive, send, start, stop + ChannelRouter
-- [ ] **3.2 — Web channel upgrade** — WebSocket /ws + SSE /events + polling fallback
-- [ ] **3.3 — Signal channel** — signal-cli as managed subprocess (JSON-RPC)
-- [ ] **3.4 — MCP server** — expose tools to MCP clients, all through trust router
+- [x] **3.1 — Channel abstraction** — ABC: receive, send, start, stop + ChannelRouter + event bus wiring in orchestrator (5 events)
+- [x] **3.2 — Web channel upgrade** — WebSocket /ws + SSE /api/events + transport cascade UI (WS → SSE → HTTP polling)
+- [x] **3.4 — MCP server** — FastMCP with 4 tools (search_memory, store_memory, run_task, health_check), mounted at /mcp/
+- [x] **3.3 — Signal channel** — signal-cli subprocess (JSON-RPC), exponential backoff crash recovery, all tests mocked
 
-**Verify:** WebSocket streams, SSE fallback works, Signal send/receive, MCP connects from Claude Desktop
+**Verified:** 74 new tests (826 total, all pass). Channel ABC, bus wiring, WS auth/send/receive, SSE stream, MCP tools, Signal subprocess management
 
 ---
 
