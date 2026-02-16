@@ -503,6 +503,14 @@ class Orchestrator:
         if step.output_format and step.output_format in _FORMAT_INSTRUCTIONS:
             resolved_prompt += _FORMAT_INSTRUCTIONS[step.output_format]
 
+        # Verbose logging — capture prompts/responses for stress test analysis.
+        # Only populated when SENTINEL_VERBOSE_RESULTS=true (never in production).
+        verbose = settings.verbose_results
+        _v: dict = {}
+        if verbose:
+            _v["planner_prompt"] = step.prompt
+            _v["resolved_prompt"] = resolved_prompt
+
         try:
             tagged = await self._pipeline.process_with_qwen(
                 prompt=resolved_prompt,
@@ -510,6 +518,10 @@ class Orchestrator:
                 skip_input_scan=bool(step.input_vars),
                 user_input=user_input,
             )
+
+            # Capture Qwen's raw response before any post-processing
+            if verbose:
+                _v["worker_response"] = tagged.content
 
             # Fail-closed: if CodeShield is required but unavailable, block
             if settings.require_codeshield and not codeshield.is_loaded():
@@ -524,6 +536,7 @@ class Orchestrator:
                     step_id=step.id,
                     status="blocked",
                     error="CodeShield required but not loaded",
+                    **_v,
                 )
 
             # CodeShield scan on ALL Qwen output (not just expects_code steps)
@@ -542,6 +555,7 @@ class Orchestrator:
                         step_id=step.id,
                         status="blocked",
                         error=f"CodeShield: insecure code detected ({len(cs_result.matches)} issues)",
+                        **_v,
                     )
 
             # Validate output format if specified (P8)
@@ -554,6 +568,7 @@ class Orchestrator:
                         step_id=step.id,
                         status="error",
                         error="Output format violation: response is not valid JSON",
+                        **_v,
                     )
             elif step.output_format == "tagged":
                 stripped = content.strip()
@@ -562,6 +577,7 @@ class Orchestrator:
                         step_id=step.id,
                         status="error",
                         error="Output format violation: response missing <RESPONSE> tags",
+                        **_v,
                     )
                 # Extract content between tags
                 start = stripped.index("<RESPONSE>") + len("<RESPONSE>")
@@ -574,8 +590,13 @@ class Orchestrator:
                 status="success",
                 data_id=tagged.id,
                 content=content,
+                **_v,
             )
         except SecurityViolation as exc:
+            # Capture Qwen's raw response from the exception (post-Qwen violations
+            # like output scan or echo scan include it; pre-Qwen violations don't)
+            if verbose and exc.raw_response is not None:
+                _v["worker_response"] = exc.raw_response
             # Build specific block reason from scan results
             details = []
             for scanner_name, sr in exc.scan_results.items():
@@ -586,12 +607,14 @@ class Orchestrator:
                 step_id=step.id,
                 status="blocked",
                 error=f"Output blocked — {specific}",
+                **_v,
             )
         except Exception as exc:
             return StepResult(
                 step_id=step.id,
                 status="error",
                 error=f"LLM task failed: {exc}",
+                **_v,
             )
 
     async def _execute_tool_call(

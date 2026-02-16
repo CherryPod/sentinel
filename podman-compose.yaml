@@ -12,7 +12,8 @@ services:
       - SENTINEL_WORKSPACE_PATH=/workspace
       - SENTINEL_LOG_DIR=/logs
       - SENTINEL_LOG_LEVEL=INFO
-      - SENTINEL_APPROVAL_MODE=full
+      - SENTINEL_APPROVAL_MODE=auto
+      - SENTINEL_VERBOSE_RESULTS=true
       - SENTINEL_PIN_REQUIRED=true
       - SENTINEL_PIN_FILE=/run/secrets/sentinel_pin
       - SENTINEL_OLLAMA_URL=http://sentinel-qwen:11434

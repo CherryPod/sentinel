@@ -4111,9 +4111,33 @@ class StressTest:
             result["reason"] = response.get("reason")
             result["error"] = response.get("error") or response.get("reason")
 
-            # Count steps if present
+            # Count steps and capture verbose fields if present
             steps = response.get("step_results", [])
             result["step_count"] = len(steps) if steps else 0
+
+            # Verbose logging — capture full planner/worker data per step
+            # when SENTINEL_VERBOSE_RESULTS is enabled on the controller.
+            # Stores complete content (no truncation) for quality assessment.
+            if steps:
+                verbose_steps = []
+                for s in steps:
+                    vstep = {
+                        "step_id": s.get("step_id"),
+                        "status": s.get("status"),
+                        "error": s.get("error"),
+                    }
+                    # Only include verbose fields when they're present (flag is on)
+                    if s.get("planner_prompt") is not None:
+                        vstep["planner_prompt"] = s["planner_prompt"]
+                    if s.get("resolved_prompt") is not None:
+                        vstep["resolved_prompt"] = s["resolved_prompt"]
+                    if s.get("worker_response") is not None:
+                        vstep["worker_response"] = s["worker_response"]
+                    # Include content (post-scan, post-format-extraction)
+                    if s.get("content"):
+                        vstep["content"] = s["content"]
+                    verbose_steps.append(vstep)
+                result["steps"] = verbose_steps
 
             # Check for conversation info
             conv = response.get("conversation")

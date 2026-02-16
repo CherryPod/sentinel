@@ -57,19 +57,22 @@ echo
 
 # ── Step 1: Switch to auto mode ──────────────────────────────────
 
-echo "[1/5] Switching approval mode to auto..."
+echo "[1/5] Switching to stress test mode (auto approval + verbose results)..."
 
 # Always restore on exit (even on error or kill)
-restore_approval() {
+restore_settings() {
     echo
-    echo "[cleanup] Restoring approval mode to full..."
+    echo "[cleanup] Restoring production settings..."
     sed -i 's/SENTINEL_APPROVAL_MODE=auto/SENTINEL_APPROVAL_MODE=full/' "$COMPOSE_FILE"
-    echo "[cleanup] Done. Approval mode restored."
+    sed -i 's/SENTINEL_VERBOSE_RESULTS=true/SENTINEL_VERBOSE_RESULTS=false/' "$COMPOSE_FILE"
+    echo "[cleanup] Done. Approval mode + verbose results restored."
 }
-trap restore_approval EXIT
+trap restore_settings EXIT
 
 sed -i 's/SENTINEL_APPROVAL_MODE=full/SENTINEL_APPROVAL_MODE=auto/' "$COMPOSE_FILE"
+sed -i 's/SENTINEL_VERBOSE_RESULTS=false/SENTINEL_VERBOSE_RESULTS=true/' "$COMPOSE_FILE"
 echo "  Approval mode set to: auto"
+echo "  Verbose results: enabled"
 echo
 
 # ── Step 2: Rebuild and restart containers ────────────────────────

@@ -39,9 +39,17 @@ def _generate_marker(length: int = 4) -> str:
 class SecurityViolation(Exception):
     """Raised when the scan pipeline detects a security violation."""
 
-    def __init__(self, message: str, scan_results: dict[str, ScanResult]):
+    def __init__(
+        self,
+        message: str,
+        scan_results: dict[str, ScanResult],
+        raw_response: str | None = None,
+    ):
         super().__init__(message)
         self.scan_results = scan_results
+        # Qwen's raw output when violation is post-Qwen (output scan, echo scan).
+        # None for pre-Qwen violations (input scan, ASCII gate, prompt length gate).
+        self.raw_response = raw_response
 
 
 class PipelineScanResult:
@@ -406,6 +414,7 @@ class ScanPipeline:
             raise SecurityViolation(
                 "Qwen output blocked by security scan",
                 output_scan.violations,
+                raw_response=response_text,
             )
 
         # 6. Vulnerability echo scan: compare input vs output fingerprints.
@@ -425,6 +434,7 @@ class ScanPipeline:
                 raise SecurityViolation(
                     "Vulnerability echo: Qwen reproduced vulnerable code from input",
                     {"vulnerability_echo_scanner": echo_result},
+                    raw_response=response_text,
                 )
 
         logger.info(

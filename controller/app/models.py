@@ -83,6 +83,11 @@ class StepResult(BaseModel):
     data_id: str | None = None           # TaggedData ID
     content: str = ""
     error: str = ""
+    # Verbose fields — populated when SENTINEL_VERBOSE_RESULTS=true.
+    # Exposes defence internals; never enable in production.
+    planner_prompt: str | None = None    # Claude's raw plan step prompt
+    resolved_prompt: str | None = None   # What Qwen actually receives (after spotlighting/tags/sandwich)
+    worker_response: str | None = None   # Qwen's raw response (before output scanning)
 
 
 class ConversationInfo(BaseModel):
