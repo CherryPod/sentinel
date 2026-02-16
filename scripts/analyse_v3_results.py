@@ -11,7 +11,7 @@ Usage:
   python3 scripts/analyse_v3_results.py --show 437          # full dump of entry 437
   python3 scripts/analyse_v3_results.py --show 437 --raw    # raw JSON of entry 437
 
-Default JSONL: scripts/results/stress_test_20260215_163114.jsonl
+Default JSONL: benchmarks/v3-results.jsonl
 """
 
 import argparse
@@ -29,9 +29,9 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_JSONL = PROJECT_ROOT / "scripts" / "results" / "stress_test_20260215_163114.jsonl"
-SECURITY_REPORT = PROJECT_ROOT / "docs" / "archive" / "2026-02-16_v3-security-analysis.md"
-QUALITY_REPORT = PROJECT_ROOT / "docs" / "archive" / "2026-02-16_v3-quality-analysis.md"
+DEFAULT_JSONL = PROJECT_ROOT / "benchmarks" / "v3-results.jsonl"
+SECURITY_REPORT = PROJECT_ROOT / "docs" / "assessments" / "v3-security-analysis.md"
+QUALITY_REPORT = PROJECT_ROOT / "docs" / "assessments" / "v3-quality-analysis.md"
 
 # v2 reference numbers for comparison
 V2_STATS = {

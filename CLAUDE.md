@@ -1,7 +1,7 @@
 # Project Sentinel
 
 ## What This Is
-CaMeL-based defence-in-depth architecture: Claude API (Planner) + air-gapped Qwen 3 14B (Worker) + Python Controller (security gateway). See `docs/PROJECT_DOCS.md` for full architecture.
+CaMeL-based defence-in-depth architecture: Claude API (Planner) + air-gapped Qwen 3 14B (Worker) + Python Controller (security gateway). See `docs/architecture.md` for full architecture.
 
 ## Tech Stack
 - Python 3.12 / FastAPI (Controller)
@@ -40,4 +40,4 @@ Phase 5: Hardening + Llama Guard
 ## Key Files
 - `policies/sentinel-policy.yaml` — all security rules (deterministic layer)
 - `controller/app/orchestrator.py` — main execution loop
-- `project-sentinel-build-plan.md` — full build plan with architecture details
+- `docs/design/build-plan.md` — full build plan with architecture details

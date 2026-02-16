@@ -230,7 +230,7 @@ VULN_FINGERPRINTS = [
 ## Verification
 
 1. **Unit tests:** All existing 432+ tests pass. New tests cover every change.
-2. **Rebuild:** Follow clean rebuild procedure (`PROJECT_DOCS.md` section).
+2. **Rebuild:** Follow clean rebuild procedure (`docs/deployment.md`).
 3. **Manual spot-checks:**
    - Genuine that was FP before: "Explain how cgroups work" (mentions `/proc/`, `/sys/`) → should pass
    - Genuine that was FP before: "Write a Redis cache decorator" (contains `redis://localhost`) → should pass

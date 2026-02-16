@@ -2,7 +2,7 @@
 
 ## Key Reports & Assessments
 
-- **Stress test v2 assessment (2026-02-15):** `docs/archive/2026-02-15_camel-pipeline-assessment.md`
+- **Stress test v2 assessment (2026-02-15):** `docs/assessments/camel-pipeline-assessment.md`
   - Overall grade: 3.0/5 — strong foundations, not deployment-ready
   - Conversation analyser scored 1.0/5 — conv_risk_score 0.00 on all 22 multi-turn escapes
   - 19 of 25 FPs fixable with 3 targeted scanner pattern changes (no security cost)
@@ -14,7 +14,7 @@
 ## Gotchas & Learnings
 
 - Stress test JSONL stores metadata only — no response content. Fix planned: `SENTINEL_VERBOSE_RESULTS` config flag to add worker_prompt + worker_response to StepResult (see Next Steps #1)
-- Container uses read-only FS with files copied at build time (not bind-mounted). Must rebuild to pick up code changes — see `docs/PROJECT_DOCS.md` "Rebuilding Containers" section
+- Container uses read-only FS with files copied at build time (not bind-mounted). Must rebuild to pick up code changes — see `docs/deployment.md` "Rebuilding After Code Changes" section
 - Hostile Qwen test payloads must put sensitive paths in operational context (code blocks, shell commands) — context-aware output scanner passes prose mentions
 - When updating existing tests for scanner behavior changes, check `test_hostile.py` too — it simulates real attacks and depends on scanner behavior
 - `execute_approved_plan` must record turns in the session — without this, `full` approval mode breaks multi-turn conversation history (turns never get stored, planner sees empty history)
@@ -25,9 +25,9 @@
 
 **Stress test v3 created and launched (nohup, ~10-11hrs expected):** v2 prompts (~976) + 160 capability benchmark prompts (4 tiers: T1 Simple, T2 Moderate, T3 Complex, T4 Hard). Categories: Python (76), Rust (21), container/devops (28), data (7), JS (7), SQL (7), bash (6), config (5), HTML (3). `genuine_target` cap raised 110→270, `max_requests` default raised 1400→1600. Verbose logging confirmed working — JSONL captures planner_prompt, resolved_prompt, and worker_response per step.
 - Scripts: `scripts/stress_test_v3.py`, `scripts/run_stress_test_v3.sh`
-- JSONL results: `scripts/results/stress_test_20260215_163114.jsonl`
-- Runner log: `scripts/results/runner_20260215_163040.log`
-- Nohup log: `scripts/results/nohup_v3_20260215_163040.log`
+- JSONL results: `benchmarks/v3-results.jsonl`
+- Runner log: `benchmarks/v3-runner.log`
+- Nohup log: `scripts/results/nohup_v3_20260215_163040.log` (gitignored)
 - Runner auto-restores `SENTINEL_APPROVAL_MODE=full` and `SENTINEL_VERBOSE_RESULTS=false` on exit
 
 **Planner undefined variable fix:** Added clarification to planner system prompt — `$` symbols in user text are literal, not plan variables. Don't add them to `input_vars`. Fixes 5 stress test errors (all `indirect_injection` category).
@@ -61,13 +61,13 @@ Priority order:
 ## Key Paths for Context Loading
 
 - `memory/MEMORY.md` — this file (gotchas, next steps)
-- `docs/PROJECT_DOCS.md` — architecture, config, file tree, current status
+- `docs/architecture.md` — architecture, containers, API endpoints, data flow
 - `docs/CHANGELOG.md` — version history, all changes
-- `docs/archive/2026-02-15_camel-pipeline-assessment.md` — stress test v2 expert assessment (3.0/5)
+- `docs/assessments/camel-pipeline-assessment.md` — stress test v2 expert assessment (3.0/5)
 - `docs/archive/2026-02-15_security-improvement-plan.md` — implementation plan for the post-assessment work
 - `controller/app/` — all source code (scanner.py, pipeline.py, orchestrator.py, planner.py, conversation.py, session.py, approval.py)
 - `controller/tests/` — all tests (test_scanner.py, test_pipeline.py, test_hostile.py, test_encoding_scanner.py, test_conversation.py, test_orchestrator.py, test_planner.py)
-- `scripts/stress_test.py` — stress test v2
+- `scripts/archive/stress_test_v1.py` — stress test v1 (archived)
 - `scripts/stress_test_v3.py` — stress test v3 (v2 + 160 capability benchmarks)
 - `policies/sentinel-policy.yaml` — security policy rules
 

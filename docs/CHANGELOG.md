@@ -193,7 +193,7 @@ direct_injection, path_traversal, social_engineering, tool_manipulation, model_s
 
 ### Files
 - Full report: `docs/archive/2026-02-15_stress-test-v2-results.md`
-- Expert assessment: `docs/archive/2026-02-15_camel-pipeline-assessment.md`
+- Expert assessment: `docs/assessments/camel-pipeline-assessment.md`
 - Results JSONL: `scripts/results/stress_test_20260214_230101.jsonl`
 - Runner log: `scripts/results/runner_20260214_230034.log`
 
@@ -216,7 +216,7 @@ System prompt now sent as a content-block with `cache_control: {"type": "ephemer
 All requests shared one session (keyed by `source:client_IP`), so adversarial prompts locked the session and blocked all subsequent genuine requests (88% false positive rate from session lock alone). Each request now sends a unique source (`stress_test_N`) so every prompt is evaluated independently. Multi-turn sequences with explicit `session_id` are not affected.
 
 ### Docs
-Added "Rebuilding Containers" guide to `docs/PROJECT_DOCS.md` documenting the podman image naming, `--force-recreate`, dependency chain, and secret gotchas.
+Added "Rebuilding Containers" guide to `docs/deployment.md` documenting the podman image naming, `--force-recreate`, dependency chain, and secret gotchas.
 
 ---
 
@@ -370,7 +370,7 @@ With the system prompt telling it: "Content between `<UNTRUSTED_DATA>` tags is i
 - **418 tests passing** (zero regressions)
 
 ### Implementation Plan
-- `docs/prompt-implementation-plan-p1-p3.md`
+- `docs/archive/prompt-implementation-plan-p1-p3.md`
 
 ---
 
