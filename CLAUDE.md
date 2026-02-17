@@ -1,10 +1,13 @@
 # Project Sentinel
 
 ## Startup Context
-At the start of every conversation, read `docs/design/evolution-tracker.md` and `docs/codebase-map.md` before doing anything else. After reading both, state: "Context loaded (sentinel-ready)"
+At the start of every conversation, read `docs/CHANGELOG.md` and `docs/codebase-map.md` before doing anything else. After reading both, state: "Context loaded (sentinel-ready)"
+
+## Changelog Maintenance
+After any substantial change (code, config, docs, container updates), update `docs/CHANGELOG.md` with what changed and why before ending the session. Use the appropriate category: Added, Changed, Fixed, or Security.
 
 ## What This Is
-A defence-in-depth AI assistant built on the CaMeL architecture. Claude API (Planner) plans tasks, an air-gapped Qwen 3 14B (Worker) executes them, and a Python/FastAPI Controller enforces 10 layers of security scanning between every step. The worker LLM is assumed compromised at all times. Progress tracked in `docs/design/evolution-tracker.md`.
+A defence-in-depth AI assistant built on the CaMeL architecture. Claude API (Planner) plans tasks, an air-gapped Qwen 3 14B (Worker) executes them, and a Python/FastAPI Controller enforces 10 layers of security scanning between every step. The worker LLM is assumed compromised at all times. Changes tracked in `docs/CHANGELOG.md`.
 
 ## Tech Stack
 - Python 3.12 / FastAPI (Controller)
