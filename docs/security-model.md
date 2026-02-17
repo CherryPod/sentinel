@@ -106,13 +106,13 @@ Detects code injection via the "review/test/debug" framing attack:
 
 Only checks code regions (fenced blocks or 4+ space indent), not educational prose.
 
-### Layer 9: ASCII Prompt Gate
+### Layer 9: Script Gate
 
 Deterministic backstop for cross-model bilingual injection:
 
-- Regex allowlist: printable ASCII (`\x20`-`\x7E`) + `\n` + `\t` + `\r`
-- Only checks the planner-constructed `prompt` (not `untrusted_data`, which is protected by spotlighting)
-- Catches CJK, Cyrillic homoglyphs, Arabic, accented Latin
+- Expanded allowlist: ASCII + Latin Extended + typographic symbols (smart quotes, em-dashes, math operators, currency, arrows, box drawing, dingbats)
+- Always checks the planner-constructed `prompt` (not `untrusted_data`, which is protected by spotlighting)
+- Blocks CJK, Cyrillic, Arabic, Hangul, and other non-Latin scripts that Qwen might follow as instructions
 
 Works alongside the planner's language safety rule (which tells Claude to translate everything to English before constructing worker prompts).
 
@@ -163,8 +163,8 @@ All communication channels (WebSocket, SSE, HTTP, MCP, Signal) route through the
 
 ## Known Limitations
 
-- **False positive rate:** 18.8% of genuine requests are blocked (mostly sensitive path scanner being overzealous on educational content)
-- **ASCII gate is broad:** blocks all non-ASCII in worker prompts, which means genuine requests involving non-English content need translation
+- **False positive rate:** ~4.7% estimated after script gate reform (was 18.8% — the old strict-ASCII gate caused 75% of FPs)
+- **Script gate allowlist:** permits Latin Extended + typographic Unicode but blocks non-Latin scripts; genuine non-English content still needs translation by the planner
 - **Single-user:** no multi-tenant isolation (planned for future phases)
 - **No Llama Guard:** content safety model (violence, hate, weapons) was intentionally skipped — not the primary threat model
 - **MCP auth:** currently exempt from PIN middleware — relies on transport-level auth. Will need strengthening for remote access

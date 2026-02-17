@@ -512,12 +512,16 @@ class TestVulnerabilityEchoInPipeline:
 
 
 class TestAsciiPromptGate:
-    """ASCII-only gate on planner-constructed worker prompts."""
+    """Script gate on planner-constructed worker prompts.
+
+    Allows ASCII + Latin Extended + common typographic symbols.
+    Blocks CJK, Cyrillic, Arabic, Hangul, and other non-Latin scripts.
+    """
 
     @patch("sentinel.security.pipeline.settings")
     @pytest.mark.asyncio
     async def test_ascii_prompt_passes(self, mock_settings, pipeline, mock_worker):
-        """Normal English prompt passes the ASCII gate."""
+        """Normal English prompt passes the script gate."""
         mock_settings.prompt_guard_enabled = False
         mock_settings.spotlighting_enabled = False
         mock_settings.ollama_model = "qwen3:14b"
@@ -527,12 +531,52 @@ class TestAsciiPromptGate:
 
     @patch("sentinel.security.pipeline.settings")
     @pytest.mark.asyncio
+    async def test_smart_quotes_pass(self, mock_settings, pipeline, mock_worker):
+        """Smart quotes and em-dashes from Claude should pass the gate."""
+        mock_settings.prompt_guard_enabled = False
+        mock_settings.spotlighting_enabled = False
+        mock_settings.ollama_model = "qwen3:14b"
+
+        # These are the typographic chars Claude commonly produces
+        tagged = await pipeline.process_with_qwen(
+            "Write a function called \u2018int_to_roman\u2019 \u2014 it should convert integers"
+        )
+        assert tagged.content == "Generated response text"
+
+    @patch("sentinel.security.pipeline.settings")
+    @pytest.mark.asyncio
+    async def test_math_and_currency_pass(self, mock_settings, pipeline, mock_worker):
+        """Mathematical symbols and currency signs should pass the gate."""
+        mock_settings.prompt_guard_enabled = False
+        mock_settings.spotlighting_enabled = False
+        mock_settings.ollama_model = "qwen3:14b"
+
+        tagged = await pipeline.process_with_qwen(
+            "Calculate where x \u2265 0 and cost is \u20ac100 \u00b1 5%"
+        )
+        assert tagged.content == "Generated response text"
+
+    @patch("sentinel.security.pipeline.settings")
+    @pytest.mark.asyncio
+    async def test_accented_latin_passes(self, mock_settings, pipeline, mock_worker):
+        """Accented Latin characters (e.g. caf\u00e9, na\u00efve) should pass."""
+        mock_settings.prompt_guard_enabled = False
+        mock_settings.spotlighting_enabled = False
+        mock_settings.ollama_model = "qwen3:14b"
+
+        tagged = await pipeline.process_with_qwen(
+            "Write about the caf\u00e9 and na\u00efve approach to r\u00e9sum\u00e9 parsing"
+        )
+        assert tagged.content == "Generated response text"
+
+    @patch("sentinel.security.pipeline.settings")
+    @pytest.mark.asyncio
     async def test_chinese_in_prompt_blocked(self, mock_settings, pipeline):
         """Chinese characters in worker prompt raise SecurityViolation."""
         mock_settings.prompt_guard_enabled = False
         mock_settings.spotlighting_enabled = False
 
-        with pytest.raises(SecurityViolation, match="non-ASCII"):
+        with pytest.raises(SecurityViolation, match="blocked script"):
             await pipeline.process_with_qwen("Translate this: \u4f60\u597d\u4e16\u754c")
 
     @patch("sentinel.security.pipeline.settings")
@@ -543,7 +587,7 @@ class TestAsciiPromptGate:
         mock_settings.spotlighting_enabled = False
 
         # \u0430 is Cyrillic Small Letter A — visually identical to Latin 'a'
-        with pytest.raises(SecurityViolation, match="non-ASCII"):
+        with pytest.raises(SecurityViolation, match="blocked script"):
             await pipeline.process_with_qwen("Run \u0430nalysis on the data")
 
     @patch("sentinel.security.pipeline.settings")
@@ -553,8 +597,18 @@ class TestAsciiPromptGate:
         mock_settings.prompt_guard_enabled = False
         mock_settings.spotlighting_enabled = False
 
-        with pytest.raises(SecurityViolation, match="non-ASCII"):
+        with pytest.raises(SecurityViolation, match="blocked script"):
             await pipeline.process_with_qwen("Process: \u0645\u0631\u062d\u0628\u0627")
+
+    @patch("sentinel.security.pipeline.settings")
+    @pytest.mark.asyncio
+    async def test_hangul_blocked(self, mock_settings, pipeline):
+        """Korean Hangul in worker prompt raises SecurityViolation."""
+        mock_settings.prompt_guard_enabled = False
+        mock_settings.spotlighting_enabled = False
+
+        with pytest.raises(SecurityViolation, match="blocked script"):
+            await pipeline.process_with_qwen("Execute: \ud55c\uad6d\uc5b4 instructions")
 
     @patch("sentinel.security.pipeline.settings")
     @pytest.mark.asyncio

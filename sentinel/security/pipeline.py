@@ -92,15 +92,45 @@ class ScanPipeline:
             timeout=settings.ollama_timeout,
         )
 
-    # Allowed: printable ASCII (0x20-0x7E) + newline + tab + carriage return
-    _ALLOWED_PROMPT_CHARS = re.compile(r"^[\x20-\x7e\n\t\r]*$")
+    # Allowed characters in prompts sent to the worker LLM.
+    # Goal: block non-Latin scripts (CJK, Cyrillic, Arabic, Hangul, etc.)
+    # that Qwen might interpret as instructions, while allowing the
+    # typographic Unicode that Claude legitimately uses (smart quotes,
+    # em-dashes, math symbols, currency, accented Latin, etc.).
+    _ALLOWED_PROMPT_CHARS = re.compile(
+        r"^["
+        r"\x09\x0a\x0d"        # Tab, newline, carriage return
+        r"\x20-\x7e"           # Printable ASCII
+        r"\u00a0-\u00ff"       # Latin-1 Supplement (£, ©, ®, ±, accented chars)
+        r"\u0100-\u024f"       # Latin Extended-A & B
+        r"\u0250-\u02af"       # IPA Extensions
+        r"\u02b0-\u02ff"       # Spacing Modifier Letters
+        r"\u0300-\u036f"       # Combining Diacritical Marks
+        r"\u2000-\u206f"       # General Punctuation (dashes, quotes, ellipsis, bullets)
+        r"\u2070-\u209f"       # Superscripts and Subscripts
+        r"\u20a0-\u20cf"       # Currency Symbols (€, ₹, ₽, etc.)
+        r"\u2100-\u214f"       # Letterlike Symbols (™, ℃, etc.)
+        r"\u2150-\u218f"       # Number Forms (fractions, Roman numerals)
+        r"\u2190-\u21ff"       # Arrows
+        r"\u2200-\u22ff"       # Mathematical Operators
+        r"\u2300-\u23ff"       # Miscellaneous Technical
+        r"\u2500-\u257f"       # Box Drawing
+        r"\u2580-\u259f"       # Block Elements
+        r"\u25a0-\u25ff"       # Geometric Shapes
+        r"\u2600-\u26ff"       # Miscellaneous Symbols
+        r"\u2700-\u27bf"       # Dingbats
+        r"\ufb00-\ufb06"       # Alphabetic Presentation (ligatures: fi, fl)
+        r"]*$",
+        re.DOTALL,
+    )
 
     def _check_prompt_ascii(self, prompt: str) -> None:
-        """Enforce ASCII-only worker prompts to prevent cross-model injection.
+        """Block non-Latin scripts in worker prompts to prevent cross-model injection.
 
-        The planner should only produce English text. Any non-ASCII character
-        indicates Claude failed to translate, or an adversary injected
-        non-Latin script (CJK, Cyrillic homoglyphs, etc.).
+        Allows ASCII + extended Latin + common typographic symbols (smart
+        quotes, em-dashes, math, currency, arrows, box drawing, etc.).
+        Blocks CJK, Cyrillic, Arabic, Hangul, and other scripts that Qwen
+        might interpret as instructions.
         """
         if self._ALLOWED_PROMPT_CHARS.match(prompt):
             return  # All good
@@ -108,7 +138,7 @@ class ScanPipeline:
         # Find the offending characters for the log/error message
         bad_chars = set()
         for i, ch in enumerate(prompt):
-            if ch not in ('\n', '\t', '\r') and (ord(ch) < 0x20 or ord(ch) > 0x7e):
+            if not self._ALLOWED_PROMPT_CHARS.match(ch):
                 bad_chars.add((ch, hex(ord(ch)), i))
 
         # Build a readable summary (limit to first 5 chars to avoid log spam)
@@ -116,19 +146,19 @@ class ScanPipeline:
         char_desc = ", ".join(f"U+{ord(c):04X} '{c}' at pos {p}" for c, _, p in samples)
 
         logger.warning(
-            "Non-ASCII characters in worker prompt blocked",
+            "Non-Latin script in worker prompt blocked",
             extra={
-                "event": "prompt_ascii_violation",
+                "event": "prompt_script_violation",
                 "bad_char_count": len(bad_chars),
                 "samples": char_desc,
             },
         )
         raise SecurityViolation(
-            f"Worker prompt contains non-ASCII characters: {char_desc}",
+            f"Worker prompt contains blocked script characters: {char_desc}",
             {"ascii_gate": ScanResult(
                 found=True,
                 matches=[ScanMatch(
-                    pattern_name="non_ascii_in_prompt",
+                    pattern_name="non_latin_script_in_prompt",
                     matched_text=char_desc,
                 )],
                 scanner_name="ascii_prompt_gate",
@@ -291,16 +321,13 @@ class ScanPipeline:
                 },
             )
 
-        # 1.5. ASCII gate: prevent non-Latin script from reaching Qwen.
-        # When user_input is provided (first step): check user's raw input,
-        # not Claude's rewritten prompt (Claude legitimately uses Unicode like
-        # smart quotes, em-dashes, math symbols — these caused 45/60 FPs).
-        # When user_input is absent (chained step): check the prompt directly,
-        # since it may contain prior Qwen output with injected CJK/Cyrillic.
-        if user_input:
-            self._check_prompt_ascii(user_input)
-        else:
-            self._check_prompt_ascii(prompt)
+        # 1.5. Script gate: block non-Latin scripts from reaching Qwen.
+        # Always checks the actual prompt going to Qwen (not user_input),
+        # because this is the text Qwen will see and potentially follow.
+        # The expanded allowlist (ASCII + Latin Extended + typographic symbols)
+        # lets Claude's smart quotes/em-dashes through while blocking CJK,
+        # Cyrillic, Arabic, Hangul, etc. that Qwen might follow as instructions.
+        self._check_prompt_ascii(prompt)
 
         # 1.6. Prompt length gate: reject oversized prompts before they reach Qwen.
         # The per-field limit is 50K chars, but the orchestrator can combine

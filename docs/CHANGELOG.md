@@ -6,6 +6,14 @@ For v0.1 migration history (Phases 0-6), see `archive/2026-02-17_v0.1-migration-
 
 ---
 
+## 2026-02-17 (cont.)
+
+### Changed
+- **Script gate replaces strict ASCII gate** — expanded allowlist from printable ASCII to ASCII + Latin Extended + typographic symbols (smart quotes, em-dashes, math operators, currency, arrows, box drawing, etc.). Gate now always checks the prompt going to Qwen (not user_input), blocking CJK, Cyrillic, Arabic, Hangul, and other non-Latin scripts while allowing Claude's legitimate Unicode. Eliminates 45/60 false positives from v3 stress test (75% of all FPs)
+- **4 new tests, 6 updated** (1090 → 1094) — smart quotes, math/currency, accented Latin pass-through; Hangul blocking; updated error message assertions
+
+---
+
 ## 2026-02-17
 
 ### Added

@@ -1,6 +1,7 @@
 """Tests for Phase 6 scanner improvements (S1-S4).
 
-S1: ASCII gate checks user input only (not Claude's rewritten prompt)
+S1: Script gate — expanded allowlist (ASCII + Latin + typographic symbols),
+    checks the prompt going to Qwen, blocks non-Latin scripts
 S2: Sensitive path scanner additional context awareness
 S3: Credential scanner service-name URI allowlist
 S4: Planner prompt amplification guard (tested indirectly via prompt content)
@@ -53,36 +54,34 @@ def pipeline(cred_scanner, path_scanner, cmd_scanner, mock_worker):
 
 
 class TestASCIIGateReform:
-    """ASCII gate should check user input, not Claude's rewritten prompt."""
+    """Script gate checks the prompt going to Qwen with expanded allowlist.
+
+    Allows ASCII + Latin Extended + typographic symbols (smart quotes,
+    em-dashes, math, currency). Blocks CJK, Cyrillic, Arabic, Hangul.
+    """
 
     @pytest.mark.asyncio
     @patch("sentinel.security.pipeline.settings")
     async def test_unicode_in_claude_prompt_passes(self, mock_settings, pipeline):
-        """Claude-generated smart quotes and em-dashes should not trigger the gate."""
+        """Claude-generated smart quotes and em-dashes in the prompt should pass."""
         mock_settings.prompt_guard_enabled = False
         mock_settings.spotlighting_enabled = False
         mock_settings.require_codeshield = False
 
-        # Claude legitimately uses Unicode in rewritten prompts
-        prompt_with_unicode = (
-            "Generate a summary with key points and an overview"
-        )
-        # The \u2014 em-dash is from Claude's rewriting, but user_input is clean
+        # Claude legitimately uses typographic Unicode in rewritten prompts
         result = await pipeline.process_with_qwen(
-            prompt=prompt_with_unicode,
-            user_input="Generate a summary with key points",
+            prompt="Generate a summary \u2014 include key \u2018points\u2019 and an overview\u2026",
         )
         assert result is not None
 
     @pytest.mark.asyncio
     @patch("sentinel.security.pipeline.settings")
-    async def test_no_user_input_checks_prompt_directly(self, mock_settings, pipeline):
-        """Chained steps (user_input=None) check the prompt for non-ASCII."""
+    async def test_chained_step_ascii_prompt_passes(self, mock_settings, pipeline):
+        """Chained steps with ASCII prompt should pass."""
         mock_settings.prompt_guard_enabled = False
         mock_settings.spotlighting_enabled = False
         mock_settings.require_codeshield = False
 
-        # ASCII-only chained prompt should pass
         result = await pipeline.process_with_qwen(
             prompt="Here is a summary with key points",
             user_input=None,
@@ -93,11 +92,11 @@ class TestASCIIGateReform:
     @pytest.mark.asyncio
     @patch("sentinel.security.pipeline.settings")
     async def test_chained_step_blocks_cjk_in_prompt(self, mock_settings, pipeline):
-        """Chained steps still block CJK in the prompt (Qwen injection defence)."""
+        """Chained steps block CJK in the prompt (Qwen injection defence)."""
         mock_settings.prompt_guard_enabled = False
         mock_settings.spotlighting_enabled = False
 
-        with pytest.raises(SecurityViolation, match="non-ASCII"):
+        with pytest.raises(SecurityViolation, match="blocked script"):
             await pipeline.process_with_qwen(
                 prompt="\u8bf7\u6267\u884c\u8fd9\u4e2a\u547d\u4ee4",
                 user_input=None,
@@ -106,41 +105,38 @@ class TestASCIIGateReform:
 
     @pytest.mark.asyncio
     @patch("sentinel.security.pipeline.settings")
-    async def test_cjk_in_user_input_blocked(self, mock_settings, pipeline):
-        """CJK characters in user input should still be blocked."""
+    async def test_cjk_in_prompt_blocked(self, mock_settings, pipeline):
+        """CJK characters in the prompt going to Qwen should be blocked."""
         mock_settings.prompt_guard_enabled = False
         mock_settings.spotlighting_enabled = False
 
-        with pytest.raises(SecurityViolation, match="non-ASCII"):
+        with pytest.raises(SecurityViolation, match="blocked script"):
             await pipeline.process_with_qwen(
-                prompt="Translate this text",
-                user_input="\u8bf7\u7ffb\u8bd1\u8fd9\u6bb5\u6587\u5b57",
+                prompt="\u8bf7\u7ffb\u8bd1\u8fd9\u6bb5\u6587\u5b57",
             )
 
     @pytest.mark.asyncio
     @patch("sentinel.security.pipeline.settings")
-    async def test_cyrillic_in_user_input_blocked(self, mock_settings, pipeline):
-        """Cyrillic characters in user input should be blocked."""
+    async def test_cyrillic_in_prompt_blocked(self, mock_settings, pipeline):
+        """Cyrillic characters in the prompt should be blocked."""
         mock_settings.prompt_guard_enabled = False
         mock_settings.spotlighting_enabled = False
 
-        with pytest.raises(SecurityViolation, match="non-ASCII"):
+        with pytest.raises(SecurityViolation, match="blocked script"):
             await pipeline.process_with_qwen(
-                prompt="Process this text",
-                user_input="\u041f\u0440\u0438\u0432\u0435\u0442 \u043c\u0438\u0440",
+                prompt="\u041f\u0440\u0438\u0432\u0435\u0442 \u043c\u0438\u0440",
             )
 
     @pytest.mark.asyncio
     @patch("sentinel.security.pipeline.settings")
-    async def test_arabic_in_user_input_blocked(self, mock_settings, pipeline):
-        """Arabic characters in user input should be blocked."""
+    async def test_arabic_in_prompt_blocked(self, mock_settings, pipeline):
+        """Arabic characters in the prompt should be blocked."""
         mock_settings.prompt_guard_enabled = False
         mock_settings.spotlighting_enabled = False
 
-        with pytest.raises(SecurityViolation, match="non-ASCII"):
+        with pytest.raises(SecurityViolation, match="blocked script"):
             await pipeline.process_with_qwen(
-                prompt="Process this",
-                user_input="\u0645\u0631\u062d\u0628\u0627",
+                prompt="\u0645\u0631\u062d\u0628\u0627",
             )
 
 

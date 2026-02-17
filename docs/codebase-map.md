@@ -89,7 +89,7 @@ container/             # Containerfile for builds
 
 | Module | Lines | Purpose |
 |--------|-------|---------|
-| `pipeline.py` | ~449 | Scan orchestration: input scan → ASCII gate → length gate → spotlighting → Qwen → output scan → echo scan |
+| `pipeline.py` | ~449 | Scan orchestration: input scan → script gate → length gate → spotlighting → Qwen → output scan → echo scan |
 | `scanner.py` | ~512 | Regex scanners: CredentialScanner, SensitivePathScanner, CommandPatternScanner, VulnerabilityEchoScanner, EncodingNormalizationScanner |
 | `policy_engine.py` | ~288 | YAML-driven deterministic rules: file paths, commands, traversal detection, injection patterns |
 | `prompt_guard.py` | ~117 | Prompt Guard 2 (86M BERT) — injection/jailbreak detection, 2000-char chunking |
@@ -224,7 +224,7 @@ WASM tool sandbox with Wasmtime. Executes tools in isolated WASM instances with 
 | `test_policy_engine.py` | ~60 | security/policy_engine (paths, commands, traversal, globs) |
 | `test_scanner.py` | ~65 | security/scanner (credentials inc. 10 new patterns, paths, commands, echo) |
 | `test_encoding_scanner.py` | ~25 | security/scanner (base64, hex, URL, ROT13, HTML, char-split) |
-| `test_pipeline.py` | ~35 | security/pipeline (input/output scan, SecurityViolation, ASCII gate, empty response retry) |
+| `test_pipeline.py` | ~47 | security/pipeline (input/output scan, SecurityViolation, script gate, empty response retry) |
 | `test_spotlighting.py` | ~10 | security/spotlighting (apply/remove markers) |
 | `test_prompt_guard.py` | ~15 | security/prompt_guard (init, chunking, classification) |
 | `test_code_extractor.py` | ~39 | security/code_extractor (block extraction, language detection, emoji stripping) |
@@ -313,7 +313,7 @@ User → HTTPS (uvicorn TLS) or HTTP (redirect.HTTPSRedirectApp → 301)
          → for each step:
              llm_task → orchestrator._execute_llm_task()
                       → security/pipeline.process_with_qwen()
-                        → security/pipeline._check_prompt_ascii()
+                        → security/pipeline._check_prompt_ascii()  # script gate
                         → security/spotlighting.apply_datamarking()
                         → worker/ollama.generate() → sentinel-qwen:11434
                         → security/provenance.create_tagged_data() [UNTRUSTED, SQLite]

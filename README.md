@@ -256,10 +256,11 @@ cargo test --manifest-path sidecar/Cargo.toml
 
 ## Current Status
 
-**v0.1.0-alpha** — Phases 0–6 delivered, 2-container stack deployed and validated.
+**v0.2.0-alpha** — Assessment recommendations implemented, script gate reform, benchmark-ready.
 
-- 1,006 Python tests + 41 Rust tests passing (1,047 total)
+- 1,094 Python tests + 41 Rust tests passing (1,135 total)
 - v3 stress test benchmarked (1,136 prompts, 0.12% real risk rate)
+- Script gate expanded allowlist eliminates 75% of false positives
 - Infrastructure hardened (TLS, CSP, CSRF, resource limits, read-only FS, pinned images, health checks)
 - Persistent memory with RRF hybrid search (FTS5 + sqlite-vec)
 - Multi-channel access: WebSocket, SSE, MCP server, Signal (code ready)

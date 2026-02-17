@@ -304,7 +304,7 @@ class TestHostileQwenOutputBlocked:
         # orchestrator naively used it as the next prompt, the ASCII gate
         # should block it before it reaches Qwen.
         chinese_output = ATTACKS["chinese_injection_in_output"]
-        with pytest.raises(SecurityViolation, match="non-ASCII"):
+        with pytest.raises(SecurityViolation, match="blocked script"):
             await pipeline.process_with_qwen(chinese_output, skip_input_scan=True)
 
     @staticmethod
