@@ -1,0 +1,4 @@
+name = "shell_exec"
+description = "Execute a shell command and return output"
+wasm = "shell_exec.wasm"
+capabilities = ["shell_exec"]

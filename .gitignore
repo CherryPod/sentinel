@@ -7,6 +7,7 @@ secrets/
 
 # Rust build artifacts
 sidecar/target/
+sidecar/wasm/*.wasm
 
 # Python
 __pycache__/

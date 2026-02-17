@@ -106,18 +106,19 @@ Progress checklist for the evolution plan. Design rationale lives in `evolution-
 
 ---
 
-## Phase 4: WASM Tool Sandbox (parallel with 2-3)
+## Phase 4: WASM Tool Sandbox — COMPLETE (2026-02-16)
 
 > Goal: Rust sidecar with Wasmtime for sandboxed tool execution.
 
-- [ ] **4.1 — Wasmtime integration** — fresh instance per exec, fuel metering, memory cap, epoch timeout
-- [ ] **4.2 — Capability model** — ReadFile, WriteFile, HttpRequest, UseCredential, InvokeTool
-- [ ] **4.3 — Credential injection + leak detection** — host function injection, Aho-Corasick output scan
-- [ ] **4.4 — HTTP allowlist + SSRF protection** — URL validation, private IP rejection, DNS rebinding defence
-- [ ] **4.5 — Python client** — SidecarClient over Unix socket with crash recovery
-- [ ] **4.6 — V1 tool set** — file_read, file_write, shell_exec, http_fetch, memory_search
+- [x] **4.1 — Wasmtime integration** — fresh Store per exec, fuel metering (1B budget), epoch timeout (500ms ticks), WASI P1
+- [x] **4.2 — Capability model** — ReadFile, WriteFile, HttpRequest, UseCredential, InvokeTool, ShellExec — deny-by-default
+- [x] **4.3 — Credential injection + leak detection** — per-execution credential map, Aho-Corasick output scanner (22 patterns), redaction
+- [x] **4.4 — HTTP allowlist + SSRF protection** — URL validation, private IP rejection (v4+v6), DNS rebinding defence, hostname glob matching
+- [x] **4.5 — Python client** — SidecarClient over Unix socket, auto-start, crash recovery (retry once), timeout handling
+- [x] **4.6 — V1 tool set** — file_read (197K), file_write (199K), shell_exec (198K), http_fetch (227K) as wasm32-wasip1 crates
+  - memory_search stays Python-side (queries SQLite in Python process, moving to sidecar would require IPC back)
 
-**Verify:** capability enforcement works, credentials injected/wiped, leak detector catches patterns, fuel/memory limits stop abuse
+**Verified:** 41 Rust tests (33 unit + 8 integration), 29 Python tests (855 total, all pass). Sidecar binary 26MB, 4 WASM tools compiled. Host function shared-buffer ABI, TOML-based tool registry, configurable via SENTINEL_SIDECAR_* env vars. Opt-in via `sidecar_enabled=true`.
 
 ---
 

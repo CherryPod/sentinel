@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import shlex
@@ -8,7 +9,20 @@ from sentinel.core.models import DataSource, PolicyResult, TaggedData, TrustLeve
 from sentinel.security.policy_engine import PolicyEngine
 from sentinel.security.provenance import create_tagged_data, get_file_writer, get_tagged_data, record_file_write
 
+from sentinel.tools.sidecar import SidecarClient, SidecarResponse
+
 logger = logging.getLogger("sentinel.audit")
+
+# Tools that can be dispatched to the WASM sidecar when enabled
+WASM_TOOLS = frozenset({"file_read", "file_write", "shell_exec", "http_fetch"})
+
+# Capability mapping: tool name → required sidecar capabilities
+_WASM_TOOL_CAPABILITIES = {
+    "file_read": ["read_file"],
+    "file_write": ["write_file"],
+    "shell_exec": ["shell_exec"],
+    "http_fetch": ["http_request"],
+}
 
 # Podman flags that must never be passed, even if the tool interface is extended
 _DANGEROUS_PODMAN_FLAG_NAMES = frozenset({
@@ -29,10 +43,16 @@ class ToolBlockedError(ToolError):
 
 
 class ToolExecutor:
-    """Executes tool actions with policy validation before every operation."""
+    """Executes tool actions with policy validation before every operation.
 
-    def __init__(self, policy_engine: PolicyEngine):
+    When a SidecarClient is provided and a tool is in WASM_TOOLS, the tool
+    is dispatched to the Rust WASM sidecar for sandboxed execution. Non-WASM
+    tools (podman_*, mkdir) always use the Python handlers.
+    """
+
+    def __init__(self, policy_engine: PolicyEngine, sidecar: SidecarClient | None = None):
         self._engine = policy_engine
+        self._sidecar = sidecar
 
     def get_tool_descriptions(self) -> list[dict]:
         return [
@@ -93,7 +113,10 @@ class ToolExecutor:
                 raise ToolBlockedError(f"Dangerous podman flag blocked: {arg}")
 
     async def execute(self, tool_name: str, args: dict) -> TaggedData:
-        """Execute a tool by name with policy checks."""
+        """Execute a tool by name with policy checks.
+
+        WASM-capable tools are dispatched to the sidecar when available.
+        """
         logger.info(
             "Tool execution requested",
             extra={
@@ -102,6 +125,10 @@ class ToolExecutor:
                 "args_keys": list(args.keys()),
             },
         )
+
+        # Dispatch to sidecar for WASM-capable tools
+        if self._sidecar is not None and tool_name in WASM_TOOLS:
+            return await self._execute_via_sidecar(tool_name, args)
 
         handler = {
             "file_write": self._file_write,
@@ -133,6 +160,64 @@ class ToolExecutor:
             },
         )
         return result
+
+    async def _execute_via_sidecar(self, tool_name: str, args: dict) -> TaggedData:
+        """Dispatch a tool to the WASM sidecar for sandboxed execution."""
+        capabilities = _WASM_TOOL_CAPABILITIES.get(tool_name, [])
+
+        t0 = time.monotonic()
+        response = await self._sidecar.execute(
+            tool_name=tool_name,
+            args=args,
+            capabilities=capabilities,
+        )
+        elapsed = time.monotonic() - t0
+
+        if not response.success:
+            logger.warning(
+                "Sidecar tool execution failed",
+                extra={
+                    "event": "sidecar_tool_failed",
+                    "tool": tool_name,
+                    "error": response.result,
+                    "elapsed_s": round(elapsed, 3),
+                },
+            )
+            raise ToolError(f"sidecar: {response.result}")
+
+        if response.leaked:
+            logger.warning(
+                "Sidecar detected credential leak in output",
+                extra={
+                    "event": "sidecar_leak_detected",
+                    "tool": tool_name,
+                },
+            )
+
+        # Convert SidecarResponse to TaggedData
+        content = response.result
+        if response.data is not None:
+            content = json.dumps(response.data)
+
+        tagged = create_tagged_data(
+            content=content,
+            source=DataSource.TOOL,
+            trust_level=TrustLevel.TRUSTED,
+            originated_from=f"sidecar:{tool_name}",
+        )
+
+        logger.info(
+            "Sidecar tool execution complete",
+            extra={
+                "event": "sidecar_tool_complete",
+                "tool": tool_name,
+                "data_id": tagged.id,
+                "elapsed_s": round(elapsed, 3),
+                "fuel_consumed": response.fuel_consumed,
+                "leaked": response.leaked,
+            },
+        )
+        return tagged
 
     async def _file_write(self, args: dict) -> TaggedData:
         path = args.get("path", "")

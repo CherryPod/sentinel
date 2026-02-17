@@ -152,16 +152,35 @@ container/             # Containerfile for builds
 
 ## Rust Sidecar (`sidecar/`)
 
-Skeleton for Phase 4 WASM tool sandbox. Compiles and accepts JSON over Unix socket.
+WASM tool sandbox with Wasmtime. Executes tools in isolated WASM instances with deny-by-default capabilities, fuel metering, epoch timeouts, and Aho-Corasick leak detection.
 
 | File | Purpose |
 |------|---------|
-| `src/main.rs` | Unix socket listener, connection handler |
-| `src/protocol.rs` | JSON request/response types (serde) |
-| `src/sandbox.rs` | Wasmtime engine stub |
-| `src/registry.rs` | Tool metadata stub |
-| `src/capabilities.rs` | Capability model stub (ReadFile, WriteFile, HttpRequest, UseCredential, InvokeTool) |
-| `src/config.rs` | Resource limits (memory, fuel, timeout) |
+| `src/main.rs` | Unix socket listener, config loading, graceful shutdown |
+| `src/protocol.rs` | JSON request/response types (with credentials, timeout, fuel_consumed, leaked fields) |
+| `src/sandbox.rs` | Wasmtime engine: fresh Store per execution, fuel metering, epoch timeout, spawn_blocking |
+| `src/host_functions.rs` | `host_call` dispatcher: read_file, write_file, shell_exec, http_fetch, get_credential |
+| `src/leak_detector.rs` | Aho-Corasick credential scanner (22 patterns + injected values), redaction |
+| `src/http_client.rs` | URL validation, SSRF protection (private IP rejection, hostname allowlist), ureq client |
+| `src/registry.rs` | TOML-based tool metadata registry (wasm_path, required_capabilities, http_allowlist) |
+| `src/capabilities.rs` | Capability enum (6 variants) + CapabilitySet with from_strings/requires_all |
+| `src/config.rs` | Resource limits + env var config (SENTINEL_SIDECAR_* prefix) |
+| `tools/common/` | Guest-side library: IO_BUFFER (1MB), host_call wrapper, Op enum, stdin/stdout JSON helpers |
+| `tools/file-read/` | WASM tool: reads file via Op::ReadFile host function |
+| `tools/file-write/` | WASM tool: writes file via Op::WriteFile host function |
+| `tools/shell-exec/` | WASM tool: runs command via Op::ShellExec host function |
+| `tools/http-fetch/` | WASM tool: HTTP fetch via Op::HttpFetch + optional Op::GetCredential |
+| `wasm/` | Compiled .wasm outputs + tool.toml metadata files (gitignored except .toml) |
+| `tests/integration.rs` | Protocol serialization, registry TOML parsing, config defaults |
+
+**Key constants:**
+- `leak_detector.rs` — 22 built-in patterns (AWS, GitHub, Slack, OpenAI, Stripe, PEM, JWT, generic)
+- `config.rs` — defaults: 64 MiB memory, 1B fuel, 30s timeout, /workspace allowed paths
+- `sandbox.rs` — epoch ticker at 500ms intervals for timeout enforcement
+
+**Python integration:**
+- `sentinel/tools/sidecar.py` — SidecarClient (Unix socket, auto-start, crash recovery)
+- `sentinel/tools/executor.py` — WASM_TOOLS set dispatches to sidecar when configured
 
 ---
 
@@ -204,9 +223,10 @@ Skeleton for Phase 4 WASM tool sandbox. Compiles and accepts JSON over Unix sock
 | `test_sse.py` | 10 | SSEWriter stream, event delivery, endpoint tests |
 | `test_mcp.py` | 16 | MCP tools, trust tiers, search/store/run_task/health |
 | `test_signal_channel.py` | 17 | Signal subprocess, backoff, JSON-RPC protocol, crash recovery |
+| `test_sidecar_client.py` | 29 | SidecarClient mock socket, ToolExecutor WASM dispatch, config |
 | `conftest.py` | — | Fixtures: engine, cred_scanner, path_scanner, cmd_scanner, encoding_scanner |
 
-**Total: 826 tests passing** (`pytest tests/` from project root)
+**Total: 855 Python tests + 41 Rust tests passing** (`pytest tests/` + `cargo test` from project root)
 
 ---
 

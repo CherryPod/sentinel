@@ -89,5 +89,12 @@ class Settings(BaseSettings):
     # Request size limit (Tier 4, code review #13) — 1MB
     max_request_bytes: int = 1_048_576
 
+    # WASM sidecar (Phase 4) — opt-in, disabled by default
+    sidecar_enabled: bool = False
+    sidecar_socket: str = "/tmp/sentinel-sidecar.sock"
+    sidecar_binary: str = "./sidecar/target/release/sentinel-sidecar"
+    sidecar_timeout: int = 30
+    sidecar_tool_dir: str = "./sidecar/wasm"
+
 
 settings = Settings()
