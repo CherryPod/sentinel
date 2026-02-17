@@ -1,0 +1,16 @@
+rules:
+- id: command-injection-runtime
+  patterns:
+      - pattern: Runtime.getRuntime().exec($X)
+      - pattern-not: Runtime.getRuntime().exec("...")
+  message: >-
+    Command execution via Runtime.exec() with non-literal argument.
+    Use ProcessBuilder with explicit argument arrays instead.
+  metadata:
+    cwe:
+    - 'CWE-78: Improper Neutralization of Special Elements used in an OS Command (OS Command Injection)'
+    cwe_id: CWE-78
+    prescan_regex: Runtime\.getRuntime\(\)\.exec
+  severity: WARNING
+  languages:
+  - java

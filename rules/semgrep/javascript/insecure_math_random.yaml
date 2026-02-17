@@ -1,0 +1,15 @@
+rules:
+- id: insecure-math-random
+  pattern: Math.random()
+  message: >-
+    Math.random() is not cryptographically secure. For security-sensitive
+    contexts, use crypto.getRandomValues() or crypto.randomUUID().
+  metadata:
+    cwe:
+    - 'CWE-338: Use of Cryptographically Weak Pseudo-Random Number Generator (PRNG)'
+    cwe_id: CWE-338
+    prescan_regex: Math\.random
+  severity: WARNING
+  languages:
+  - javascript
+  - typescript

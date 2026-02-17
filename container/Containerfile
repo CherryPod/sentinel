@@ -1,0 +1,70 @@
+FROM python@sha256:9e01bf1ae5db7649a236da7be1e94ffbbbdd7a93f867dd0d8d5720d9e1f89fab
+
+WORKDIR /app
+
+# Build deps (torch/transformers native extensions) + worker build tools
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc g++ openssl wget make rustc \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install signal-cli (A3) — GraalVM native binary (no JRE needed)
+# Data dir (keys + trust store) lives on a bind mount at /app/signal-data.
+ARG SIGNAL_CLI_VERSION=0.13.24
+RUN wget -q "https://github.com/AsamK/signal-cli/releases/download/v${SIGNAL_CLI_VERSION}/signal-cli-${SIGNAL_CLI_VERSION}-Linux-native.tar.gz" \
+    -O /tmp/signal-cli.tar.gz \
+    && tar xf /tmp/signal-cli.tar.gz -C /usr/local/bin \
+    && chmod +x /usr/local/bin/signal-cli \
+    && rm /tmp/signal-cli.tar.gz
+
+# PostgreSQL 17 server (in-container, socket-only) + pgvector extension
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    postgresql-17 \
+    postgresql-server-dev-17 \
+    git \
+    && cd /tmp \
+    && git clone --branch v0.8.0 --depth 1 https://github.com/pgvector/pgvector.git \
+    && cd pgvector && make && make install \
+    && cd / && rm -rf /tmp/pgvector \
+    && apt-get purge -y postgresql-server-dev-17 git && apt-get autoremove -y \
+    && rm -rf /var/lib/apt/lists/*
+
+# Initialise PostgreSQL data directory (owned by postgres user)
+# Actual initdb runs in entrypoint on first boot (needs writable /data volume)
+RUN mkdir -p /data/pgdata && chown -R postgres:postgres /data/pgdata
+
+COPY pyproject.toml .
+
+# Install torch CPU-only first (separate index), then the rest
+RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu \
+    && pip install --no-cache-dir ".[dev,mcp,worker]"
+
+# Pre-download Prompt Guard model at build time (uses HF token via build secret)
+RUN --mount=type=secret,id=hf_token \
+    HF_TOKEN=$(cat /run/secrets/hf_token) \
+    python -c "from transformers import pipeline; pipeline('text-classification', model='meta-llama/Llama-Prompt-Guard-2-86M')"
+
+COPY sentinel/ ./sentinel/
+COPY rules/ ./rules/
+COPY tests/ ./tests/
+COPY ui/ ./ui/
+
+# WASM sidecar binary + tool modules (pre-built on host, Phase 4)
+COPY sidecar/target/release/sentinel-sidecar ./sidecar/sentinel-sidecar
+RUN chmod +x ./sidecar/sentinel-sidecar
+COPY sidecar/wasm/ ./wasm/
+
+# Radicale CalDAV server config + container entrypoint
+COPY container/radicale.conf /app/radicale.conf
+COPY container/entrypoint.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh
+
+# Generate self-signed TLS cert at build time (swap for real cert in production)
+RUN mkdir -p /data /app/tls /logs /workspace && \
+    openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
+    -keyout /app/tls/sentinel.key \
+    -out /app/tls/sentinel.crt \
+    -subj "/CN=sentinel/O=Sentinel"
+
+EXPOSE 8443 8080
+
+CMD ["/app/entrypoint.sh"]

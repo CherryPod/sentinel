@@ -1,0 +1,18 @@
+rules:
+- id: preg-replace-eval
+  pattern: preg_replace($PAT, ...)
+  metavariable-regex:
+      metavariable: '$PAT'
+      regex: '.*\/e[^"]*"'
+  message: >-
+    preg_replace with /e modifier executes the replacement as PHP code.
+    The /e modifier is deprecated since PHP 5.5 and removed in PHP 7.0.
+    Use preg_replace_callback() instead.
+  metadata:
+    cwe:
+    - 'CWE-94: Improper Control of Generation of Code (Code Injection)'
+    cwe_id: CWE-94
+    prescan_regex: preg_replace
+  severity: WARNING
+  languages:
+  - php

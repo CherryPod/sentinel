@@ -1,0 +1,15 @@
+rules:
+- id: insecure-tls-skip-verify
+  pattern: |
+    InsecureSkipVerify: true
+  message: >-
+    TLS certificate verification disabled. This allows man-in-the-middle
+    attacks. Only use in development/testing.
+  metadata:
+    cwe:
+    - 'CWE-295: Improper Certificate Validation'
+    cwe_id: CWE-295
+    prescan_regex: InsecureSkipVerify
+  severity: WARNING
+  languages:
+  - go

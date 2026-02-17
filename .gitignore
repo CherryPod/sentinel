@@ -1,0 +1,78 @@
+# Secrets — never commit
+secrets/
+*.key
+*.pem
+*.secret
+*.env
+
+# Rust build artifacts
+sidecar/target/
+sidecar/wasm/*.wasm
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+.venv/
+venv/
+
+# Signal-cli registration data (keys, account DB — bind-mounted into container)
+data/
+
+# Ollama data (pulled into container volume)
+ollama-data/
+
+# Logs (stored in container volume)
+logs/
+
+# Claude Code
+.claude/
+
+# Serena
+.serena/
+
+# Git worktrees
+.worktrees/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+sentinel.db
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+
+# Benchmark artifacts (results, logs, lock files)
+benchmarks/*.jsonl
+benchmarks/*.log
+benchmarks/.compose.lock
+benchmarks/.pipeline_start_*
+benchmarks/tainted_run14/
+
+# Test results & screenshots (untracked local artifacts)
+test-results/
+screenshots/
+
+# Compose backup
+podman-compose.yaml.bak
+
+# Claude API usage analysis
+docs/archive/claude_api_tokens*.csv
+
+# Tainted run artifacts
+docs/assessments/tainted_run14/
+
+# GitHub deploy staging area
+.github-deploy/

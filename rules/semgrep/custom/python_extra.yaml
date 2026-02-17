@@ -1,0 +1,15 @@
+rules:
+  - id: dangerous-dynamic-import
+    patterns:
+      - pattern: __import__($MOD)
+      - metavariable-regex:
+          metavariable: $MOD
+          regex: "['\"]?(os|subprocess|shutil|commands|pty)['\"]?"
+    message: >-
+      Dynamic import of dangerous module via __import__(). This can be used
+      to bypass static analysis and execute arbitrary system commands.
+    languages: [python]
+    severity: WARNING
+    metadata:
+      cwe:
+        - "CWE-78: Improper Neutralization of Special Elements used in an OS Command ('OS Command Injection')"

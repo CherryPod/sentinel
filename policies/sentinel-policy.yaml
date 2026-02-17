@@ -1,0 +1,235 @@
+file_access:
+  write_allowed:
+    - /workspace/**
+  read_allowed:
+    - /workspace/**
+  blocked:
+    - /etc/**
+    - /root/**
+    - /home/**/.ssh/**
+    - /home/**/.gnupg/**
+    - /var/run/docker.sock
+    - /run/podman/**
+    - "**/*.env"
+    - "**/*.key"
+    - "**/*.pem"
+    - "**/*.secret"
+    - "**/wallet.dat"
+    - "**/.bitcoin/**"
+
+commands:
+  allowed:
+    - podman build
+    - podman run
+    - podman stop
+    - podman ps
+    - podman images
+    - podman logs
+    - ls
+    - cat
+    - mkdir
+    - cp
+    - head
+    - tail
+    - wc
+    - grep
+    - find
+    # File operations
+    - mv
+    - rm
+    - touch
+    - chmod
+    - chown
+    - ln
+    # Text processing
+    - echo
+    - sort
+    - uniq
+    - diff
+    - sed
+    - awk
+    - tee
+    - cut
+    - tr
+    - xargs
+    # Development tools (Python only — no Rust/Node toolchains in container)
+    - python3
+    - python
+    - pip3
+    - pip
+    - make
+    - gcc
+    - g++
+    # Archives
+    - tar
+    - gzip
+    - gunzip
+    - zip
+    - unzip
+    # Shells (direct invocation only — "bash -c", "| bash", "| sh" blocked by blocked_patterns)
+    - bash
+    - sh
+    # Navigation & path utilities
+    # NOTE: cd and test are shell builtins — only work via sandbox path (TL2+)
+    - cd
+    - test
+    - basename
+    - dirname
+    - realpath
+    # System info (read-only)
+    - env
+    - which
+    - whoami
+    - date
+    - pwd
+    - file
+    - stat
+  blocked_patterns:
+    - "rm -rf"
+    - "rm -r /"
+    - curl
+    - wget
+    - ssh
+    - scp
+    - rsync
+    - nc
+    - ncat
+    - netcat
+    - "python -c"
+    - "python3 -c"
+    - "bash -c"
+    - "sh -c"
+    - eval
+    - exec
+    - "| sh"
+    - "| bash"
+    - "| python"
+    - "> /dev/"
+    - "dd if="
+    - mount
+    - umount
+    - mkfs
+    - fdisk
+    - iptables
+
+  path_constrained:
+    - cat
+    - find
+    - cp
+    - mkdir
+    - head
+    - tail
+    - grep
+    - ls
+    - wc
+    - mv
+    - rm
+    - touch
+    - chmod
+    - chown
+    - ln
+    - sed
+    - awk
+    - tee
+
+network:
+  qwen_outbound: none
+  controller_outbound_allowed:
+    - api.anthropic.com:443
+  controller_internal_allowed:
+    - sentinel-qwen:11434
+  http_tool_allowed_domains:
+    - "api.search.brave.com"
+    # R-001: Narrowed from *.googleapis.com — least-privilege for Gmail, Calendar, OAuth
+    - "www.googleapis.com"
+    - "oauth2.googleapis.com"
+
+human_approval_required:
+  - podman run with -p flag
+  - podman run with -v flag
+  - any file write outside /workspace
+  - any command not in the allowed list
+  - any action using data tagged as untrusted from web sources
+
+approval_mode: full
+
+credential_patterns:
+  - name: aws_access_key
+    pattern: 'AKIA[0-9A-Z]{16}'
+  - name: api_key
+    pattern: 'sk-[a-zA-Z0-9_-]{20,}'
+  - name: slack_token
+    pattern: 'xox[bpras]-[a-zA-Z0-9-]+'
+  - name: github_pat
+    pattern: 'ghp_[a-zA-Z0-9]{36}'
+  - name: gitlab_pat
+    pattern: 'glpat-[a-zA-Z0-9_-]{20}'
+  - name: private_key
+    pattern: '-----BEGIN .* KEY-----'
+  - name: certificate
+    pattern: '-----BEGIN CERTIFICATE-----'
+  - name: hex_secret_64
+    pattern: '(?i)\b(?:key|secret|token|password|api_key|apikey|auth)[=:\s]+[0-9a-f]{64}\b'
+  - name: jwt_token
+    pattern: 'eyJ[a-zA-Z0-9_-]*\.eyJ'
+  - name: mongodb_uri
+    pattern: 'mongodb(\+srv)?://[^\s]+'
+  - name: postgres_uri
+    pattern: 'postgres(ql)?://[^\s]+'
+  - name: redis_uri
+    pattern: 'redis://[^\s]+'
+  - name: npm_access_token
+    pattern: 'npm_[a-zA-Z0-9]{36}'
+  - name: pypi_upload_token
+    pattern: 'pypi-AgEIcHlwaS5vcmc[a-zA-Z0-9_-]{50,}'
+  - name: huggingface_token
+    pattern: 'hf_[a-zA-Z0-9]{34,}'
+  - name: google_api_key
+    pattern: 'AIza[A-Za-z0-9_-]{35}'
+  - name: stripe_secret_key
+    pattern: '(?:sk|rk)_(?:live|test|prod)_[a-zA-Z0-9]{10,99}'
+  - name: sendgrid_api_key
+    pattern: 'SG\.[a-zA-Z0-9=_.-]{66}'
+  - name: digitalocean_pat
+    pattern: 'dop_v1_[a-f0-9]{64}'
+  - name: vercel_token
+    pattern: '(?:vcp|vci|vca|vcr|vck)_[a-zA-Z0-9]{24,}'
+  - name: telegram_bot_token
+    pattern: '\d{5,16}:AA[a-zA-Z0-9_-]{32,33}'
+  - name: grafana_service_token
+    pattern: 'glsa_[A-Za-z0-9]{32}_[A-Fa-f0-9]{8}'
+  # --- Generic env-var secret assignments ---
+  # Catches PRIVATE_KEY=<value>, DB_PASSWORD=<value>, etc.
+  # Placeholder values suppressed in scanner code to avoid FPs on templates.
+  - name: generic_secret_assignment
+    pattern: '(?i)(?:PRIVATE_KEY|SECRET_KEY|ENCRYPTION_KEY|SIGNING_KEY|CLIENT_SECRET|DB_PASSWORD|DATABASE_PASSWORD|MASTER_KEY|API_SECRET|APP_SECRET|AUTH_SECRET|SESSION_SECRET|COOKIE_SECRET|RELAY_TOKEN|SMTP_PASSWORD|IMAP_PASSWORD|CALDAV_PASSWORD|PRESHARED_KEY)[=:\s]+[''"]?[^\s''"]{8,}'
+  # --- Additional prefixed formats ---
+  - name: aws_secret_access_key
+    pattern: '(?i)AWS_SECRET_ACCESS_KEY[=:\s]+[A-Za-z0-9/+=]{40}'
+  - name: discord_bot_token
+    pattern: '[A-Za-z0-9_-]{18,}\.[A-Za-z0-9_-]{6}\.[A-Za-z0-9_-]{27,}'
+  - name: hashicorp_vault_token
+    pattern: 'hvs\.[a-zA-Z0-9_-]{24,}'
+  - name: age_secret_key
+    pattern: 'AGE-SECRET-KEY-[A-Z0-9]{59}'
+  - name: wireguard_key
+    pattern: '(?i)(?:WIREGUARD_PRIVATE_KEY|WIREGUARD_PRESHARED_KEY)[=:\s]+[A-Za-z0-9/+=]{43,44}'
+  - name: azure_connection_string
+    pattern: '(?i)AccountKey=[A-Za-z0-9/+=]{44,88}'
+  - name: mysql_uri
+    pattern: 'mysql(\+[a-z]+)?://[^\s]+'
+  - name: openvpn_static_key
+    pattern: '-----BEGIN OpenVPN Static key V1-----'
+
+sensitive_path_patterns:
+  - /etc/shadow
+  - /etc/passwd
+  - .ssh/
+  - .gnupg/
+  - .env
+  - wallet.dat
+  - .bitcoin/
+  - .config/
+  - .local/share/
+  - /proc/
+  - /sys/

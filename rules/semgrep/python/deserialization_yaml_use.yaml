@@ -1,0 +1,52 @@
+# Reference: https://gitlab.com/gitlab-org/security-products/sast-rules/-/blob/main/python/deserialization/rule-yaml-load.yml?ref_type=heads
+
+rules:
+- id: unsafe-yaml-unsafe-load
+  patterns:
+      - pattern: yaml.unsafe_load(...)
+      - pattern-not: yaml.unsafe_load("...")
+  message: >-
+    Potential deserialization risk due to unsafe yaml deserialization usage.
+  metadata:
+    cwe:
+    - 'CWE-502: Deserialization of Untrusted Data'
+    cwe_id: CWE-502
+    prescan_regex: yaml\.unsafe_load
+  severity: WARNING
+  languages:
+  - python
+
+- id: unsafe-yaml-loader
+  patterns:
+      - pattern: yaml.load(..., Loader = $LOADER, ...)
+      - pattern-not: yaml.load("...", Loader = $LOADER, ...)
+      - metavariable-regex:
+          metavariable: '$LOADER'
+          regex: (yaml\.Loader|Loader|yaml\.UnsafeLoader|UnsafeLoader)
+  message: >-
+    Potential deserialization risk due to unsafe yaml deserialization usage.
+  metadata:
+    cwe:
+    - 'CWE-502: Deserialization of Untrusted Data'
+    cwe_id: CWE-502
+    prescan_regex: (yaml\.Loader|Loader|yaml\.UnsafeLoader|UnsafeLoader)
+  severity: WARNING
+  languages:
+  - python
+
+- id: unsafe-yaml-load-no-loader
+  patterns:
+      - pattern: yaml.load($DATA)
+      - pattern-not: yaml.load("...")
+  message: >-
+    yaml.load() without explicit Loader parameter. In older PyYAML versions
+    this defaults to UnsafeLoader, allowing arbitrary code execution.
+    Use yaml.safe_load() or yaml.load(data, Loader=yaml.SafeLoader).
+  metadata:
+    cwe:
+    - 'CWE-502: Deserialization of Untrusted Data'
+    cwe_id: CWE-502
+    prescan_regex: yaml\.load\(
+  severity: WARNING
+  languages:
+  - python

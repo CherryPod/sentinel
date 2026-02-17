@@ -1,0 +1,203 @@
+# NOTE: Replace placeholder values (your-hostname, your-email, etc.) with your actual configuration.
+# See README.md Quick Start for setup instructions.
+
+## Sentinel — 2-container production stack
+##
+## Controller (Python/FastAPI) + Ollama (air-gapped Qwen 3 14B)
+## TLS, security headers, PIN auth, static UI — all in one container.
+##
+## Usage:
+##   podman compose up -d
+##   curl -k https://localhost:3001/api/health
+##   bash scripts/smoke_test.sh
+
+services:
+  sentinel:
+    build:
+      context: .
+      dockerfile: container/Containerfile
+    container_name: sentinel
+    networks:
+      - sentinel_internal
+      - sentinel_egress
+    environment:
+      - SENTINEL_POLICY_FILE=/policies/sentinel-policy.yaml
+      - SENTINEL_WORKSPACE_PATH=/workspace
+      - SENTINEL_LOG_DIR=/logs
+      - SENTINEL_LOG_LEVEL=INFO
+      - SENTINEL_APPROVAL_MODE=auto
+      - SENTINEL_TRUST_LEVEL=4
+      - SENTINEL_VERBOSE_RESULTS=true
+      - SENTINEL_BENCHMARK_MODE=true
+      - SENTINEL_PIN_REQUIRED=true
+      - SENTINEL_PIN_FILE=/run/secrets/sentinel_pin
+      - SENTINEL_OLLAMA_URL=http://sentinel-ollama:11434
+      - SENTINEL_OLLAMA_MODEL=qwen3:14b
+      - SENTINEL_OLLAMA_TIMEOUT=7200
+      - SENTINEL_STATIC_DIR=/app/ui
+      - SENTINEL_TLS_CERT_FILE=/app/tls/sentinel.crt
+      - SENTINEL_TLS_KEY_FILE=/app/tls/sentinel.key
+      - SENTINEL_HTTPS_PORT=8443
+      - SENTINEL_HTTP_PORT=8080
+      - SENTINEL_REDIRECT_ENABLED=true
+      - SENTINEL_EXTERNAL_HTTPS_PORT=3001
+      - SENTINEL_ALLOWED_ORIGINS=https://localhost:3001,https://your-hostname:3001,https://your-lan-ip:3001
+      # Routine engine
+      - SENTINEL_ROUTINE_ENABLED=true
+      # Signal channel — replace with your registered Signal number
+      - SENTINEL_SIGNAL_ENABLED=true
+      - SENTINEL_SIGNAL_ACCOUNT=+440000000000
+      - SENTINEL_SIGNAL_ALLOWED_SENDERS=+440000000001,00000000-0000-0000-0000-000000000000
+      - SENTINEL_SIGNAL_RATE_LIMIT=10
+      - SENTINEL_SIGNAL_MAX_MESSAGE_LENGTH=2000
+      - SENTINEL_SIGNAL_CLI_CONFIG=/app/signal-data
+      # WASM sidecar
+      - SENTINEL_SIDECAR_ENABLED=true
+      - SENTINEL_SIDECAR_SOCKET=/tmp/sentinel-sidecar.sock
+      - SENTINEL_SIDECAR_BINARY=/app/sidecar/sentinel-sidecar
+      - SENTINEL_SIDECAR_TOOL_DIR=/app/wasm
+      # Telegram channel — replace with your bot token and chat ID
+      - SENTINEL_TELEGRAM_ENABLED=true
+      - SENTINEL_TELEGRAM_BOT_TOKEN_FILE=/run/secrets/telegram_bot_token
+      - SENTINEL_TELEGRAM_ALLOWED_CHAT_IDS=0000000000
+      - SENTINEL_TELEGRAM_RATE_LIMIT=10
+      - SENTINEL_TELEGRAM_MAX_MESSAGE_LENGTH=4096
+      - SENTINEL_TELEGRAM_POLLING_TIMEOUT=30
+      # Brave web search
+      - SENTINEL_WEB_SEARCH_ENABLED=true
+      - SENTINEL_WEB_SEARCH_BACKEND=brave
+      - SENTINEL_BRAVE_API_KEY_FILE=/run/secrets/brave_api_key
+      # X/Twitter search (Grok API)
+      - SENTINEL_X_SEARCH_ENABLED=true
+      - SENTINEL_X_SEARCH_API_KEY_FILE=/run/secrets/grok_api_key
+      - SENTINEL_X_SEARCH_MODEL=grok-4-1-fast-reasoning
+      # Email (IMAP + SMTP) — replace with your mail provider
+      - SENTINEL_EMAIL_ENABLED=true
+      - SENTINEL_EMAIL_BACKEND=imap
+      - SENTINEL_SMTP_HOST=mail.example.com
+      - SENTINEL_SMTP_PORT=465
+      - SENTINEL_SMTP_USERNAME=your-email@example.com
+      - SENTINEL_SMTP_PASSWORD_FILE=/run/secrets/smtp_password
+      - SENTINEL_SMTP_FROM=your-email@example.com
+      - SENTINEL_SMTP_TLS_MODE=ssl
+      - SENTINEL_IMAP_HOST=mail.example.com
+      - SENTINEL_IMAP_PORT=993
+      - SENTINEL_IMAP_USERNAME=your-email@example.com
+      - SENTINEL_IMAP_PASSWORD_FILE=/run/secrets/imap_password
+      - SENTINEL_IMAP_TLS_MODE=ssl
+      # CalDAV calendar — replace with your CalDAV provider
+      - SENTINEL_CALENDAR_ENABLED=true
+      - SENTINEL_CALENDAR_BACKEND=caldav
+      - SENTINEL_CALDAV_URL=https://mail.example.com:8443/calendars/your-user/default
+      - SENTINEL_CALDAV_USERNAME=your-email@example.com
+      - SENTINEL_CALDAV_PASSWORD_FILE=/run/secrets/caldav_password
+      # Podman sandbox — disposable containers for shell at TL2+
+      - SENTINEL_SANDBOX_ENABLED=true
+      - SENTINEL_SANDBOX_SOCKET=/tmp/podman-proxy.sock
+      - SENTINEL_SANDBOX_IMAGE=sentinel-sandbox:latest
+      # Sandbox workspace — must match the compose-prefixed volume name so the
+      # sandbox containers mount the same volume as sentinel's /workspace
+      - SENTINEL_SANDBOX_WORKSPACE_VOLUME=sentinel_sentinel-workspace
+      # Podman proxy — restricts socket access to sandbox operations only
+      - SENTINEL_PODMAN_PROXY_UPSTREAM=/run/podman/podman-host.sock
+      - SENTINEL_PODMAN_PROXY_LISTEN=/tmp/podman-proxy.sock
+    volumes:
+      - ./policies:/policies:ro
+      - sentinel-data:/data
+      - sentinel-workspace:/workspace
+      - ./logs:/logs
+      - /run/user/1000/podman/podman.sock:/run/podman/podman-host.sock:ro
+      - ./data/signal-cli:/app/signal-data:Z
+    secrets:
+      - claude_api_key
+      - sentinel_pin
+      - brave_api_key
+      - grok_api_key
+      - telegram_bot_token
+      - smtp_password
+      - imap_password
+      - caldav_password
+    ports:
+      - "3001:8443"
+      - "3002:8080"
+    restart: "no"
+    depends_on:
+      - sentinel-ollama
+    # Resource limits (bumped for Signal + sandbox)
+    mem_limit: 8G
+    mem_reservation: 2G
+    cpus: 6.0
+    # Read-only filesystem
+    read_only: true
+    tmpfs:
+      - /tmp:size=512M
+    # Health check
+    healthcheck:
+      test: ["CMD-SHELL", "python -c 'import urllib.request, ssl; ctx=ssl.create_default_context(); ctx.check_hostname=False; ctx.verify_mode=ssl.CERT_NONE; urllib.request.urlopen(\"https://localhost:8443/health\", context=ctx)'"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  sentinel-ollama:
+    image: docker.io/ollama/ollama:0.17.7
+    container_name: sentinel-ollama
+    networks:
+      - sentinel_internal
+    environment:
+      - OLLAMA_HOST=0.0.0.0:11434
+      - OLLAMA_KEEP_ALIVE=5m
+      # Context: 24K total, 12K output cap. VRAM budget: model 9.3GB + KV cache
+      # 1.87GB (q8_0) = ~11.3GB. Adjust based on your GPU VRAM.
+      - OLLAMA_CONTEXT_LENGTH=24576
+      - OLLAMA_NUM_PREDICT=12288
+      - OLLAMA_KV_CACHE_TYPE=q8_0
+      - OLLAMA_FLASH_ATTENTION=1
+    volumes:
+      - sentinel-ollama-data:/root/.ollama
+    devices:
+      - nvidia.com/gpu=all
+    restart: "no"
+    # Resource limits
+    mem_limit: 14G
+    cpus: 4.0
+    # Health check
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'echo -e \"GET /api/tags HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n\" > /dev/tcp/localhost/11434'"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+networks:
+  sentinel_internal:
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
+  sentinel_egress:
+    driver: bridge
+
+secrets:
+  claude_api_key:
+    file: ./secrets/claude_api_key.txt
+  sentinel_pin:
+    file: ./secrets/sentinel_pin.txt
+  brave_api_key:
+    file: ./secrets/brave_api_key.txt
+  telegram_bot_token:
+    file: ./secrets/telegram_bot_token.txt
+  smtp_password:
+    file: ./secrets/smtp_password.txt
+  imap_password:
+    file: ./secrets/imap_password.txt
+  caldav_password:
+    file: ./secrets/caldav_password.txt
+  grok_api_key:
+    file: ./secrets/grok_api_key.txt
+
+volumes:
+  sentinel-data:
+  sentinel-workspace:
+  sentinel-ollama-data:

@@ -1,0 +1,11 @@
+[package]
+name = "tool-http-fetch"
+version = "0.1.0"
+edition = "2021"
+description = "WASM tool: HTTP fetch via host function with SSRF protection"
+license = "Apache-2.0"
+
+[dependencies]
+tool-common = { path = "../common" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

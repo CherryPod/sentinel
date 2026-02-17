@@ -1,0 +1,18 @@
+rules:
+- id: log-injection
+  pattern-either:
+      - pattern: $LOGGER.info($X + ...)
+      - pattern: $LOGGER.warn($X + ...)
+      - pattern: $LOGGER.error($X + ...)
+      - pattern: $LOGGER.debug($X + ...)
+  message: >-
+    Log message built via string concatenation. Use parameterized logging
+    (e.g. logger.info("msg {}", param)) to prevent log injection.
+  metadata:
+    cwe:
+    - 'CWE-117: Improper Output Neutralization for Logs'
+    cwe_id: CWE-117
+    prescan_regex: (\.info\(|\.warn\(|\.error\(|\.debug\()
+  severity: WARNING
+  languages:
+  - java

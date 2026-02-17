@@ -1,0 +1,17 @@
+rules:
+- id: insecure-eval-use
+  patterns:
+      - pattern: eval($X)
+      - pattern-not: eval("...")
+  message: >-
+    eval() executes arbitrary code and should be avoided. Use
+    JSON.parse() for data or Function() with validated input.
+  metadata:
+    cwe:
+    - 'CWE-94: Improper Control of Generation of Code (Code Injection)'
+    cwe_id: CWE-94
+    prescan_regex: eval\(
+  severity: WARNING
+  languages:
+  - javascript
+  - typescript

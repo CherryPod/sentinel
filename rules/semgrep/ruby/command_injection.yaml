@@ -1,0 +1,19 @@
+rules:
+- id: command-injection-system
+  patterns:
+      - pattern-either:
+          - pattern: system($X)
+          - pattern: exec($X)
+      - pattern-not: system("...")
+      - pattern-not: exec("...")
+  message: >-
+    Command execution with non-literal argument. Use array form
+    (system("cmd", arg1)) to prevent shell injection.
+  metadata:
+    cwe:
+    - 'CWE-78: Improper Neutralization of Special Elements used in an OS Command (OS Command Injection)'
+    cwe_id: CWE-78
+    prescan_regex: (system|exec)\(
+  severity: WARNING
+  languages:
+  - ruby

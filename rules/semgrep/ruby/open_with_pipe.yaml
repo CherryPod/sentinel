@@ -1,0 +1,14 @@
+rules:
+- id: open-with-pipe
+  pattern: open("|...", ...)
+  message: >-
+    Ruby open() with a pipe prefix (|) executes the argument as a
+    shell command. Use IO.popen() or Open3 for explicit subprocess control.
+  metadata:
+    cwe:
+    - 'CWE-78: Improper Neutralization of Special Elements used in an OS Command (OS Command Injection)'
+    cwe_id: CWE-78
+    prescan_regex: open\(\s*["\']?\|
+  severity: WARNING
+  languages:
+  - ruby

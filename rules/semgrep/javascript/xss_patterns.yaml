@@ -1,0 +1,32 @@
+rules:
+- id: document-write-xss
+  pattern: document.write($X)
+  message: >-
+    document.write() with dynamic content can lead to XSS.
+    Use DOM manipulation methods (textContent, createElement) instead.
+  metadata:
+    cwe:
+    - 'CWE-79: Improper Neutralization of Input During Web Page Generation (XSS)'
+    cwe_id: CWE-79
+    prescan_regex: document\.write
+  severity: WARNING
+  languages:
+  - javascript
+  - typescript
+
+- id: innerhtml-xss
+  patterns:
+      - pattern: $EL.innerHTML = $X
+      - pattern-not: $EL.innerHTML = "..."
+  message: >-
+    Setting innerHTML with dynamic content can lead to XSS.
+    Use textContent for text or sanitize HTML with DOMPurify.
+  metadata:
+    cwe:
+    - 'CWE-79: Improper Neutralization of Input During Web Page Generation (XSS)'
+    cwe_id: CWE-79
+    prescan_regex: \.innerHTML\s*=
+  severity: WARNING
+  languages:
+  - javascript
+  - typescript

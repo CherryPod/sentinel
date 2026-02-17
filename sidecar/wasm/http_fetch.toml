@@ -1,0 +1,4 @@
+name = "http_fetch"
+description = "Fetch a URL via HTTP with SSRF protection"
+wasm = "http_fetch.wasm"
+capabilities = ["http_request"]

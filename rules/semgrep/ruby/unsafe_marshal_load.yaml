@@ -1,0 +1,14 @@
+rules:
+- id: unsafe-marshal-load
+  pattern: Marshal.load(...)
+  message: >-
+    Marshal.load() can execute arbitrary code during deserialization.
+    Do not use with untrusted data — use JSON.parse instead.
+  metadata:
+    cwe:
+    - 'CWE-502: Deserialization of Untrusted Data'
+    cwe_id: CWE-502
+    prescan_regex: Marshal\.load
+  severity: WARNING
+  languages:
+  - ruby

@@ -1,0 +1,20 @@
+rules:
+- id: prototype-pollution
+  pattern-either:
+      - pattern: Object.assign({}, $X)
+      - pattern: _.merge({}, $X)
+      - pattern: _.defaultsDeep({}, $X)
+      - pattern: _.extend({}, $X)
+  message: >-
+    Potential prototype pollution via Object.assign or lodash merge
+    with user-controlled input. Validate input properties or use
+    Object.create(null) as the target.
+  metadata:
+    cwe:
+    - 'CWE-1321: Improperly Controlled Modification of Object Prototype Attributes (Prototype Pollution)'
+    cwe_id: CWE-1321
+    prescan_regex: (Object\.assign|_\.merge|_\.defaultsDeep|_\.extend)
+  severity: WARNING
+  languages:
+  - javascript
+  - typescript

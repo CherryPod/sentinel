@@ -1,0 +1,28 @@
+rules:
+- id: weak-hash-md5
+  pattern: MessageDigest.getInstance("MD5")
+  message: >-
+    MD5 is cryptographically broken and should not be used for security
+    purposes. Use SHA-256 or stronger.
+  metadata:
+    cwe:
+    - 'CWE-328: Use of Weak Hash'
+    cwe_id: CWE-328
+    prescan_regex: MessageDigest\.getInstance
+  severity: WARNING
+  languages:
+  - java
+
+- id: weak-hash-sha1
+  pattern: MessageDigest.getInstance("SHA-1")
+  message: >-
+    SHA-1 is cryptographically weak and should not be used for security
+    purposes. Use SHA-256 or stronger.
+  metadata:
+    cwe:
+    - 'CWE-328: Use of Weak Hash'
+    cwe_id: CWE-328
+    prescan_regex: MessageDigest\.getInstance
+  severity: WARNING
+  languages:
+  - java

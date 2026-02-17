@@ -1,0 +1,23 @@
+rules:
+- id: file-inclusion
+  patterns:
+      - pattern-either:
+          - pattern: include($X)
+          - pattern: require($X)
+          - pattern: include_once($X)
+          - pattern: require_once($X)
+      - pattern-not: include('...')
+      - pattern-not: require('...')
+      - pattern-not: include_once('...')
+      - pattern-not: require_once('...')
+  message: >-
+    File inclusion with non-literal path. Validate and whitelist allowed
+    paths to prevent local/remote file inclusion attacks.
+  metadata:
+    cwe:
+    - 'CWE-98: Improper Control of Filename for Include/Require Statement in PHP Program'
+    cwe_id: CWE-98
+    prescan_regex: (include|require)(_once)?\(
+  severity: WARNING
+  languages:
+  - php

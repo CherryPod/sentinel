@@ -1,0 +1,203 @@
+import hashlib
+import hmac
+import logging
+import os
+import threading
+import time
+from collections.abc import Callable
+
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+from starlette.responses import JSONResponse
+
+logger = logging.getLogger("sentinel.audit")
+
+# PBKDF2 settings for PIN hashing (H-002)
+_PBKDF2_ITERATIONS = 600_000
+_PBKDF2_HASH = "sha256"
+_SALT_LENGTH = 32
+
+
+class PinVerifier:
+    """Holds a hashed PIN + salt — plaintext is never stored in memory.
+
+    Uses PBKDF2-HMAC-SHA256 with 600k iterations (OWASP 2024 recommendation).
+    """
+
+    __slots__ = ("_hash", "_salt")
+
+    def __init__(self, pin: str):
+        self._salt = os.urandom(_SALT_LENGTH)
+        self._hash = hashlib.pbkdf2_hmac(
+            _PBKDF2_HASH, pin.encode("utf-8"), self._salt, _PBKDF2_ITERATIONS,
+        )
+
+    def verify(self, supplied: str) -> bool:
+        """Verify a supplied PIN against the stored hash (constant-time)."""
+        supplied_hash = hashlib.pbkdf2_hmac(
+            _PBKDF2_HASH, supplied.encode("utf-8"), self._salt, _PBKDF2_ITERATIONS,
+        )
+        return hmac.compare_digest(supplied_hash, self._hash)
+
+    def to_stored(self) -> str:
+        """Serialise hash+salt for DB storage. Format: hex(salt):hex(hash)"""
+        return self._salt.hex() + ":" + self._hash.hex()
+
+    @classmethod
+    def from_stored(cls, stored: str) -> "PinVerifier":
+        """Reconstruct from DB-stored format (hex(salt):hex(hash))."""
+        salt_hex, hash_hex = stored.split(":", 1)
+        obj = object.__new__(cls)
+        obj._salt = bytes.fromhex(salt_hex)
+        obj._hash = bytes.fromhex(hash_hex)
+        return obj
+
+# Lockout settings
+_MAX_FAILED_ATTEMPTS = 5
+_LOCKOUT_SECONDS = 60
+
+
+class _FailureTracker:
+    """Thread-safe per-IP failed PIN attempt tracker with lockout."""
+
+    _PRUNE_INTERVAL = 100  # Prune stale entries every N lookups
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        # {ip: (fail_count, last_fail_time)}
+        self._attempts: dict[str, tuple[int, float]] = {}
+        self._lookup_count = 0
+
+    def _prune_stale(self) -> None:
+        """Remove entries older than lockout window. Called under lock."""
+        now = time.monotonic()
+        self._attempts = {
+            ip: (count, ts)
+            for ip, (count, ts) in self._attempts.items()
+            if now - ts < _LOCKOUT_SECONDS * 2
+        }
+
+    def is_locked_out(self, ip: str) -> bool:
+        with self._lock:
+            self._lookup_count += 1
+            if self._lookup_count >= self._PRUNE_INTERVAL:
+                self._prune_stale()
+                self._lookup_count = 0
+
+            record = self._attempts.get(ip)
+            if record is None:
+                return False
+            count, last_fail = record
+            if count >= _MAX_FAILED_ATTEMPTS:
+                if time.monotonic() - last_fail < _LOCKOUT_SECONDS:
+                    return True
+                # Lockout expired — reset
+                del self._attempts[ip]
+                return False
+            return False
+
+    def record_failure(self, ip: str) -> int:
+        with self._lock:
+            record = self._attempts.get(ip)
+            now = time.monotonic()
+            if record is None:
+                self._attempts[ip] = (1, now)
+                return 1
+            count, last_fail = record
+            # Reset if lockout period has passed
+            if count >= _MAX_FAILED_ATTEMPTS and now - last_fail >= _LOCKOUT_SECONDS:
+                self._attempts[ip] = (1, now)
+                return 1
+            self._attempts[ip] = (count + 1, now)
+            return count + 1
+
+    def clear(self, ip: str) -> None:
+        with self._lock:
+            self._attempts.pop(ip, None)
+
+
+class PinAuthMiddleware(BaseHTTPMiddleware):
+    """PIN authentication via X-Sentinel-Pin header.
+
+    Uses PinVerifier (PBKDF2 hash) so the plaintext PIN is never held in
+    memory beyond startup. Constant-time comparison prevents timing attacks,
+    and per-IP lockout throttles brute force.
+    """
+
+    def __init__(self, app, pin_verifier_getter: Callable[[], PinVerifier | None]):
+        super().__init__(app)
+        self._pin_verifier_getter = pin_verifier_getter
+        self._failures = _FailureTracker()
+
+    async def dispatch(self, request: Request, call_next):
+        verifier = self._pin_verifier_getter()
+        remote = request.client.host if request.client else "unknown"
+
+        # PIN disabled (None) — pass through
+        if verifier is None:
+            return await call_next(request)
+
+        # Health, WebSocket, MCP, and static UI assets are exempt.
+        # Static assets must load without PIN so the JS can show the PIN overlay.
+        # API endpoints enforce PIN separately via X-Sentinel-Pin header.
+        # MCP exempt by design — intended for local Claude Code / tool integration
+        # (streamable HTTP on localhost). If exposed on 0.0.0.0, add MCP-specific auth.
+        path = request.url.path
+        _EXEMPT_PATHS = ("/health", "/api/health", "/ws", "/.well-known/agent.json", "/api/auth/login")
+        _EXEMPT_EXTENSIONS = (".html", ".js", ".css", ".png", ".ico", ".svg", ".woff", ".woff2")
+        if (
+            path in _EXEMPT_PATHS
+            or path.startswith("/mcp")
+            or path.startswith("/sites")
+            or path == "/"
+            or any(path.endswith(ext) for ext in _EXEMPT_EXTENSIONS)
+        ):
+            return await call_next(request)
+
+        # Check lockout before doing any comparison
+        if self._failures.is_locked_out(remote):
+            logger.warning(
+                "PIN auth locked out",
+                extra={
+                    "event": "pin_auth_lockout",
+                    "path": request.url.path,
+                    "remote": remote,
+                },
+            )
+            return JSONResponse(
+                status_code=429,
+                content={"detail": "Too many failed attempts — try again later"},
+            )
+
+        supplied = request.headers.get("x-sentinel-pin", "")
+        if not verifier.verify(supplied):
+            fail_count = self._failures.record_failure(remote)
+            logger.warning(
+                "PIN auth failed",
+                extra={
+                    "event": "pin_auth_failed",
+                    "path": request.url.path,
+                    "method": request.method,
+                    "remote": remote,
+                    "pin_supplied": bool(supplied),
+                    "fail_count": fail_count,
+                    "locked_out": fail_count >= _MAX_FAILED_ATTEMPTS,
+                },
+            )
+            return JSONResponse(
+                status_code=401,
+                content={"detail": "Invalid or missing PIN"},
+            )
+
+        # Successful auth — clear any failure record
+        self._failures.clear(remote)
+        logger.debug(
+            "PIN auth passed",
+            extra={
+                "event": "pin_auth_success",
+                "path": request.url.path,
+                "method": request.method,
+                "remote": remote,
+            },
+        )
+        return await call_next(request)

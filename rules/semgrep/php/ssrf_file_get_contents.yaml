@@ -1,0 +1,16 @@
+rules:
+- id: ssrf-file-get-contents
+  patterns:
+      - pattern: file_get_contents($X)
+      - pattern-not: file_get_contents('...')
+  message: >-
+    file_get_contents() with user-controlled URL can lead to SSRF.
+    Validate and whitelist allowed URLs/hosts.
+  metadata:
+    cwe:
+    - 'CWE-918: Server-Side Request Forgery (SSRF)'
+    cwe_id: CWE-918
+    prescan_regex: file_get_contents\(
+  severity: WARNING
+  languages:
+  - php

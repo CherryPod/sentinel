@@ -1,0 +1,16 @@
+rules:
+- id: unsafe-shelve-use
+  patterns:
+      - pattern: shelve.open(...)
+      - pattern-not: shelve.open("...")
+  message: >-
+    shelve.open() uses pickle internally for serialization. Opening a shelve
+    database from untrusted sources can lead to arbitrary code execution.
+  metadata:
+    cwe:
+    - 'CWE-502: Deserialization of Untrusted Data'
+    cwe_id: CWE-502
+    prescan_regex: shelve\.open
+  severity: WARNING
+  languages:
+  - python
