@@ -11,22 +11,18 @@ A defence-in-depth AI assistant built on the CaMeL architecture. Claude API (Pla
 - Podman (all containers, rootless, user kifterz)
 - Ollama (Qwen 3 14B Q4_K_M, GPU-shared RTX 3060 12GB)
 
-## Container Names (Phase 1 — not yet deployed)
-- `sentinel-v2` — controller + UI + TLS (ports 3003/3004)
-- `sentinel-ollama-v2` — air-gapped local LLM (sentinel_internal_v2 network ONLY)
-- Compose: `podman-compose.phase1.yaml`
-
-## Container Names (Legacy — still running)
-- `sentinel-controller` — security gateway + orchestrator (port 8000)
-- `sentinel-qwen` — air-gapped local LLM (sentinel_internal network ONLY)
-- `sentinel-ui` — WebUI frontend (nginx, HTTPS, ports 3001/3002)
+## Containers
+- `sentinel` — controller + UI + TLS (ports 3001/3002)
+- `sentinel-ollama` — air-gapped local LLM (sentinel_internal network ONLY)
+- Compose: `podman-compose.yaml`
+- Deploy guide: `docs/deploy-new-stack.md`
 
 ## Networks
-- `sentinel_internal` / `sentinel_internal_v2` — air-gapped, internal: true, no external routing
-- `sentinel_egress` / `sentinel_egress_v2` — internet access for Claude API
+- `sentinel_internal` — air-gapped, internal: true, no external routing
+- `sentinel_egress` — internet access for Claude API
 
 ## Critical Safety Rules
-- NEVER give sentinel-qwen internet access — the air gap is a core security layer
+- NEVER give sentinel-ollama internet access — the air gap is a core security layer
 - NEVER trust Qwen output — always scan before acting on it
 - NEVER store secrets in project files — use Podman secrets or ~/.secrets/
 - NEVER modify existing containers (27 running) — this is a standalone stack
@@ -35,7 +31,7 @@ A defence-in-depth AI assistant built on the CaMeL architecture. Claude API (Pla
 
 ## Testing
 - Local: `.venv/bin/pytest tests/` — 1006 tests
-- Container (legacy layout): `podman exec sentinel-controller pytest /app/tests/`
+- Container: `podman exec sentinel pytest /app/tests/`
 - Stress test: `python3 scripts/analyse_v3_results.py` (reads `benchmarks/v3-results.jsonl`)
 
 ## Documentation

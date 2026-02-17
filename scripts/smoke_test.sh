@@ -3,15 +3,15 @@
 #
 # Verifies core functionality without requiring API keys or GPU.
 # Run from project root after starting the stack:
-#   podman compose -f podman-compose.phase1.yaml up -d
+#   podman compose up -d
 #   bash scripts/smoke_test.sh
 #
 # Exit codes: 0 = all checks pass, 1 = one or more failed
 
 set -euo pipefail
 
-HTTPS_PORT="${SENTINEL_HTTPS_PORT:-3003}"
-HTTP_PORT="${SENTINEL_HTTP_PORT:-3004}"
+HTTPS_PORT="${SENTINEL_HTTPS_PORT:-3001}"
+HTTP_PORT="${SENTINEL_HTTP_PORT:-3002}"
 BASE="https://localhost:${HTTPS_PORT}"
 CURL="curl -sk --max-time 10"
 
@@ -57,7 +57,7 @@ check "GET / serves HTML containing 'Sentinel'" \
 
 # 5. Air gap (Ollama container can't reach internet)
 echo "5. Air gap verification"
-OLLAMA_CONTAINER="sentinel-ollama-v2"
+OLLAMA_CONTAINER="sentinel-ollama"
 if podman ps --format '{{.Names}}' | grep -q "$OLLAMA_CONTAINER"; then
     check "Ollama container cannot reach internet" \
         bash -c "! podman exec $OLLAMA_CONTAINER bash -c 'echo -e \"GET / HTTP/1.0\r\nHost: google.com\r\n\r\n\" > /dev/tcp/google.com/80' 2>/dev/null"

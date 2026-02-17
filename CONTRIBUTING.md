@@ -62,7 +62,7 @@ podman build \
   -f container/Containerfile .
 
 # Start the stack
-podman compose -f podman-compose.phase1.yaml up -d
+podman compose up -d
 ```
 
 See [docs/deployment.md](docs/deployment.md) for the full build procedure and common gotchas.

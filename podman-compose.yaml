@@ -1,9 +1,19 @@
+## Sentinel — 2-container production stack
+##
+## Controller (Python/FastAPI) + Ollama (air-gapped Qwen 3 14B)
+## TLS, security headers, PIN auth, static UI — all in one container.
+##
+## Usage:
+##   podman compose up -d
+##   curl -k https://localhost:3001/api/health
+##   bash scripts/smoke_test.sh
+
 services:
-  sentinel-controller:
+  sentinel:
     build:
-      context: ./controller
-      dockerfile: Dockerfile
-    container_name: sentinel-controller
+      context: .
+      dockerfile: container/Containerfile
+    container_name: sentinel
     networks:
       - sentinel_internal
       - sentinel_egress
@@ -16,40 +26,51 @@ services:
       - SENTINEL_VERBOSE_RESULTS=false
       - SENTINEL_PIN_REQUIRED=true
       - SENTINEL_PIN_FILE=/run/secrets/sentinel_pin
-      - SENTINEL_OLLAMA_URL=http://sentinel-qwen:11434
+      - SENTINEL_OLLAMA_URL=http://sentinel-ollama:11434
       - SENTINEL_OLLAMA_MODEL=qwen3:14b
       - SENTINEL_OLLAMA_TIMEOUT=1800
+      - SENTINEL_DB_PATH=/data/sentinel.db
+      - SENTINEL_STATIC_DIR=/app/ui
+      - SENTINEL_TLS_CERT_FILE=/app/tls/sentinel.crt
+      - SENTINEL_TLS_KEY_FILE=/app/tls/sentinel.key
+      - SENTINEL_HTTPS_PORT=8443
+      - SENTINEL_HTTP_PORT=8080
+      - SENTINEL_REDIRECT_ENABLED=true
+      - SENTINEL_EXTERNAL_HTTPS_PORT=3001
+      - SENTINEL_ALLOWED_ORIGINS=https://localhost:3001,https://localhost:3002
     volumes:
       - ./policies:/policies:ro
+      - sentinel-data:/data
       - sentinel-workspace:/workspace
       - ./logs:/logs
     secrets:
       - claude_api_key
       - sentinel_pin
     ports:
-      - "8000:8000"
+      - "3001:8443"
+      - "3002:8080"
     restart: always
     depends_on:
-      - sentinel-qwen
-    # Resource limits (#23)
+      - sentinel-ollama
+    # Resource limits
     mem_limit: 4G
     mem_reservation: 1G
     cpus: 4.0
-    # Read-only filesystem (#24)
+    # Read-only filesystem
     read_only: true
     tmpfs:
       - /tmp:size=100M,noexec
-    # Health check (#30)
+    # Health check
     healthcheck:
-      test: ["CMD-SHELL", "python -c 'import urllib.request; urllib.request.urlopen(\"http://localhost:8000/health\")'"]
+      test: ["CMD-SHELL", "python -c 'import urllib.request, ssl; ctx=ssl.create_default_context(); ctx.check_hostname=False; ctx.verify_mode=ssl.CERT_NONE; urllib.request.urlopen(\"https://localhost:8443/health\", context=ctx)'"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 60s
 
-  sentinel-qwen:
+  sentinel-ollama:
     image: docker.io/ollama/ollama@sha256:44893537fcc6f100b70ceb7f5c9fd8f787ba58f9f8ce73bf4a48a5b05fd8c422
-    container_name: sentinel-qwen
+    container_name: sentinel-ollama
     networks:
       - sentinel_internal
     environment:
@@ -61,45 +82,16 @@ services:
     devices:
       - nvidia.com/gpu=all
     restart: always
-    # Resource limits (#23)
+    # Resource limits
     mem_limit: 14G
     cpus: 4.0
-    # Health check (#30)
+    # Health check
     healthcheck:
       test: ["CMD-SHELL", "bash -c 'echo -e \"GET /api/tags HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n\" > /dev/tcp/localhost/11434'"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 30s
-
-  sentinel-ui:
-    build:
-      context: ./gateway
-    container_name: sentinel-ui
-    networks:
-      - sentinel_egress
-    ports:
-      - "3001:8443"
-      - "3002:8080"
-    restart: unless-stopped
-    depends_on:
-      - sentinel-controller
-    # Resource limits (#23)
-    mem_limit: 128M
-    cpus: 1.0
-    # Read-only filesystem (#24)
-    read_only: true
-    tmpfs:
-      - /tmp:size=10M
-      - /var/cache/nginx:size=50M
-      - /run:size=10M
-    # Health check (#30)
-    healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "--no-check-certificate", "https://localhost:8443/"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 5s
 
 networks:
   sentinel_internal:
@@ -118,5 +110,6 @@ secrets:
     file: ./secrets/sentinel_pin.txt
 
 volumes:
+  sentinel-data:
   sentinel-workspace:
   sentinel-ollama-data:
