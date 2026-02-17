@@ -11,7 +11,7 @@ COPY pyproject.toml .
 
 # Install torch CPU-only first (separate index), then the rest
 RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu \
-    && pip install --no-cache-dir ".[dev]"
+    && pip install --no-cache-dir ".[dev,mcp]"
 
 # Pre-download Prompt Guard model at build time (uses HF token via build secret)
 RUN --mount=type=secret,id=hf_token \
