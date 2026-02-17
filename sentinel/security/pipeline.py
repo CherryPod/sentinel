@@ -369,6 +369,42 @@ class ScanPipeline:
         )
         qwen_elapsed = time.monotonic() - t0
 
+        # 3.5. Empty response detection: retry once if Qwen returns nothing.
+        # Qwen occasionally returns 0 chars after a successful HTTP 200 —
+        # likely a generation loop or Ollama hang. Retrying once catches
+        # transient failures without masking persistent issues.
+        if not response_text or not response_text.strip():
+            logger.warning(
+                "Qwen returned empty response — retrying once",
+                extra={
+                    "event": "qwen_empty_response",
+                    "elapsed_s": round(qwen_elapsed, 2),
+                    "prompt_hash": prompt_hash,
+                },
+            )
+            t1 = time.monotonic()
+            response_text = await self._worker.generate(
+                prompt=full_prompt,
+                model=settings.ollama_model,
+                marker=marker,
+            )
+            retry_elapsed = time.monotonic() - t1
+            qwen_elapsed += retry_elapsed
+
+            if not response_text or not response_text.strip():
+                logger.error(
+                    "Qwen returned empty response on retry — failing",
+                    extra={
+                        "event": "qwen_empty_response_final",
+                        "total_elapsed_s": round(qwen_elapsed, 2),
+                        "prompt_hash": prompt_hash,
+                    },
+                )
+                raise RuntimeError(
+                    "Qwen returned an empty response after retry. "
+                    "This may indicate an Ollama hang or model issue."
+                )
+
         logger.info(
             "Qwen response received",
             extra={

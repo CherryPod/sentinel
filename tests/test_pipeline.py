@@ -354,6 +354,80 @@ class TestProcessWithQwen:
             )
 
 
+class TestEmptyResponseHandling:
+    """Empty/whitespace responses from Qwen trigger retry + error."""
+
+    @patch("sentinel.security.pipeline.settings")
+    @pytest.mark.asyncio
+    async def test_empty_response_retries_once(self, mock_settings, pipeline, mock_worker):
+        """Empty first response should trigger one retry."""
+        mock_settings.prompt_guard_enabled = False
+        mock_settings.spotlighting_enabled = False
+        mock_settings.ollama_model = "qwen3:14b"
+        mock_worker.generate = AsyncMock(
+            side_effect=["", "Retry succeeded"],
+        )
+
+        tagged = await pipeline.process_with_qwen("test prompt")
+        assert tagged.content == "Retry succeeded"
+        assert mock_worker.generate.call_count == 2
+
+    @patch("sentinel.security.pipeline.settings")
+    @pytest.mark.asyncio
+    async def test_whitespace_response_retries(self, mock_settings, pipeline, mock_worker):
+        """Whitespace-only response should also trigger retry."""
+        mock_settings.prompt_guard_enabled = False
+        mock_settings.spotlighting_enabled = False
+        mock_settings.ollama_model = "qwen3:14b"
+        mock_worker.generate = AsyncMock(
+            side_effect=["   \n\t  ", "Retry succeeded"],
+        )
+
+        tagged = await pipeline.process_with_qwen("test prompt")
+        assert tagged.content == "Retry succeeded"
+        assert mock_worker.generate.call_count == 2
+
+    @patch("sentinel.security.pipeline.settings")
+    @pytest.mark.asyncio
+    async def test_empty_response_both_attempts_raises(self, mock_settings, pipeline, mock_worker):
+        """Empty response on both attempts raises RuntimeError."""
+        mock_settings.prompt_guard_enabled = False
+        mock_settings.spotlighting_enabled = False
+        mock_settings.ollama_model = "qwen3:14b"
+        mock_worker.generate = AsyncMock(return_value="")
+
+        with pytest.raises(RuntimeError, match="empty response"):
+            await pipeline.process_with_qwen("test prompt")
+        assert mock_worker.generate.call_count == 2
+
+    @patch("sentinel.security.pipeline.settings")
+    @pytest.mark.asyncio
+    async def test_none_response_retries(self, mock_settings, pipeline, mock_worker):
+        """None response (edge case) should trigger retry."""
+        mock_settings.prompt_guard_enabled = False
+        mock_settings.spotlighting_enabled = False
+        mock_settings.ollama_model = "qwen3:14b"
+        mock_worker.generate = AsyncMock(
+            side_effect=[None, "Retry succeeded"],
+        )
+
+        tagged = await pipeline.process_with_qwen("test prompt")
+        assert tagged.content == "Retry succeeded"
+
+    @patch("sentinel.security.pipeline.settings")
+    @pytest.mark.asyncio
+    async def test_non_empty_response_no_retry(self, mock_settings, pipeline, mock_worker):
+        """Normal non-empty response should not trigger retry."""
+        mock_settings.prompt_guard_enabled = False
+        mock_settings.spotlighting_enabled = False
+        mock_settings.ollama_model = "qwen3:14b"
+        mock_worker.generate = AsyncMock(return_value="Good response")
+
+        tagged = await pipeline.process_with_qwen("test prompt")
+        assert tagged.content == "Good response"
+        assert mock_worker.generate.call_count == 1
+
+
 class TestScanOutputContextAware:
     """Part 1A: Output scan uses context-aware path scanning."""
 
