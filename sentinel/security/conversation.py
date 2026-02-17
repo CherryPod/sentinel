@@ -61,6 +61,14 @@ INSTRUCTION_OVERRIDE_PATTERNS = [
     re.compile(r"\benable (?:developer|debug|admin|god|unrestricted) mode\b", re.IGNORECASE),
     re.compile(r"\bjailbreak\b", re.IGNORECASE),
     re.compile(r"\bDAN\b"),  # "Do Anything Now" — case-sensitive, it's an acronym
+    # Authority/command-style override patterns (v3 assessment gap)
+    re.compile(r"\bsystem\s+override\b", re.IGNORECASE),
+    re.compile(r"\bsafety\s+mode\s+(?:is\s+)?off\b", re.IGNORECASE),
+    re.compile(r"\ball\s+restrictions?\s+(?:are\s+)?(?:now\s+)?(?:lifted|removed|disabled)\b", re.IGNORECASE),
+    re.compile(r"\byour\s+(?:programming|rules|constraints)\s+(?:ha(?:ve|s)\s+been)\s+(?:revised|updated|changed|removed)\b", re.IGNORECASE),
+    re.compile(r"\bbypass\s+(?:all\s+)?(?:filters?|security|restrictions?|constraints?)\b", re.IGNORECASE),
+    re.compile(r"\b(?:new|updated)\s+directive\b", re.IGNORECASE),
+    re.compile(r"\bdisable\s+(?:content\s+)?filter(?:ing|s)?\b", re.IGNORECASE),
 ]
 
 # ── Sensitive topic keywords ──────────────────────────────────
@@ -72,6 +80,9 @@ SENSITIVE_TOPICS = [
     "reverse shell", "backdoor", "exploit", "payload", "malware",
     "disable security", "disable firewall", "disable logging",
     "delete logs", "clear history", "cover tracks",
+    # Path-related terms from v3 missed catches
+    "/root/", "/home/", "/var/log/", "bash_history", ".bashrc",
+    "sudoers", "auth.log", "system access",
 ]
 
 # ── Context building indicators ────────────────────────────────
@@ -138,10 +149,30 @@ class ConversationAnalyzer:
         Returns AnalysisResult with action, score, and warnings.
         First message in a session always returns ALLOW (no history to analyze).
         """
-        # First turn — no history to analyze
+        # First turn — only check stateless rules (instruction_override).
+        # History-dependent rules (retry, escalation, etc.) are skipped because
+        # there's nothing to compare against.
         if len(session.turns) == 0:
+            s, w = self._check_instruction_override(current_request)
+            if s > 0:
+                action = "block" if s >= self._block else ("warn" if s >= self._warn else "allow")
+                logger.info(
+                    "Conversation first turn — instruction override detected",
+                    extra={
+                        "event": "conversation_first_turn_override",
+                        "session_id": session.session_id,
+                        "score": s,
+                        "action": action,
+                    },
+                )
+                return AnalysisResult(
+                    action=action,
+                    total_score=s,
+                    rule_scores={"instruction_override": s},
+                    warnings=w,
+                )
             logger.debug(
-                "Conversation first turn — no analysis",
+                "Conversation first turn — no analysis needed",
                 extra={"event": "conversation_first_turn", "session_id": session.session_id},
             )
             return AnalysisResult(action="allow", total_score=0.0)

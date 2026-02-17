@@ -65,6 +65,90 @@ def is_loaded() -> bool:
     return _loaded
 
 
+async def scan_blocks(blocks: list[tuple[str, str | None]]) -> ScanResult:
+    """Scan multiple code blocks individually with optional language hints.
+
+    Each block is scanned separately with its language hint passed to
+    CodeShield.scan_code(). If ANY block is insecure, the overall result
+    is insecure. All issues are merged into a single ScanResult.
+
+    Args:
+        blocks: list of (code_text, language_hint) tuples where
+                language_hint matches CodeShield Language enum values
+                (e.g. "python", "javascript") or None.
+    """
+    if not _loaded or _cs_class is None:
+        logger.debug(
+            "CodeShield not loaded, skipping block scan",
+            extra={"event": "codeshield_skipped"},
+        )
+        return ScanResult(found=False, matches=[], scanner_name="codeshield")
+
+    # Lazy-import Language enum (only available when codeshield is installed)
+    Language = None
+    try:
+        from codeshield.insecure_code_detector.languages import Language
+    except ImportError:
+        pass
+
+    all_matches: list[ScanMatch] = []
+
+    for code, lang_hint in blocks:
+        try:
+            # Convert language string to Language enum if available
+            lang_enum = None
+            if lang_hint and Language is not None:
+                try:
+                    lang_enum = Language(lang_hint)
+                except ValueError:
+                    pass  # Unknown language, scan without hint
+
+            result = await _cs_class.scan_code(code, language=lang_enum)
+
+            if result.is_insecure:
+                block_matches = []
+                for issue in result.issues_found or []:
+                    block_matches.append(
+                        ScanMatch(
+                            pattern_name=f"codeshield_{getattr(issue, 'cwe_id', 'unknown')}",
+                            matched_text=getattr(issue, 'description', 'security issue detected'),
+                            position=getattr(issue, 'line', 0),
+                        )
+                    )
+                # If flagged but no detailed issues, add a generic match
+                if not block_matches:
+                    block_matches.append(
+                        ScanMatch(
+                            pattern_name="codeshield_insecure",
+                            matched_text="Code flagged as insecure by CodeShield",
+                            position=0,
+                        )
+                    )
+                all_matches.extend(block_matches)
+        except Exception as exc:
+            logger.error(
+                "CodeShield block scan error: %s",
+                exc,
+                extra={"event": "codeshield_block_scan_error", "error": str(exc)},
+            )
+            continue
+
+    scan_result = ScanResult(
+        found=len(all_matches) > 0,
+        matches=all_matches,
+        scanner_name="codeshield",
+    )
+    logger.info(
+        "CodeShield block scan complete",
+        extra={
+            "event": "codeshield_block_scan_complete",
+            "block_count": len(blocks),
+            "issues_count": len(all_matches),
+        },
+    )
+    return scan_result
+
+
 async def scan(code: str) -> ScanResult:
     """Scan code for security issues using CodeShield.
 

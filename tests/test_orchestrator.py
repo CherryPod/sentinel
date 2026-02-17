@@ -439,7 +439,7 @@ class TestHandleTask:
 
         with patch("sentinel.planner.orchestrator.codeshield") as mock_cs:
             mock_cs.is_loaded.return_value = True
-            mock_cs.scan = AsyncMock(return_value=ScanResult(
+            mock_cs.scan_blocks = AsyncMock(return_value=ScanResult(
                 found=True,
                 matches=[ScanMatch(
                     pattern_name="codeshield_insecure",
@@ -454,7 +454,7 @@ class TestHandleTask:
 
             assert result.status == "blocked"
             assert "CodeShield" in result.step_results[0].error
-            mock_cs.scan.assert_called_once()
+            mock_cs.scan_blocks.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_codeshield_runs_with_expects_code(self, mock_planner, mock_pipeline):
@@ -479,7 +479,7 @@ class TestHandleTask:
 
         with patch("sentinel.planner.orchestrator.codeshield") as mock_cs:
             mock_cs.is_loaded.return_value = True
-            mock_cs.scan = AsyncMock(return_value=ScanResult(
+            mock_cs.scan_blocks = AsyncMock(return_value=ScanResult(
                 found=True,
                 matches=[ScanMatch(
                     pattern_name="codeshield_insecure",
@@ -493,7 +493,7 @@ class TestHandleTask:
             result = await orch.handle_task("Write a script")
 
             assert result.status == "blocked"
-            mock_cs.scan.assert_called_once()
+            mock_cs.scan_blocks.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_plan_summary_in_result(self, mock_planner, mock_pipeline):
