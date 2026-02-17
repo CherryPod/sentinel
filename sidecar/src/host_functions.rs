@@ -25,7 +25,8 @@ pub struct HostState {
     pub http_allowlist: Vec<String>,
     /// HTTP client configuration.
     pub http_config: HttpConfig,
-    /// Shell command timeout in milliseconds.
+    /// Shell command timeout in milliseconds (reserved for per-command timeout).
+    #[allow(dead_code)]
     pub shell_timeout_ms: u64,
     /// Shell command max output size in bytes.
     pub shell_max_output_bytes: u64,
@@ -62,11 +63,11 @@ pub fn host_call_dispatch(mut caller: Caller<'_, HostState>, op: i32, req_len: i
 
     // Dispatch based on operation code
     let result = match op {
-        1 => handle_read_file(&caller.data(), &request),
-        2 => handle_write_file(&caller.data(), &request),
-        3 => handle_shell_exec(&caller.data(), &request),
-        4 => handle_http_fetch(&caller.data(), &request),
-        5 => handle_get_credential(&caller.data(), &request),
+        1 => handle_read_file(caller.data(), &request),
+        2 => handle_write_file(caller.data(), &request),
+        3 => handle_shell_exec(caller.data(), &request),
+        4 => handle_http_fetch(caller.data(), &request),
+        5 => handle_get_credential(caller.data(), &request),
         _ => return -1,
     };
 

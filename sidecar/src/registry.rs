@@ -14,6 +14,7 @@ pub struct ToolMeta {
     /// Tool name (e.g. "file_read").
     pub name: String,
     /// Human-readable description.
+    #[allow(dead_code)]
     pub description: String,
     /// Path to the compiled .wasm file.
     pub wasm_path: PathBuf,
@@ -114,18 +115,8 @@ impl ToolRegistry {
         self.tools.get(name)
     }
 
-    /// Register a tool programmatically (used for built-in tools).
-    pub fn register(&mut self, meta: ToolMeta) {
-        self.tools.insert(meta.name.clone(), meta);
-    }
-
     /// Get the number of registered tools.
     pub fn len(&self) -> usize {
         self.tools.len()
-    }
-
-    /// Check if the registry is empty.
-    pub fn is_empty(&self) -> bool {
-        self.tools.is_empty()
     }
 }

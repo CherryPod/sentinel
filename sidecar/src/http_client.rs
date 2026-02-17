@@ -9,6 +9,7 @@ use url::Url;
 
 /// A URL that has been validated against the allowlist and SSRF checks.
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct ValidatedUrl {
     /// The original URL string.
     pub original: String,

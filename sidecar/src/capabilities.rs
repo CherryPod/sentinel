@@ -72,6 +72,7 @@ impl CapabilitySet {
     }
 
     /// Check that all required capabilities are granted.
+    #[allow(dead_code)]
     pub fn requires_all(&self, required: &[Capability]) -> bool {
         required.iter().all(|cap| self.has(cap))
     }

@@ -54,11 +54,6 @@ impl SandboxEngine {
         })
     }
 
-    /// Get a reference to the engine (needed for epoch ticker).
-    pub fn engine(&self) -> &Engine {
-        &self.engine
-    }
-
     /// Execute a tool request inside an isolated WASM sandbox.
     ///
     /// 1. Look up tool in registry, verify capabilities
@@ -135,18 +130,18 @@ impl SandboxEngine {
 
         // Run WASM execution in a blocking task (WASM is synchronous/CPU-bound)
         let result = tokio::task::spawn_blocking(move || {
-            execute_wasm_sync(
-                &engine,
-                &wasm_bytes,
-                &args_json,
+            let params = WasmExecParams {
+                wasm_bytes,
+                args_json,
                 capabilities,
                 credentials,
-                &config.allowed_paths,
+                allowed_paths: config.allowed_paths.clone(),
                 http_allowlist,
-                &config,
+                config,
                 max_fuel,
                 timeout_ms,
-            )
+            };
+            execute_wasm_sync(&engine, params)
         })
         .await;
 
@@ -176,23 +171,36 @@ impl SandboxEngine {
     }
 }
 
+/// Parameters for a single WASM execution.
+struct WasmExecParams {
+    wasm_bytes: Vec<u8>,
+    args_json: String,
+    capabilities: CapabilitySet,
+    credentials: HashMap<String, String>,
+    allowed_paths: Vec<String>,
+    http_allowlist: Vec<String>,
+    config: Arc<SidecarConfig>,
+    max_fuel: u64,
+    timeout_ms: u64,
+}
+
 /// Synchronous WASM execution — runs inside spawn_blocking.
 ///
 /// Returns (stdout_output, fuel_consumed) on success.
-fn execute_wasm_sync(
-    engine: &Engine,
-    wasm_bytes: &[u8],
-    args_json: &str,
-    capabilities: CapabilitySet,
-    credentials: HashMap<String, String>,
-    allowed_paths: &[String],
-    http_allowlist: Vec<String>,
-    config: &SidecarConfig,
-    max_fuel: u64,
-    timeout_ms: u64,
-) -> Result<(String, u64)> {
+fn execute_wasm_sync(engine: &Engine, params: WasmExecParams) -> Result<(String, u64)> {
+    let WasmExecParams {
+        wasm_bytes,
+        args_json,
+        capabilities,
+        credentials,
+        allowed_paths,
+        http_allowlist,
+        config,
+        max_fuel,
+        timeout_ms,
+    } = params;
     // Create WASI context with stdin (args) and captured stdout
-    let stdin_data = args_json.as_bytes().to_vec();
+    let stdin_data = args_json.into_bytes();
     let stdout_buf = MemoryOutputPipe::new(1024 * 1024); // 1 MiB
 
     let wasi_ctx = WasiCtxBuilder::new()
@@ -205,7 +213,7 @@ fn execute_wasm_sync(
     let host_state = HostState {
         capabilities,
         credentials,
-        allowed_paths: allowed_paths.to_vec(),
+        allowed_paths,
         http_allowlist,
         http_config: HttpConfig {
             timeout_ms: config.http_default_timeout_ms,
@@ -249,7 +257,7 @@ fn execute_wasm_sync(
     // Start epoch ticker thread for timeout enforcement
     let engine_clone = engine.clone();
     let epoch_interval_ms = 500u64;
-    let total_epochs = (timeout_ms + epoch_interval_ms - 1) / epoch_interval_ms;
+    let total_epochs = timeout_ms.div_ceil(epoch_interval_ms);
     let ticker = std::thread::spawn(move || {
         for _ in 0..total_epochs {
             std::thread::sleep(std::time::Duration::from_millis(epoch_interval_ms));

@@ -7,6 +7,7 @@ use std::collections::HashMap;
 #[derive(Debug, Deserialize)]
 pub struct Request {
     /// Unique request ID for correlation.
+    #[allow(dead_code)]
     pub request_id: String,
     /// Name of the tool to execute (e.g. "file_read", "shell_exec").
     pub tool_name: String,
