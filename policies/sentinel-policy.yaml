@@ -120,6 +120,26 @@ credential_patterns:
     pattern: 'postgres(ql)?://[^\s]+'
   - name: redis_uri
     pattern: 'redis://[^\s]+'
+  - name: npm_access_token
+    pattern: 'npm_[a-zA-Z0-9]{36}'
+  - name: pypi_upload_token
+    pattern: 'pypi-AgEIcHlwaS5vcmc[a-zA-Z0-9_-]{50,}'
+  - name: huggingface_token
+    pattern: 'hf_[a-zA-Z0-9]{34,}'
+  - name: google_api_key
+    pattern: 'AIza[A-Za-z0-9_-]{35}'
+  - name: stripe_secret_key
+    pattern: '(?:sk|rk)_(?:live|test|prod)_[a-zA-Z0-9]{10,99}'
+  - name: sendgrid_api_key
+    pattern: 'SG\.[a-zA-Z0-9=_.-]{66}'
+  - name: digitalocean_pat
+    pattern: 'dop_v1_[a-f0-9]{64}'
+  - name: vercel_token
+    pattern: '(?:vcp|vci|vca|vcr|vck)_[a-zA-Z0-9]{24,}'
+  - name: telegram_bot_token
+    pattern: '\d{5,16}:AA[a-zA-Z0-9_-]{32,33}'
+  - name: grafana_service_token
+    pattern: 'glsa_[A-Za-z0-9]{32}_[A-Fa-f0-9]{8}'
 
 sensitive_path_patterns:
   - /etc/shadow

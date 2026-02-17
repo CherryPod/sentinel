@@ -101,6 +101,76 @@ class TestCredentialScannerDetection:
         assert r.matches[0].pattern_name == "redis_uri"
 
 
+    def test_npm_access_token(self, cred_scanner: CredentialScanner):
+        r = cred_scanner.scan("NPM_TOKEN=npm_aBcDeFgHiJkLmNoPqRsTuVwXyZaBcDeFgHiJ")
+        assert r.found is True
+        assert r.matches[0].pattern_name == "npm_access_token"
+
+    def test_pypi_upload_token(self, cred_scanner: CredentialScanner):
+        # Real PyPI tokens start with pypi-AgEIcHlwaS5vcmc + base64url content
+        token = "pypi-AgEIcHlwaS5vcmc" + "A" * 60
+        r = cred_scanner.scan(f"PYPI_TOKEN={token}")
+        assert r.found is True
+        assert r.matches[0].pattern_name == "pypi_upload_token"
+
+    def test_huggingface_token(self, cred_scanner: CredentialScanner):
+        r = cred_scanner.scan("HF_TOKEN=hf_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefgh")
+        assert r.found is True
+        assert r.matches[0].pattern_name == "huggingface_token"
+
+    def test_google_api_key(self, cred_scanner: CredentialScanner):
+        r = cred_scanner.scan("GOOGLE_KEY=AIzaSyA1234567890abcdefghijklmnopqrstuv")
+        assert r.found is True
+        assert r.matches[0].pattern_name == "google_api_key"
+
+    def test_stripe_live_secret_key(self, cred_scanner: CredentialScanner):
+        r = cred_scanner.scan("STRIPE_KEY=sk_live_abcdefghijklmnopqrst1234")
+        assert r.found is True
+        assert r.matches[0].pattern_name == "stripe_secret_key"
+
+    def test_stripe_test_key(self, cred_scanner: CredentialScanner):
+        r = cred_scanner.scan("sk_test_abcdefghij1234567890")
+        assert r.found is True
+        assert r.matches[0].pattern_name == "stripe_secret_key"
+
+    def test_stripe_restricted_key(self, cred_scanner: CredentialScanner):
+        r = cred_scanner.scan("rk_live_abcdefghij1234567890")
+        assert r.found is True
+        assert r.matches[0].pattern_name == "stripe_secret_key"
+
+    def test_sendgrid_api_key(self, cred_scanner: CredentialScanner):
+        # SG. + 22 chars + . + 43 chars = 66 chars after SG.
+        r = cred_scanner.scan("SG.abcdefghijklmnopqrstuv.ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopq")
+        assert r.found is True
+        assert r.matches[0].pattern_name == "sendgrid_api_key"
+
+    def test_digitalocean_pat(self, cred_scanner: CredentialScanner):
+        hex64 = "a" * 64
+        r = cred_scanner.scan(f"DO_TOKEN=dop_v1_{hex64}")
+        assert r.found is True
+        assert r.matches[0].pattern_name == "digitalocean_pat"
+
+    def test_vercel_token(self, cred_scanner: CredentialScanner):
+        r = cred_scanner.scan("VERCEL_TOKEN=vcp_aBcDeFgHiJkLmNoPqRsTuVwX")
+        assert r.found is True
+        assert r.matches[0].pattern_name == "vercel_token"
+
+    def test_vercel_integration_token(self, cred_scanner: CredentialScanner):
+        r = cred_scanner.scan("vci_aBcDeFgHiJkLmNoPqRsTuVwX")
+        assert r.found is True
+        assert r.matches[0].pattern_name == "vercel_token"
+
+    def test_telegram_bot_token(self, cred_scanner: CredentialScanner):
+        r = cred_scanner.scan("BOT_TOKEN=123456789:AABBCCDDEEFFGGHHIIJJKKLLMMNNOOPPQQr")
+        assert r.found is True
+        assert r.matches[0].pattern_name == "telegram_bot_token"
+
+    def test_grafana_service_token(self, cred_scanner: CredentialScanner):
+        r = cred_scanner.scan("GRAFANA_TOKEN=glsa_9244xlVFZK0j8Lh4fU8Cz6Z5tO664zIi_7a762939")
+        assert r.found is True
+        assert r.matches[0].pattern_name == "grafana_service_token"
+
+
 class TestCredentialScannerClean:
     def test_normal_text_clean(self, cred_scanner: CredentialScanner):
         r = cred_scanner.scan("Here is your portfolio website HTML code")
