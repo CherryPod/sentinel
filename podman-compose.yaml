@@ -37,7 +37,7 @@ services:
       - SENTINEL_HTTP_PORT=8080
       - SENTINEL_REDIRECT_ENABLED=true
       - SENTINEL_EXTERNAL_HTTPS_PORT=3001
-      - SENTINEL_ALLOWED_ORIGINS=https://localhost:3001,https://localhost:3002
+      - SENTINEL_ALLOWED_ORIGINS=https://localhost:3001,https://thebeast:3001,https://192.168.0.40:3001,https://100.103.25.16:3001
     volumes:
       - ./policies:/policies:ro
       - sentinel-data:/data
