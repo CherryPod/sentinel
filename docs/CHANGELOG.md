@@ -1,5 +1,28 @@
 # Changelog
 
+## Container Migration — 3→2 Stack (2026-02-17)
+
+Migrated from old 3-container stack (sentinel-controller + sentinel-qwen + sentinel-ui) to new 2-container stack (sentinel + sentinel-ollama). Full end-to-end pipeline validated including UI, PIN auth, approval flow, and Qwen execution.
+
+### Fixes During Migration
+
+- **Containerfile:** `.[dev]` → `.[dev,mcp]` — MCP optional dependency was missing, causing 4 test files to fail on import inside the container
+- **PIN auth static assets:** Exempted `/`, `.js`, `.css`, `.png`, `.ico`, `.svg`, `.woff`, `.woff2` from PIN auth middleware — JS couldn't load to show the PIN overlay (chicken-and-egg problem)
+- **CSRF origins:** Added hostname, LAN IP, and Tailscale IP to `SENTINEL_ALLOWED_ORIGINS` for browser access from the local network
+
+### Validation
+
+- 1,006/1,006 Python tests pass inside the container
+- Health endpoint, PIN auth, HTTP→HTTPS redirect, static UI, air gap, and security headers all verified
+- Ollama air gap confirmed (network unreachable from sentinel-ollama container)
+- Full CaMeL pipeline tested: task submission → Claude planning → approval → Qwen execution → response
+
+### GitHub (commit 416be9f)
+
+Pushed Containerfile and PIN auth fixes to `main` — new users can clone, build, and see the UI working on localhost out of the box.
+
+---
+
 ## Phase 6: Hardening + Open Source (2026-02-17)
 
 Security audit, hardening, and open-source readiness. 77 new security tests (1006 Python + 41 Rust = 1047 total).
