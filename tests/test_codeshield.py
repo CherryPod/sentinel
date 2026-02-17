@@ -161,6 +161,193 @@ class TestCodeShieldScan:
         assert result.found is False
 
 
+class TestCodeShieldScanBlocks:
+    @pytest.mark.asyncio
+    async def test_not_loaded_returns_clean(self):
+        """When not loaded, scan_blocks returns clean result."""
+        result = await codeshield.scan_blocks([("eval(x)", "python")])
+        assert result.found is False
+        assert result.scanner_name == "codeshield"
+
+    @pytest.mark.asyncio
+    async def test_single_clean_block(self):
+        """Single clean code block passes."""
+        mock_result = MagicMock()
+        mock_result.is_insecure = False
+        mock_result.issues_found = None
+
+        mock_cs = MagicMock()
+        mock_cs.scan_code = AsyncMock(return_value=mock_result)
+
+        codeshield._cs_class = mock_cs
+        codeshield._loaded = True
+
+        result = await codeshield.scan_blocks([
+            ("def hello():\n    return 'world'", "python"),
+        ])
+        assert result.found is False
+
+    @pytest.mark.asyncio
+    async def test_one_clean_one_insecure(self):
+        """Mixed results: one clean + one insecure → overall insecure."""
+        clean_result = MagicMock()
+        clean_result.is_insecure = False
+        clean_result.issues_found = None
+
+        insecure_issue = MagicMock()
+        insecure_issue.cwe_id = "CWE-78"
+        insecure_issue.description = "os.system call"
+        insecure_issue.line = 1
+
+        insecure_result = MagicMock()
+        insecure_result.is_insecure = True
+        insecure_result.issues_found = [insecure_issue]
+
+        mock_cs = MagicMock()
+        mock_cs.scan_code = AsyncMock(side_effect=[clean_result, insecure_result])
+
+        codeshield._cs_class = mock_cs
+        codeshield._loaded = True
+
+        result = await codeshield.scan_blocks([
+            ("def safe(): pass", "python"),
+            ("import os\nos.system('ls')", "python"),
+        ])
+        assert result.found is True
+        assert len(result.matches) == 1
+        assert "CWE-78" in result.matches[0].pattern_name
+
+    @pytest.mark.asyncio
+    async def test_language_hint_passed(self):
+        """Language hint is forwarded to scan_code()."""
+        mock_result = MagicMock()
+        mock_result.is_insecure = False
+        mock_result.issues_found = None
+
+        mock_cs = MagicMock()
+        mock_cs.scan_code = AsyncMock(return_value=mock_result)
+
+        codeshield._cs_class = mock_cs
+        codeshield._loaded = True
+
+        # Mock the Language enum import
+        mock_lang_enum = MagicMock()
+        mock_lang_value = MagicMock()
+        mock_lang_enum.return_value = mock_lang_value
+
+        with patch.dict("sys.modules", {
+            "codeshield.insecure_code_detector.languages": MagicMock(Language=mock_lang_enum),
+        }):
+            await codeshield.scan_blocks([("print('hi')", "python")])
+            mock_lang_enum.assert_called_with("python")
+            mock_cs.scan_code.assert_called_once_with(
+                "print('hi')", language=mock_lang_value,
+            )
+
+    @pytest.mark.asyncio
+    async def test_none_language_hint(self):
+        """None language hint → scan without language parameter."""
+        mock_result = MagicMock()
+        mock_result.is_insecure = False
+        mock_result.issues_found = None
+
+        mock_cs = MagicMock()
+        mock_cs.scan_code = AsyncMock(return_value=mock_result)
+
+        codeshield._cs_class = mock_cs
+        codeshield._loaded = True
+
+        await codeshield.scan_blocks([("echo hello", None)])
+        mock_cs.scan_code.assert_called_once_with("echo hello", language=None)
+
+    @pytest.mark.asyncio
+    async def test_error_in_one_block_continues(self):
+        """Error scanning one block doesn't prevent scanning others."""
+        insecure_issue = MagicMock()
+        insecure_issue.cwe_id = "CWE-94"
+        insecure_issue.description = "eval detected"
+        insecure_issue.line = 1
+
+        insecure_result = MagicMock()
+        insecure_result.is_insecure = True
+        insecure_result.issues_found = [insecure_issue]
+
+        mock_cs = MagicMock()
+        mock_cs.scan_code = AsyncMock(
+            side_effect=[RuntimeError("crash"), insecure_result],
+        )
+
+        codeshield._cs_class = mock_cs
+        codeshield._loaded = True
+
+        result = await codeshield.scan_blocks([
+            ("block1", "python"),
+            ("eval(x)", "python"),
+        ])
+        assert result.found is True
+        assert len(result.matches) == 1
+
+    @pytest.mark.asyncio
+    async def test_multiple_insecure_blocks(self):
+        """Multiple insecure blocks → all issues merged."""
+        issue1 = MagicMock()
+        issue1.cwe_id = "CWE-78"
+        issue1.description = "os.system"
+        issue1.line = 1
+
+        issue2 = MagicMock()
+        issue2.cwe_id = "CWE-94"
+        issue2.description = "eval"
+        issue2.line = 1
+
+        result1 = MagicMock()
+        result1.is_insecure = True
+        result1.issues_found = [issue1]
+
+        result2 = MagicMock()
+        result2.is_insecure = True
+        result2.issues_found = [issue2]
+
+        mock_cs = MagicMock()
+        mock_cs.scan_code = AsyncMock(side_effect=[result1, result2])
+
+        codeshield._cs_class = mock_cs
+        codeshield._loaded = True
+
+        result = await codeshield.scan_blocks([
+            ("os.system('ls')", "python"),
+            ("eval(x)", "python"),
+        ])
+        assert result.found is True
+        assert len(result.matches) == 2
+
+    @pytest.mark.asyncio
+    async def test_insecure_no_issues_generic_match(self):
+        """Block flagged insecure but no specific issues → generic match."""
+        mock_result = MagicMock()
+        mock_result.is_insecure = True
+        mock_result.issues_found = []
+
+        mock_cs = MagicMock()
+        mock_cs.scan_code = AsyncMock(return_value=mock_result)
+
+        codeshield._cs_class = mock_cs
+        codeshield._loaded = True
+
+        result = await codeshield.scan_blocks([("bad code", None)])
+        assert result.found is True
+        assert result.matches[0].pattern_name == "codeshield_insecure"
+
+    @pytest.mark.asyncio
+    async def test_empty_blocks_list(self):
+        """Empty blocks list → clean result (nothing to scan)."""
+        codeshield._cs_class = MagicMock()
+        codeshield._loaded = True
+
+        result = await codeshield.scan_blocks([])
+        assert result.found is False
+
+
 class TestCodeShieldInitialize:
     def test_import_not_available(self):
         """When codeshield package is not installed, returns False gracefully."""

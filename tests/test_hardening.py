@@ -77,7 +77,7 @@ class TestGap1CodeShieldOnAllOutput:
 
         with patch("sentinel.planner.orchestrator.codeshield") as mock_cs:
             mock_cs.is_loaded.return_value = True
-            mock_cs.scan = AsyncMock(return_value=ScanResult(
+            mock_cs.scan_blocks = AsyncMock(return_value=ScanResult(
                 found=True,
                 matches=[ScanMatch(
                     pattern_name="codeshield_insecure",
@@ -92,7 +92,7 @@ class TestGap1CodeShieldOnAllOutput:
 
             assert result.status == "blocked"
             assert "CodeShield" in result.step_results[0].error
-            mock_cs.scan.assert_called_once_with(tagged.content)
+            mock_cs.scan_blocks.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_red_team_5_4_surveillance_script_blocked(self):
@@ -131,7 +131,7 @@ class TestGap1CodeShieldOnAllOutput:
 
         with patch("sentinel.planner.orchestrator.codeshield") as mock_cs:
             mock_cs.is_loaded.return_value = True
-            mock_cs.scan = AsyncMock(return_value=ScanResult(
+            mock_cs.scan_blocks = AsyncMock(return_value=ScanResult(
                 found=True,
                 matches=[ScanMatch(
                     pattern_name="codeshield_insecure",
@@ -145,7 +145,7 @@ class TestGap1CodeShieldOnAllOutput:
             result = await orch.handle_task("Set up monitoring")
 
             assert result.status == "blocked"
-            mock_cs.scan.assert_called_once()
+            mock_cs.scan_blocks.assert_called_once()
 
 
 # ── Gap 2: CommandPatternScanner ─────────────────────────────────
