@@ -5,7 +5,7 @@ import unicodedata
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import APIRouter, FastAPI, Query, Request
+from fastapi import APIRouter, FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, field_validator
@@ -961,16 +961,20 @@ async def create_routine(req: CreateRoutineRequest, request: Request):
             dt = datetime.now(timezone.utc) + timedelta(seconds=seconds)
             next_run_at = dt.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
-    routine = _routine_store.create(
-        name=req.name,
-        trigger_type=req.trigger_type,
-        trigger_config=req.trigger_config,
-        action_config=req.action_config,
-        description=req.description,
-        enabled=req.enabled,
-        cooldown_s=req.cooldown_s,
-        next_run_at=next_run_at,
-    )
+    try:
+        routine = _routine_store.create(
+            name=req.name,
+            trigger_type=req.trigger_type,
+            trigger_config=req.trigger_config,
+            action_config=req.action_config,
+            description=req.description,
+            enabled=req.enabled,
+            cooldown_s=req.cooldown_s,
+            next_run_at=next_run_at,
+            max_per_user=settings.routine_max_per_user,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=429, detail=str(exc))
 
     return {"status": "ok", "routine": _routine_to_dict(routine)}
 

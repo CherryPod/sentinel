@@ -134,18 +134,45 @@ Progress checklist for the evolution plan. Design rationale lives in `evolution-
 
 ---
 
-## Phase 6: Hardening + Open Source
+## Phase 6: Hardening + Open Source — COMPLETE (2026-02-17)
 
-> Goal: Security audit, documentation, GitHub push.
+> Goal: Security audit, hardening, documentation, open-source readiness.
 
-- [ ] Test suite: target 800+ tests
-- [ ] Security audit: memory injection, routine manipulation, WASM escape, MCP/Signal injection
-- [ ] New attack surfaces scanned (memory results as untrusted, routine creation requires approval)
-- [ ] Documentation complete
-- [ ] Sanitise: no personal paths, IPs, hostnames, secrets in repo
-- [ ] CI: GitHub Actions (pytest, cargo test, cargo clippy)
-- [ ] IronClaw credited (NOTICE file)
-- [ ] Smoke test: clean clone → `podman compose up` → working end-to-end
+- [x] **6.1 — Security bug fixes (6 gaps)**
+  - [x] G1: MCP `run_task` now passes `approval_mode` from settings (was defaulting to "auto")
+  - [x] G2: FTS5 query injection via double-quotes — strip `"` from search terms
+  - [x] G3: `routine_max_per_user` enforced in store + API (429 on limit)
+  - [x] G4: Event-triggered routines user_id filtering documented (single-user v1)
+  - [x] G5: MCP `search_memory` k clamped to 100
+  - [x] G6: Dead MQTT reference removed from policy
+- [x] **6.2 — Scanner improvements (from v3 assessment)**
+  - [x] S1: ASCII gate checks user input (not Claude's rewritten prompt) — FP rate 18.8% → ~4.7%
+  - [x] S2: Sensitive path scanner allows educational/config contexts
+  - [x] S3: Credential scanner allows compose service-name URIs
+  - [x] S4: Planner prompt amplification guard
+- [x] **6.3 — Security test suite (~77 new tests)**
+  - [x] Memory injection: FTS5 injection, stored content injection, MCP bypass, metadata safety (15 tests)
+  - [x] Routine security: prompt injection, per-user limits, event trigger abuse, store update safety (15 tests)
+  - [x] Channel injection: MCP approval_mode, input validation, Signal handling (12 tests)
+  - [x] Cross-layer: memory→orchestrator, routine→event cascade, MCP→routine isolation (10 tests)
+  - [x] Sidecar security: path traversal, error safety, resource boundaries (5 tests)
+  - [x] Scanner improvements: ASCII gate, path scanner, credential scanner (20 tests)
+- [x] **6.4 — Sanitisation**
+  - [x] Removed personal data: hostname, username, IPs from all source/config/test files
+  - [x] Secrets paths changed to `./secrets/` (relative)
+  - [x] `allowed_origins` defaults to localhost-only
+  - [x] Ollama `OLLAMA_NUM_CTX=16384` (fixes 71% truncation cliff)
+- [x] **6.5 — Documentation + attribution**
+  - [x] NOTICE file (IronClaw credit)
+  - [x] CONTRIBUTING.md updated (test paths, counts, container build, Rust section)
+  - [x] SECURITY.md updated (GitHub Security Advisories, expanded scope)
+- [x] **6.6 — CI pipeline**
+  - [x] GitHub Actions: Python tests (pytest, Python 3.12) + Rust sidecar (cargo test + clippy)
+  - [x] All external services mocked — no GPU/API keys needed
+- [x] **6.7 — Smoke test**
+  - [x] `scripts/smoke_test.sh` — health, PIN auth, HTTPS redirect, UI, air gap, security headers
+
+**Verified:** 1006 Python tests + 41 Rust tests (1047 total, all pass). Zero personal data in source files. CI pipeline covers both languages.
 
 ---
 

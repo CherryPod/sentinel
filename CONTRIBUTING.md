@@ -8,8 +8,13 @@ Thanks for your interest in contributing. This document covers the development w
 2. Set up the development environment (see [docs/deployment.md](docs/deployment.md))
 3. Run the test suite to verify your setup:
    ```bash
-   podman exec sentinel-controller pytest /app/tests/ -v
+   # Python tests
+   .venv/bin/pytest tests/ -v
+
+   # Rust sidecar tests
+   cargo test --manifest-path sidecar/Cargo.toml
    ```
+4. Read [docs/codebase-map.md](docs/codebase-map.md) for an overview of the codebase structure
 
 ## Development Workflow
 
@@ -30,37 +35,44 @@ Thanks for your interest in contributing. This document covers the development w
 ### Running Tests
 
 ```bash
-# In-container tests (recommended — matches CI environment)
-podman exec sentinel-controller pytest /app/tests/ -v
+# Python tests (requires Python 3.12 + dependencies from pyproject.toml)
+.venv/bin/pytest tests/ -v
 
-# Local tests (requires Python 3.12 + dependencies)
-PYTHONPATH=controller .venv/bin/python -m pytest controller/tests/ -v
+# Rust sidecar tests (requires Rust toolchain + wasm32-wasip1 target)
+cargo test --manifest-path sidecar/Cargo.toml
+
+# Quick check (Python only, stop on first failure)
+.venv/bin/pytest tests/ -x -q
 ```
 
-### Rebuilding After Code Changes
+The test suite mocks all external services (Ollama, Claude API, Prompt Guard, CodeShield). No GPU, API keys, or running containers are needed.
 
-The controller requires a manual build (Prompt Guard model needs a HuggingFace token):
+Environment variables for CI/testing:
+- `SENTINEL_PROMPT_GUARD_ENABLED=false` — skip Prompt Guard
+- `SENTINEL_REQUIRE_CODESHIELD=false` — skip CodeShield
+- `SENTINEL_PIN_REQUIRED=false` — skip PIN authentication
+
+### Building Containers
 
 ```bash
+# Build the controller + UI container
 podman build \
-  --secret id=hf_token,src=$HOME/.secrets/hf_token.txt \
-  -t sentinel-controller:latest \
-  -t sentinel_sentinel-controller:latest \
-  -f controller/Dockerfile controller/
+  --secret id=hf_token,src=./secrets/hf_token.txt \
+  -t sentinel:latest \
+  -f container/Containerfile .
 
-podman stop sentinel-ui sentinel-controller sentinel-qwen
-podman rm sentinel-ui sentinel-controller sentinel-qwen
-podman compose up -d --force-recreate
+# Start the stack
+podman compose -f podman-compose.phase1.yaml up -d
 ```
 
-See [docs/deployment.md](docs/deployment.md) for the full rebuild procedure and common gotchas.
+See [docs/deployment.md](docs/deployment.md) for the full build procedure and common gotchas.
 
 ## Guidelines
 
 - **Security first** — Sentinel is a security project. Every change should consider the threat model. If you're unsure whether a change could weaken security, open an issue to discuss before submitting a PR
-- **Test coverage** — all new security-relevant code must have tests. The current suite has 435 unit tests
+- **Test coverage** — all new security-relevant code must have tests. The current suite has 1006 Python tests + 41 Rust tests
 - **No secrets in code** — never commit API keys, tokens, or credentials. Use Podman secrets
-- **Air gap is sacred** — `sentinel-qwen` must never have internet access. Any change that touches networking should be reviewed carefully
+- **Air gap is sacred** — the worker LLM must never have internet access. Any change that touches networking should be reviewed carefully
 - **Keep it simple** — avoid over-engineering. The security pipeline is already complex; additional complexity should be justified
 
 ## Reporting Issues

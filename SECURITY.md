@@ -6,7 +6,7 @@ If you discover a security vulnerability in Sentinel, please report it responsib
 
 **Do NOT open a public GitHub issue for security vulnerabilities.**
 
-Instead, please email: **security@example.com** (replace with your actual contact)
+Instead, use [GitHub Security Advisories](https://github.com/anthropics/sentinel/security/advisories/new) to report vulnerabilities privately. If the advisories link is unavailable, open a private security report via the repository's "Security" tab.
 
 Include:
 - Description of the vulnerability
@@ -22,9 +22,13 @@ The following are in scope for security reports:
 
 - Bypasses of the 10-layer security pipeline
 - Prompt injection that produces genuinely dangerous output (not just "escaped" — see our [triage methodology](docs/assessments/v3-security-analysis.md))
-- Air-gap violations (any way for `sentinel-qwen` to reach the internet)
+- Air-gap violations (any way for the worker LLM to reach the internet)
 - Authentication bypasses (PIN auth, CSRF protection)
 - Trust laundering (untrusted data reaching dangerous operations without scanning)
+- Memory injection (poisoned memory content influencing orchestrator behaviour)
+- Routine manipulation (crafting routines that bypass security controls)
+- MCP tool abuse (using MCP tools to circumvent approval gates or access controls)
+- WASM sandbox escape (breaking out of the Wasmtime sandbox)
 - Session manipulation or replay attacks
 - Vulnerabilities in the controller, policy engine, or scan pipeline
 

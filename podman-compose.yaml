@@ -55,6 +55,7 @@ services:
     environment:
       - OLLAMA_HOST=0.0.0.0:11434
       - OLLAMA_KEEP_ALIVE=5m
+      - OLLAMA_NUM_CTX=16384
     volumes:
       - sentinel-ollama-data:/root/.ollama
     devices:
@@ -112,9 +113,9 @@ networks:
 
 secrets:
   claude_api_key:
-    file: /home/kifterz/.secrets/claude_api_key.txt
+    file: ./secrets/claude_api_key.txt
   sentinel_pin:
-    file: /home/kifterz/.secrets/sentinel_pin.txt
+    file: ./secrets/sentinel_pin.txt
 
 volumes:
   sentinel-workspace:

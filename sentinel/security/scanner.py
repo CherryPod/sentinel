@@ -20,6 +20,10 @@ class CredentialScanner:
         "example.com", "example.org", "example.net",
         "user:pass@", "user:password@", "username:password@",
         "your-password", "<password>", "changeme",
+        # Common compose service names (not real hosts) — use //host: to
+        # match the URI host portion, not the scheme (e.g. "postgres://")
+        "//db:", "//redis:", "//postgres:", "//mysql:", "//mongo:",
+        "//rabbitmq:", "//memcached:",
     ]
 
     def __init__(self, patterns: list[dict]):
@@ -148,6 +152,20 @@ class SensitivePathScanner:
                         matched_text=pattern,
                         position=pos,
                     ))
+                    continue
+
+                # Check 4: markdown list item with surrounding prose (educational)
+                if re.match(r"^\s*[-*]\s+", line) and len(stripped) > len(pattern) + 5:
+                    continue
+
+                # Check 5: path followed by explanatory text (e.g. "— stores ...")
+                path_end = pos + len(pattern) - line_start
+                after_path = stripped[path_end:].strip() if path_end < len(stripped) else ""
+                if after_path and re.match(r"^[—–\-:]\s+\w", after_path):
+                    continue
+
+                # Check 6: YAML/HCL config context (indented key: value structure)
+                if re.match(r"^\s+\w[\w_-]*\s*:", line):
                     continue
 
                 # Otherwise: path is in prose context — skip (educational)

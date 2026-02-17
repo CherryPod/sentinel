@@ -34,7 +34,7 @@ A defence-in-depth AI assistant built on the CaMeL architecture. Claude API (Pla
 - GPU is shared — Ollama load/unload handles VRAM contention
 
 ## Testing
-- Local: `.venv/bin/pytest tests/` — 929 tests
+- Local: `.venv/bin/pytest tests/` — 1006 tests
 - Container (legacy layout): `podman exec sentinel-controller pytest /app/tests/`
 - Stress test: `python3 scripts/analyse_v3_results.py` (reads `benchmarks/v3-results.jsonl`)
 

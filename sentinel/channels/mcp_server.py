@@ -12,6 +12,8 @@ import logging
 
 from mcp.server.fastmcp import FastMCP
 
+from sentinel.core.config import settings
+
 logger = logging.getLogger("sentinel.audit")
 
 
@@ -36,6 +38,9 @@ def create_mcp_server(orchestrator, memory_store, embedding_client, event_bus) -
         Returns up to k results ranked by Reciprocal Rank Fusion.
         This is a SAFE operation — it does not go through the CaMeL pipeline.
         """
+        # Clamp k to prevent unbounded result sets
+        k = min(k, 100)
+
         if memory_store is None or memory_store._db is None:
             return json.dumps({"status": "error", "reason": "Memory system not initialized"})
 
@@ -131,6 +136,7 @@ def create_mcp_server(orchestrator, memory_store, embedding_client, event_bus) -
             result = await orchestrator.handle_task(
                 user_request=request,
                 source="mcp",
+                approval_mode=settings.approval_mode,
             )
             return json.dumps(result.model_dump(), default=str)
         except Exception as exc:

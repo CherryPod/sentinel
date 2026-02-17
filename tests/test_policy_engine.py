@@ -83,7 +83,7 @@ class TestFileRead:
         assert r.status == PolicyResult.BLOCKED
 
     def test_ssh_blocked(self, engine: PolicyEngine):
-        r = engine.check_file_read("/home/kifterz/.ssh/id_rsa")
+        r = engine.check_file_read("/home/testuser/.ssh/id_rsa")
         assert r.status == PolicyResult.BLOCKED
 
     def test_env_blocked(self, engine: PolicyEngine):
@@ -91,7 +91,7 @@ class TestFileRead:
         assert r.status == PolicyResult.BLOCKED
 
     def test_wallet_blocked(self, engine: PolicyEngine):
-        r = engine.check_file_read("/home/kifterz/.bitcoin/wallet.dat")
+        r = engine.check_file_read("/home/testuser/.bitcoin/wallet.dat")
         assert r.status == PolicyResult.BLOCKED
 
     def test_outside_workspace_blocked(self, engine: PolicyEngine):

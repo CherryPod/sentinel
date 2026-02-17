@@ -84,7 +84,6 @@ network:
   controller_outbound_allowed:
     - api.anthropic.com:443
   controller_internal_allowed:
-    - mosquitto:1883
     - sentinel-qwen:11434
 
 human_approval_required:

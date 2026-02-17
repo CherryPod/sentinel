@@ -83,8 +83,10 @@ class Settings(BaseSettings):
     # markers, sandwich text, UNTRUSTED_DATA structure). Off by default.
     verbose_results: bool = False
 
-    # CSRF protection (Tier 4) — comma-separated list of allowed origins
-    allowed_origins: str = "https://localhost:3001,https://localhost:3002,https://thebeast:3001,https://thebeast:3002,https://192.168.0.40:3001,https://192.168.0.40:3002,https://100.103.25.16:3001,https://100.103.25.16:3002"
+    # CSRF protection (Tier 4) — comma-separated list of allowed origins.
+    # Add your hostname/IP origins for non-localhost access, e.g.:
+    #   SENTINEL_ALLOWED_ORIGINS="https://localhost:3001,...,https://myhost:3001"
+    allowed_origins: str = "https://localhost:3001,https://localhost:3002,https://localhost:3003,https://localhost:3004"
 
     # Request size limit (Tier 4, code review #13) — 1MB
     max_request_bytes: int = 1_048_576

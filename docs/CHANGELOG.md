@@ -1,5 +1,85 @@
 # Changelog
 
+## Phase 6: Hardening + Open Source (2026-02-17)
+
+Security audit, hardening, and open-source readiness. 77 new security tests (1006 Python + 41 Rust = 1047 total).
+
+### 6.1 — Security Bug Fixes (6 gaps)
+
+- **G1 — MCP approval bypass [HIGH]:** `run_task` now passes `approval_mode` from settings instead of defaulting to `"auto"` — `sentinel/channels/mcp_server.py`
+- **G2 — FTS5 query injection [MEDIUM]:** Double-quotes stripped from search terms to prevent FTS5 syntax injection — `sentinel/memory/search.py`
+- **G3 — Routine per-user limit [MEDIUM]:** `routine_max_per_user` enforced in store + API (429 on limit) — `sentinel/routines/store.py`, `sentinel/api/app.py`
+- **G4 — Event trigger user_id [LOW]:** Documented as single-user v1 limitation — `sentinel/routines/engine.py`
+- **G5 — MCP unbounded k [LOW]:** `search_memory` k clamped to 100 — `sentinel/channels/mcp_server.py`
+- **G6 — Dead MQTT reference [INFO]:** Removed `mosquitto:1883` from policy — `policies/sentinel-policy.yaml`
+
+### 6.2 — Scanner Improvements (from v3 assessment)
+
+- **S1 — ASCII gate reform [CRITICAL]:** Checks user's original input (not Claude's rewritten prompt) — eliminates 45/60 FPs. Chained steps still checked via the prompt parameter. FP rate 18.8% → ~4.7% — `sentinel/security/pipeline.py`
+- **S2 — Sensitive path scanner context [MODERATE]:** Allows paths in markdown lists, explanatory text, and YAML config context — eliminates 7 FPs — `sentinel/security/scanner.py`
+- **S3 — Credential scanner allowlist [MINOR]:** Compose service-name URIs (`//redis:`, `//db:`, etc.) no longer flagged — `sentinel/security/scanner.py`
+- **S4 — Planner amplification guard [LOW]:** System prompt instructs Claude not to volunteer additional sensitive categories beyond what was requested — `sentinel/planner/planner.py`
+
+### 6.3 — Security Tests (77 new)
+
+| File | Tests | Coverage |
+|------|-------|----------|
+| `tests/test_scanner_improvements.py` | 20 | ASCII gate, path scanner, credential scanner, amplification guard |
+| `tests/test_memory_injection.py` | 15 | FTS5 injection, stored content injection, MCP bypass, metadata safety |
+| `tests/test_routine_security.py` | 15 | Prompt injection, per-user limits, event trigger abuse, store update safety |
+| `tests/test_channel_injection.py` | 12 | MCP approval_mode, input validation, Signal handling |
+| `tests/test_cross_layer.py` | 10 | Memory→orchestrator, routine→event cascade, MCP→routine isolation |
+| `tests/test_sidecar_security.py` | 5 | Path traversal, error safety, resource boundaries |
+
+### 6.4 — Sanitisation
+
+- Removed personal data (hostname, username, IPs) from all source, config, and test files
+- Secrets paths changed to `./secrets/` (relative, gitignored)
+- `allowed_origins` defaults to localhost-only
+- Added `OLLAMA_NUM_CTX=16384` to compose files (fixes 71% truncation cliff at ~10K chars)
+
+### 6.5 — Documentation + Attribution
+
+- `NOTICE` — IronClaw architectural inspiration credit (Apache-2.0)
+- `CONTRIBUTING.md` — updated test paths, counts (1006), container build, added Rust sidecar section
+- `SECURITY.md` — GitHub Security Advisories for reporting, expanded scope (memory injection, routines, MCP, WASM)
+
+### 6.6 — CI Pipeline
+
+- `.github/workflows/ci.yml` — Python tests (pytest, Python 3.12) + Rust sidecar (cargo test + clippy)
+- All external services mocked — no GPU or API keys needed in CI
+
+### 6.7 — Smoke Test
+
+- `scripts/smoke_test.sh` — post-deploy verification: health endpoints, PIN auth, HTTPS redirect, UI, air gap, security headers
+
+---
+
+## Phase 5: Routines + Multi-Provider (2026-02-17)
+
+Background automation and model flexibility. 74 new tests (929 total).
+
+- **Routine engine** — cron + event + interval triggers, SQLite state, cooldowns, max concurrent, execution timeouts — `sentinel/routines/engine.py`
+- **Routine API** — CRUD (POST/GET/PATCH/DELETE), manual trigger, execution history — `sentinel/api/app.py`
+- **Routine store** — dual-mode (SQLite + in-memory), cascade deletes, run state tracking — `sentinel/routines/store.py`
+- **Multi-provider LLM** — `WorkerBase`/`PlannerBase`/`EmbeddingBase` ABCs, config-driven factory, generic exception hierarchy — `sentinel/worker/base.py`, `sentinel/worker/factory.py`
+- **Event bus integration** — routines emit `routine.triggered`/`routine.executed`/`routine.failed`, self-loop prevention via `routine.*` prefix block
+
+---
+
+## Phase 4: WASM Tool Sandbox (2026-02-16)
+
+Rust sidecar with Wasmtime for sandboxed tool execution. 29 new Python tests + 41 Rust tests (855 total).
+
+- **Wasmtime integration** — fresh Store per execution, fuel metering (1B budget), epoch timeout, WASI P1 — `sidecar/src/sandbox.rs`
+- **Capability model** — ReadFile, WriteFile, HttpRequest, UseCredential, InvokeTool, ShellExec — deny-by-default — `sidecar/src/capabilities.rs`
+- **Credential injection + leak detection** — per-execution credential map, Aho-Corasick output scanner (22 patterns), redaction — `sidecar/src/leak_detector.rs`
+- **HTTP allowlist + SSRF protection** — URL validation, private IP rejection (v4+v6), DNS rebinding defence, hostname glob matching — `sidecar/src/http_client.rs`
+- **Python client** — `SidecarClient` over Unix socket, auto-start, crash recovery, timeout handling — `sentinel/tools/sidecar.py`
+- **V1 tool set** — file_read, file_write, shell_exec, http_fetch as wasm32-wasip1 crates (197-227KB each)
+
+---
+
 ## Phase 3: Multi-Channel Access (2026-02-16)
 
 Real-time communication channels — WebSocket, SSE, Signal messaging, and MCP server. All channels route through the existing CaMeL security pipeline. 74 new tests (826 total).

@@ -63,6 +63,15 @@ class RoutineStore:
 
     # -- CRUD --
 
+    def count_for_user(self, user_id: str) -> int:
+        """Return the number of routines owned by a user."""
+        if self._db is not None:
+            row = self._db.execute(
+                "SELECT COUNT(*) FROM routines WHERE user_id = ?", (user_id,)
+            ).fetchone()
+            return row[0]
+        return sum(1 for r in self._mem.values() if r.user_id == user_id)
+
     def create(
         self,
         name: str,
@@ -74,8 +83,18 @@ class RoutineStore:
         enabled: bool = True,
         cooldown_s: int = 0,
         next_run_at: str | None = None,
+        max_per_user: int = 0,
     ) -> Routine:
-        """Create a new routine and return it."""
+        """Create a new routine and return it.
+
+        If max_per_user > 0, raises ValueError when the user already owns
+        that many routines.
+        """
+        if max_per_user > 0 and self.count_for_user(user_id) >= max_per_user:
+            raise ValueError(
+                f"User {user_id!r} already has {max_per_user} routines (limit reached)"
+            )
+
         routine_id = str(uuid.uuid4())
         now = _now_iso()
 

@@ -151,6 +151,8 @@ class RoutineEngine:
             return
 
         # Find enabled event-triggered routines
+        # TODO: add user_id filter for multi-user — currently all users' event
+        # routines fire on matching topics. Single-user v1 limitation.
         if self._db is not None:
             rows = self._db.execute(
                 "SELECT * FROM routines WHERE enabled = 1 AND trigger_type = 'event'"

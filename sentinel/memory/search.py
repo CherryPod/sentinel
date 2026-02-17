@@ -103,11 +103,15 @@ def fts_search(
     Uses MATCH with BM25 ranking (FTS5 default). The query is escaped to
     prevent FTS5 syntax injection — only simple term matching is used.
     """
-    # Escape FTS5 special characters by wrapping each term in double-quotes
+    # Escape FTS5 special characters: strip double-quotes (prevents FTS5 syntax
+    # injection), then wrap each term in double-quotes for literal matching
     terms = query.split()
     if not terms:
         return []
-    safe_query = " ".join(f'"{term}"' for term in terms)
+    safe_query = " ".join(f'"{term.replace(chr(34), "")}"' for term in terms)
+    # If all terms were empty after stripping, bail out
+    if safe_query.replace('"', "").strip() == "":
+        return []
 
     try:
         rows = db.execute(

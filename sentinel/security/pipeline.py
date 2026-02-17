@@ -291,11 +291,16 @@ class ScanPipeline:
                 },
             )
 
-        # 1.5. ASCII gate: verify planner prompt contains only English characters.
-        # This is the deterministic backstop for the LANGUAGE SAFETY RULE in the
-        # planner system prompt. Catches non-Latin script that Claude failed to
-        # translate (CJK, Cyrillic homoglyphs, Arabic, etc.).
-        self._check_prompt_ascii(prompt)
+        # 1.5. ASCII gate: prevent non-Latin script from reaching Qwen.
+        # When user_input is provided (first step): check user's raw input,
+        # not Claude's rewritten prompt (Claude legitimately uses Unicode like
+        # smart quotes, em-dashes, math symbols — these caused 45/60 FPs).
+        # When user_input is absent (chained step): check the prompt directly,
+        # since it may contain prior Qwen output with injected CJK/Cyrillic.
+        if user_input:
+            self._check_prompt_ascii(user_input)
+        else:
+            self._check_prompt_ascii(prompt)
 
         # 1.6. Prompt length gate: reject oversized prompts before they reach Qwen.
         # The per-field limit is 50K chars, but the orchestrator can combine
