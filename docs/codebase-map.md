@@ -93,7 +93,8 @@ container/             # Containerfile for builds
 | `scanner.py` | ~512 | Regex scanners: CredentialScanner, SensitivePathScanner, CommandPatternScanner, VulnerabilityEchoScanner, EncodingNormalizationScanner |
 | `policy_engine.py` | ~288 | YAML-driven deterministic rules: file paths, commands, traversal detection, injection patterns |
 | `prompt_guard.py` | ~117 | Prompt Guard 2 (86M BERT) — injection/jailbreak detection, 2000-char chunking |
-| `codeshield.py` | ~136 | CodeShield/Semgrep wrapper — insecure code detection, async, fail-closed |
+| `code_extractor.py` | ~120 | Fenced code block extraction, language tag mapping + heuristic detection, emoji stripping from code |
+| `codeshield.py` | ~170 | CodeShield/Semgrep wrapper — `scan_blocks()` per-block scanning with language hints, fail-closed |
 | `spotlighting.py` | ~33 | Per-word character prefix marking for untrusted data |
 | `conversation.py` | ~493 | 8 heuristic rules for multi-turn attack detection (retry, escalation, recon, topic shift, etc.) |
 | `provenance.py` | ~260 | ProvenanceStore class (SQLite/in-memory) + module-level wrappers, trust tagging, recursive CTE chain walking |
@@ -101,14 +102,17 @@ container/             # Containerfile for builds
 **Key constants:**
 - `pipeline.py:24` — `_MARKER_POOL = "~!@#%*+=|;:"` (spotlighting alphabet)
 - `pipeline.py:27-31` — `_SANDWICH_REMINDER` (post-data security reminder)
+- `code_extractor.py` — `_LANGUAGE_MAP` (tag→canonical), `_EMOJI_RE` (Unicode ranges for stripping)
 - `scanner.py` — 11 built-in command patterns, 16 vulnerability fingerprints, 6 encoding decoders
-- `conversation.py:23-114` — capability tiers, override patterns, sensitive topics, escalation language
+- `conversation.py:23-114` — capability tiers, 14 override patterns, sensitive topics, escalation language
 - `policy_engine.py:32-39` — `_injection_patterns` (subshell, backtick, semicolon, pipe, chaining)
 
 **Key classes:**
 - `pipeline.SecurityViolation` — raised when any scan fails (stores scan_results, raw_response)
 - `pipeline.ScanPipeline.process_with_qwen()` — the full input→Qwen→output pipeline
-- `scanner.CredentialScanner` — 12+ regex patterns, URI allowlist suppression
+- `code_extractor.extract_code_blocks()` — returns `list[CodeBlock]` (code, language, start/end positions)
+- `code_extractor.strip_emoji_from_code_blocks()` — removes emoji from code blocks, preserves prose
+- `scanner.CredentialScanner` — 22+ regex patterns (inc. npm, PyPI, HF, Stripe, etc.), URI allowlist suppression
 - `scanner.SensitivePathScanner.scan_output_text()` — context-aware (only flags in code/shell, not prose)
 - `scanner.EncodingNormalizationScanner` — decodes base64/hex/URL/ROT13/HTML/char-split, re-scans
 
@@ -218,18 +222,19 @@ WASM tool sandbox with Wasmtime. Executes tools in isolated WASM instances with 
 | File | Tests | Source Module(s) |
 |------|-------|-----------------|
 | `test_policy_engine.py` | ~60 | security/policy_engine (paths, commands, traversal, globs) |
-| `test_scanner.py` | ~50 | security/scanner (credentials, paths, commands, echo) |
+| `test_scanner.py` | ~65 | security/scanner (credentials inc. 10 new patterns, paths, commands, echo) |
 | `test_encoding_scanner.py` | ~25 | security/scanner (base64, hex, URL, ROT13, HTML, char-split) |
-| `test_pipeline.py` | ~30 | security/pipeline (input/output scan, SecurityViolation, ASCII gate) |
+| `test_pipeline.py` | ~35 | security/pipeline (input/output scan, SecurityViolation, ASCII gate, empty response retry) |
 | `test_spotlighting.py` | ~10 | security/spotlighting (apply/remove markers) |
 | `test_prompt_guard.py` | ~15 | security/prompt_guard (init, chunking, classification) |
-| `test_codeshield.py` | ~10 | security/codeshield (init, scan parsing) |
+| `test_code_extractor.py` | ~39 | security/code_extractor (block extraction, language detection, emoji stripping) |
+| `test_codeshield.py` | ~19 | security/codeshield (init, scan parsing, scan_blocks with language hints) |
 | `test_planner.py` | ~40 | planner/planner (plan creation, validation, refusals) |
 | `test_orchestrator.py` | ~50 | planner/orchestrator (context, steps, trust gates, chain-safe) |
 | `test_tools.py` | ~40 | tools/executor (file I/O, shell, Podman, flag deny-list) |
 | `test_provenance.py` | ~20 | security/provenance (trust inheritance, chains, file tracking) |
 | `test_approval.py` | ~15 | core/approval (lifecycle, TTL, submit) |
-| `test_conversation.py` | ~40 | security/conversation (all 8 rules, combined scoring, FP prevention) |
+| `test_conversation.py` | ~57 | security/conversation (all 8 rules, combined scoring, FP prevention, first-turn override, authority patterns) |
 | `test_pin_auth.py` | ~20 | api/auth (PIN validation, lockout, timing) |
 | `test_hardening.py` | ~30 | Cross-module hardening regression tests |
 | `test_input_validation.py` | ~15 | api/app Pydantic validators + pipeline length gate |
@@ -258,7 +263,7 @@ WASM tool sandbox with Wasmtime. Executes tools in isolated WASM instances with 
 | `test_routine_engine.py` | 21 | Scheduler loop, event/manual triggers, cooldown, timeout, bus emissions |
 | `conftest.py` | — | Fixtures: engine, cred_scanner, path_scanner, cmd_scanner, encoding_scanner |
 
-**Total: 929 Python tests + 41 Rust tests passing** (`pytest tests/` + `cargo test` from project root)
+**Total: 1090 Python tests + 41 Rust tests passing** (`pytest tests/` + `cargo test` from project root)
 
 ---
 
@@ -312,7 +317,9 @@ User → HTTPS (uvicorn TLS) or HTTP (redirect.HTTPSRedirectApp → 301)
                         → security/spotlighting.apply_datamarking()
                         → worker/ollama.generate() → sentinel-qwen:11434
                         → security/provenance.create_tagged_data() [UNTRUSTED, SQLite]
-                        → security/codeshield.scan()
+                        → security/code_extractor.extract_code_blocks()
+                        → security/codeshield.scan_blocks() [per-block with language hints]
+                        → security/code_extractor.strip_emoji_from_code_blocks()
                         → security/pipeline.scan_output()
                         → security/scanner.VulnerabilityEchoScanner.scan()
              tool_call → security/provenance.is_trust_safe_for_execution() [recursive CTE]
@@ -351,7 +358,8 @@ sentinel/api/app.py [lifespan: init_db → SessionStore, ApprovalManager, Proven
   │     ├── core/approval.py [SQLite-backed, configurable TTL]
   │     ├── session/store.py [SQLite write-through + in-memory fallback]
   │     ├── security/conversation.py
-  │     └── security/codeshield.py → semgrep
+  │     ├── security/code_extractor.py (extract_code_blocks, strip_emoji_from_code_blocks)
+  │     └── security/codeshield.py → semgrep (scan_blocks)
   ├── core/bus.py (event bus — wired to orchestrator + channels)
   ├── channels/base.py (Channel ABC, ChannelRouter)
   ├── channels/web.py (WebSocketChannel, SSEWriter)

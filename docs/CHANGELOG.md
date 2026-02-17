@@ -23,6 +23,7 @@ For v0.1 migration history (Phases 0-6), see `archive/2026-02-17_v0.1-migration-
 ### Changed
 - CodeShield now scans extracted code blocks instead of full Qwen response text (expected catch rate improvement: 54% → 75-85%)
 - `OLLAMA_NUM_PREDICT=-1` added to `podman-compose.yaml` — unlimited output tokens (was using Ollama default)
+- Container rebuilt and redeployed with all assessment plan changes (1090/1090 tests pass in-container)
 - Archived migration-era docs (evolution tracker, evolution plan, old changelog) to `docs/archive/`
 - Fresh changelog format: date-grouped with conventional categories
 
