@@ -1,4 +1,8 @@
-from sentinel.security.code_extractor import CodeBlock, extract_code_blocks
+from sentinel.security.code_extractor import (
+    CodeBlock,
+    extract_code_blocks,
+    strip_emoji_from_code_blocks,
+)
 
 
 class TestFencedBlockExtraction:
@@ -216,3 +220,60 @@ class TestMixedContent:
         assert blocks[0].language == "python"
         assert blocks[1].language == "javascript"
         assert "child_process" in blocks[1].code
+
+
+class TestStripEmojiFromCodeBlocks:
+    def test_emoji_in_code_comment_stripped(self):
+        """The actual Qwen quirk: ✅ in Python code comments."""
+        text = "Here's the code:\n\n```python\n# Check passed ✅\nprint('ok')\n```\n"
+        result = strip_emoji_from_code_blocks(text)
+        assert "\u2705" not in result  # ✅ removed
+        assert "print('ok')" in result
+        assert "Here's the code:" in result  # prose preserved
+
+    def test_emoji_in_prose_preserved(self):
+        """Emoji in prose text (outside code blocks) should be left alone."""
+        text = "Great job! ✅ Here's your code:\n\n```python\nprint('ok')\n```\n"
+        result = strip_emoji_from_code_blocks(text)
+        assert "Great job! \u2705" in result  # prose emoji kept
+        assert "print('ok')" in result
+
+    def test_multiple_emoji_types_stripped(self):
+        """Various emoji types are all stripped from code."""
+        text = "```python\n# Working 🚀 fast ⚡ good ✨\nx = 1\n```\n"
+        result = strip_emoji_from_code_blocks(text)
+        assert "\U0001F680" not in result  # 🚀
+        assert "\u26A1" not in result      # ⚡
+        assert "\u2728" not in result      # ✨
+        assert "x = 1" in result
+
+    def test_no_code_blocks_unchanged(self):
+        """Text without code blocks is returned unchanged."""
+        text = "Just prose with emoji ✅ and no code."
+        result = strip_emoji_from_code_blocks(text)
+        assert result == text
+
+    def test_ascii_code_unchanged(self):
+        """Code blocks without emoji are not modified."""
+        text = "```python\ndef hello():\n    return 'world'\n```\n"
+        result = strip_emoji_from_code_blocks(text)
+        assert "def hello():" in result
+        assert "return 'world'" in result
+
+    def test_language_tag_preserved(self):
+        """Language tag on the code block is preserved."""
+        text = "```python\n# Done ✅\nprint('ok')\n```\n"
+        result = strip_emoji_from_code_blocks(text)
+        assert "```python\n" in result
+
+    def test_multiple_code_blocks(self):
+        """Emoji stripped from all code blocks independently."""
+        text = (
+            "```python\n# Step 1 ✅\nx = 1\n```\n\n"
+            "```javascript\n// Step 2 🎉\nlet y = 2;\n```\n"
+        )
+        result = strip_emoji_from_code_blocks(text)
+        assert "\u2705" not in result
+        assert "\U0001F389" not in result
+        assert "x = 1" in result
+        assert "let y = 2;" in result

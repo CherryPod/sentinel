@@ -68,6 +68,35 @@ def _detect_language(code: str) -> str | None:
     return None
 
 
+# Emoji and symbol Unicode ranges that cause syntax errors in code.
+# Covers emoticons, dingbats, pictographs, transport symbols, etc.
+_EMOJI_RE = re.compile(
+    "["
+    "\u2600-\u27BF"          # Misc Symbols + Dingbats (✅, ✓, ☀, etc.)
+    "\uFE00-\uFE0F"          # Variation Selectors
+    "\u200D"                  # Zero Width Joiner (composite emoji)
+    "\u20E3"                  # Combining Enclosing Keycap
+    "\U0001F000-\U0001FAFF"  # Supplemental symbol planes (all emoji)
+    "]+",
+)
+
+
+def strip_emoji_from_code_blocks(text: str) -> str:
+    """Strip emoji characters from fenced code blocks, preserving prose.
+
+    Only modifies content inside ``` fences — prose, headings, and other
+    text outside code blocks is left untouched.
+    """
+    def _clean_block(match: re.Match) -> str:
+        lang_tag = match.group(1) or ""
+        code = match.group(2)
+        cleaned = _EMOJI_RE.sub("", code)
+        prefix = f"```{lang_tag}\n" if lang_tag else "```\n"
+        return f"{prefix}{cleaned}```"
+
+    return _FENCED_BLOCK_RE.sub(_clean_block, text)
+
+
 def extract_code_blocks(text: str) -> list[CodeBlock]:
     """Extract fenced code blocks from markdown-formatted text.
 

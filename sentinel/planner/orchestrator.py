@@ -17,7 +17,7 @@ from sentinel.core.models import (
 )
 from sentinel.core.config import settings
 from sentinel.security import codeshield
-from sentinel.security.code_extractor import extract_code_blocks
+from sentinel.security.code_extractor import extract_code_blocks, strip_emoji_from_code_blocks
 from sentinel.security.conversation import ConversationAnalyzer
 from sentinel.security.pipeline import ScanPipeline, SecurityViolation, _generate_marker
 from sentinel.worker.base import EmbeddingBase, PlannerBase
@@ -663,6 +663,9 @@ class Orchestrator:
                         error=f"CodeShield: insecure code detected ({len(cs_result.matches)} issues)",
                         **_v,
                     )
+
+            # Strip emoji from code blocks (Qwen 3 quirk: uses emoji in comments)
+            tagged.content = strip_emoji_from_code_blocks(tagged.content)
 
             # Validate output format if specified (P8)
             content = tagged.content
