@@ -1,0 +1,51 @@
+# Secrets — never commit
+secrets/
+*.key
+*.pem
+*.secret
+*.env
+
+# Rust build artifacts
+sidecar/target/
+sidecar/wasm/*.wasm
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+.venv/
+venv/
+
+# Ollama data (pulled into container volume)
+ollama-data/
+
+# Logs (stored in container volume)
+logs/
+
+# Claude Code
+.claude/
+
+# Project memory (private working notes)
+memory/
+
+# Benchmark data (regenerable)
+benchmarks/*.jsonl
+benchmarks/*.log
+
+# Script artifacts
+scripts/results/
+scripts/__pycache__/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sentinel</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <header>
+        <div class="header-left">
+            <h1>Sentinel</h1>
+            <span class="subtitle">CaMeL Defence Pipeline</span>
+        </div>
+        <div class="header-right">
+            <span id="status-dot" class="status-dot"></span>
+            <span id="status-text">Connecting...</span>
+        </div>
+    </header>
+
+    <main id="messages"></main>
+
+    <footer>
+        <form id="input-form">
+            <input
+                type="text"
+                id="task-input"
+                placeholder="Describe a task..."
+                autocomplete="off"
+                disabled
+            >
+            <button type="submit" id="send-btn" disabled>Send</button>
+        </form>
+    </footer>
+
+    <script src="app.js"></script>
+</body>
+</html>

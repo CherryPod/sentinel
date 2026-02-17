@@ -1,0 +1,29 @@
+[workspace]
+members = [
+    ".",
+    "tools/common",
+    "tools/file-read",
+    "tools/file-write",
+    "tools/shell-exec",
+    "tools/http-fetch",
+]
+resolver = "2"
+
+[package]
+name = "sentinel-sidecar"
+version = "0.1.0"
+edition = "2021"
+description = "WASM tool sandbox sidecar for Sentinel"
+license = "Apache-2.0"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "signal", "sync"] }
+wasmtime = "41"
+wasmtime-wasi = "41"
+aho-corasick = "1.1"
+ureq = "3"
+anyhow = "1"
+url = "2"
+toml = "0.8"

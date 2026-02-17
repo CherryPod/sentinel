@@ -1,0 +1,40 @@
+FROM python@sha256:9e01bf1ae5db7649a236da7be1e94ffbbbdd7a93f867dd0d8d5720d9e1f89fab
+
+WORKDIR /app
+
+# Build deps for torch/transformers native extensions
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc g++ openssl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY pyproject.toml .
+
+# Install torch CPU-only first (separate index), then the rest
+RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu \
+    && pip install --no-cache-dir ".[dev]"
+
+# Pre-download Prompt Guard model at build time (uses HF token via build secret)
+RUN --mount=type=secret,id=hf_token \
+    HF_TOKEN=$(cat /run/secrets/hf_token) \
+    python -c "from transformers import pipeline; pipeline('text-classification', model='meta-llama/Llama-Prompt-Guard-2-86M')"
+
+# Pre-create semgrep symlink at build time (semgrep tries to create this at
+# runtime via os.symlink, which fails on read-only filesystem)
+RUN ln -sf /usr/local/lib/python3.12/site-packages/semgrep/bin/semgrep-core \
+        /usr/local/lib/python3.12/site-packages/semgrep/bin/osemgrep
+
+COPY sentinel/ ./sentinel/
+COPY tests/ ./tests/
+COPY ui/ ./ui/
+
+# Generate self-signed TLS cert at build time (swap for real cert in production)
+RUN mkdir -p /data /app/tls /logs /workspace && \
+    openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
+    -keyout /app/tls/sentinel.key \
+    -out /app/tls/sentinel.crt \
+    -subj "/CN=sentinel/O=Sentinel"
+
+EXPOSE 8443 8080
+
+CMD ["uvicorn", "sentinel.api.app:app", "--host", "0.0.0.0", "--port", "8443", \
+     "--ssl-keyfile", "/app/tls/sentinel.key", "--ssl-certfile", "/app/tls/sentinel.crt"]

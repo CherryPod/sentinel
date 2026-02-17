@@ -1,0 +1,135 @@
+file_access:
+  write_allowed:
+    - /workspace/**
+  read_allowed:
+    - /workspace/**
+  blocked:
+    - /etc/**
+    - /root/**
+    - /home/**/.ssh/**
+    - /home/**/.gnupg/**
+    - /var/run/docker.sock
+    - /run/podman/**
+    - "**/*.env"
+    - "**/*.key"
+    - "**/*.pem"
+    - "**/*.secret"
+    - "**/wallet.dat"
+    - "**/.bitcoin/**"
+
+commands:
+  allowed:
+    - podman build
+    - podman run
+    - podman stop
+    - podman ps
+    - podman images
+    - podman logs
+    - ls
+    - cat
+    - mkdir
+    - cp
+    - head
+    - tail
+    - wc
+    - grep
+    - find
+  blocked_patterns:
+    - "rm -rf"
+    - "rm -r /"
+    - curl
+    - wget
+    - ssh
+    - scp
+    - rsync
+    - nc
+    - ncat
+    - netcat
+    - "python -c"
+    - "python3 -c"
+    - "bash -c"
+    - "sh -c"
+    - eval
+    - exec
+    - "| sh"
+    - "| bash"
+    - "| python"
+    - "> /dev/"
+    - "dd if="
+    - chmod
+    - chown
+    - mount
+    - umount
+    - mkfs
+    - fdisk
+    - iptables
+    - systemctl
+    - journalctl
+    - "-exec"
+    - "-execdir"
+
+  path_constrained:
+    - cat
+    - find
+    - cp
+    - mkdir
+    - head
+    - tail
+    - grep
+    - ls
+    - wc
+
+network:
+  qwen_outbound: none
+  controller_outbound_allowed:
+    - api.anthropic.com:443
+  controller_internal_allowed:
+    - sentinel-qwen:11434
+
+human_approval_required:
+  - podman run with -p flag
+  - podman run with -v flag
+  - any file write outside /workspace
+  - any command not in the allowed list
+  - any action using data tagged as untrusted from web sources
+
+approval_mode: full
+
+credential_patterns:
+  - name: aws_access_key
+    pattern: 'AKIA[0-9A-Z]{16}'
+  - name: api_key
+    pattern: 'sk-[a-zA-Z0-9_-]{20,}'
+  - name: slack_token
+    pattern: 'xox[bpras]-[a-zA-Z0-9-]+'
+  - name: github_pat
+    pattern: 'ghp_[a-zA-Z0-9]{36}'
+  - name: gitlab_pat
+    pattern: 'glpat-[a-zA-Z0-9_-]{20}'
+  - name: private_key
+    pattern: '-----BEGIN .* KEY-----'
+  - name: certificate
+    pattern: '-----BEGIN CERTIFICATE-----'
+  - name: hex_secret_64
+    pattern: '(?i)\b(?:key|secret|token|password|api_key|apikey|auth)[=:\s]+[0-9a-f]{64}\b'
+  - name: jwt_token
+    pattern: 'eyJ[a-zA-Z0-9_-]*\.eyJ'
+  - name: mongodb_uri
+    pattern: 'mongodb(\+srv)?://[^\s]+'
+  - name: postgres_uri
+    pattern: 'postgres(ql)?://[^\s]+'
+  - name: redis_uri
+    pattern: 'redis://[^\s]+'
+
+sensitive_path_patterns:
+  - /etc/shadow
+  - /etc/passwd
+  - .ssh/
+  - .gnupg/
+  - .env
+  - wallet.dat
+  - .bitcoin/
+  - .config/
+  - .local/share/
+  - /proc/
+  - /sys/

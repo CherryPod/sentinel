@@ -1,0 +1,115 @@
+## Sentinel — 2-container production stack
+##
+## Controller (Python/FastAPI) + Ollama (air-gapped Qwen 3 14B)
+## TLS, security headers, PIN auth, static UI — all in one container.
+##
+## Usage:
+##   podman compose up -d
+##   curl -k https://localhost:3001/api/health
+##   bash scripts/smoke_test.sh
+
+services:
+  sentinel:
+    build:
+      context: .
+      dockerfile: container/Containerfile
+    container_name: sentinel
+    networks:
+      - sentinel_internal
+      - sentinel_egress
+    environment:
+      - SENTINEL_POLICY_FILE=/policies/sentinel-policy.yaml
+      - SENTINEL_WORKSPACE_PATH=/workspace
+      - SENTINEL_LOG_DIR=/logs
+      - SENTINEL_LOG_LEVEL=INFO
+      - SENTINEL_APPROVAL_MODE=full
+      - SENTINEL_VERBOSE_RESULTS=false
+      - SENTINEL_PIN_REQUIRED=true
+      - SENTINEL_PIN_FILE=/run/secrets/sentinel_pin
+      - SENTINEL_OLLAMA_URL=http://sentinel-ollama:11434
+      - SENTINEL_OLLAMA_MODEL=qwen3:14b
+      - SENTINEL_OLLAMA_TIMEOUT=1800
+      - SENTINEL_DB_PATH=/data/sentinel.db
+      - SENTINEL_STATIC_DIR=/app/ui
+      - SENTINEL_TLS_CERT_FILE=/app/tls/sentinel.crt
+      - SENTINEL_TLS_KEY_FILE=/app/tls/sentinel.key
+      - SENTINEL_HTTPS_PORT=8443
+      - SENTINEL_HTTP_PORT=8080
+      - SENTINEL_REDIRECT_ENABLED=true
+      - SENTINEL_EXTERNAL_HTTPS_PORT=3001
+      - SENTINEL_ALLOWED_ORIGINS=https://localhost:3001,https://localhost:3002
+    volumes:
+      - ./policies:/policies:ro
+      - sentinel-data:/data
+      - sentinel-workspace:/workspace
+      - ./logs:/logs
+    secrets:
+      - claude_api_key
+      - sentinel_pin
+    ports:
+      - "3001:8443"
+      - "3002:8080"
+    restart: always
+    depends_on:
+      - sentinel-ollama
+    # Resource limits
+    mem_limit: 4G
+    mem_reservation: 1G
+    cpus: 4.0
+    # Read-only filesystem
+    read_only: true
+    tmpfs:
+      - /tmp:size=100M,noexec
+    # Health check
+    healthcheck:
+      test: ["CMD-SHELL", "python -c 'import urllib.request, ssl; ctx=ssl.create_default_context(); ctx.check_hostname=False; ctx.verify_mode=ssl.CERT_NONE; urllib.request.urlopen(\"https://localhost:8443/health\", context=ctx)'"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  sentinel-ollama:
+    image: docker.io/ollama/ollama@sha256:44893537fcc6f100b70ceb7f5c9fd8f787ba58f9f8ce73bf4a48a5b05fd8c422
+    container_name: sentinel-ollama
+    networks:
+      - sentinel_internal
+    environment:
+      - OLLAMA_HOST=0.0.0.0:11434
+      - OLLAMA_KEEP_ALIVE=5m
+      - OLLAMA_NUM_CTX=16384
+    volumes:
+      - sentinel-ollama-data:/root/.ollama
+    devices:
+      - nvidia.com/gpu=all
+    restart: always
+    # Resource limits
+    mem_limit: 14G
+    cpus: 4.0
+    # Health check
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'echo -e \"GET /api/tags HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n\" > /dev/tcp/localhost/11434'"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+networks:
+  sentinel_internal:
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
+  sentinel_egress:
+    driver: bridge
+
+secrets:
+  claude_api_key:
+    file: ./secrets/claude_api_key.txt
+  sentinel_pin:
+    file: ./secrets/sentinel_pin.txt
+
+volumes:
+  sentinel-data:
+  sentinel-workspace:
+  sentinel-ollama-data:

@@ -1,0 +1,4 @@
+name = "file_write"
+description = "Write content to a file on the filesystem"
+wasm = "file_write.wasm"
+capabilities = ["write_file"]

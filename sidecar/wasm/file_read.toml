@@ -1,0 +1,4 @@
+name = "file_read"
+description = "Read file contents from the filesystem"
+wasm = "file_read.wasm"
+capabilities = ["read_file"]
