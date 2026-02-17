@@ -28,6 +28,7 @@ logs/
 
 # Claude Code
 .claude/
+CLAUDE.md
 
 # Project memory (private working notes)
 memory/
