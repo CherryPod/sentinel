@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""Sentinel Pipeline Stress Test v3 — Capability Benchmark
+"""Sentinel Benchmark — Pipeline Stress Test
 
-v2 prompts (~976) + 160 capability benchmark prompts (4 tiers x 40).
-Sends ~1400-1600 requests (genuine + adversarial) through the full CaMeL
-pipeline. Designed to run unattended overnight.
+1,136 prompts (genuine + adversarial) through the full CaMeL pipeline.
+Designed to run unattended overnight (~15 hours).
 
 Features:
 - Gradual ramp-up: warmup (5s delay) -> steady (2s) -> rapid (0s)
@@ -19,15 +18,15 @@ Features:
 - Progress reporting with true escape rate and refusal tracking
 
 Prerequisites:
-    - sentinel-controller running on port 8000
-    - SENTINEL_APPROVAL_MODE=auto (run_stress_test.sh handles this)
+    - sentinel container running on port 3001 (HTTPS)
+    - SENTINEL_APPROVAL_MODE=auto (run_benchmark.sh handles this)
     - SENTINEL_OLLAMA_TIMEOUT=1800 (30 min, set in compose)
     - PIN in ~/.secrets/sentinel_pin.txt
 
 Usage:
-    python3 scripts/stress_test.py
-    python3 scripts/stress_test.py --max-requests 100
-    python3 scripts/stress_test.py --categories tool_manipulation non_english_injection
+    python3 scripts/stress_test_v3.py
+    python3 scripts/stress_test_v3.py --max-requests 100
+    python3 scripts/stress_test_v3.py --categories tool_manipulation non_english_injection
 """
 
 import argparse
@@ -35,6 +34,7 @@ import json
 import os
 import random
 import signal
+import ssl
 import sys
 import time
 import uuid
@@ -43,9 +43,14 @@ import urllib.error
 from datetime import datetime, timezone
 from pathlib import Path
 
-# Import adversarial prompts from the controller test suite
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "controller"))
+# Import adversarial prompts from the test suite
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from tests.adversarial_prompts import ADVERSARIAL_PROMPTS
+
+# SSL context for self-signed certs (sentinel uses self-signed TLS)
+_SSL_CTX = ssl.create_default_context()
+_SSL_CTX.check_hostname = False
+_SSL_CTX.verify_mode = ssl.CERT_NONE
 
 
 # ── Configuration ─────────────────────────────────────────────────
@@ -1158,7 +1163,7 @@ def post_json(url, data, headers, timeout=REQUEST_TIMEOUT):
     req = urllib.request.Request(url, data=body, headers=headers)
     req.add_header("Content-Type", "application/json")
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with urllib.request.urlopen(req, timeout=timeout, context=_SSL_CTX) as resp:
             return json.loads(resp.read().decode("utf-8")), resp.status
     except urllib.error.HTTPError as e:
         try:
@@ -1171,7 +1176,7 @@ def check_health(base_url, timeout=HEALTH_TIMEOUT):
     """Check if the controller is healthy. Returns True/False."""
     try:
         req = urllib.request.Request(f"{base_url}/health")
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with urllib.request.urlopen(req, timeout=timeout, context=_SSL_CTX) as resp:
             data = json.loads(resp.read().decode("utf-8"))
             return data.get("status") == "ok"
     except Exception:
@@ -4196,12 +4201,13 @@ def build_test_queue(max_requests=1600, categories=None):
 # ── Stress test runner ────────────────────────────────────────────
 
 class StressTest:
-    def __init__(self, base_url, pin, results_dir, max_requests=1600, categories=None):
+    def __init__(self, base_url, pin, results_dir, max_requests=1600, categories=None, version=None):
         self.base_url = base_url
         self.pin = pin
         self.results_dir = Path(results_dir)
         self.max_requests = max_requests
         self.categories = categories
+        self.version = version
         self.stop_requested = False
         self.results_fh = None
 
@@ -4253,7 +4259,8 @@ class StressTest:
 
         # Open results file
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        results_file = self.results_dir / f"stress_test_{ts}.jsonl"
+        version = self.version or ts
+        results_file = self.results_dir / f"benchmark_{version}_{ts}.jsonl"
         self.results_fh = open(results_file, "w", buffering=1)  # line-buffered
         print(f"Results file: {results_file}")
 
@@ -4680,8 +4687,8 @@ class StressTest:
 def main():
     parser = argparse.ArgumentParser(description="Sentinel pipeline stress test")
     parser.add_argument(
-        "--url", default="http://localhost:8000",
-        help="Controller base URL (default: http://localhost:8000)",
+        "--url", default="https://localhost:3001",
+        help="Sentinel base URL (default: https://localhost:3001)",
     )
     parser.add_argument(
         "--max-requests", type=int, default=1600,
@@ -4689,8 +4696,8 @@ def main():
     )
     parser.add_argument(
         "--results-dir",
-        default=str(Path(__file__).resolve().parent / "results"),
-        help="Directory for results files",
+        default=str(Path(__file__).resolve().parent.parent / "benchmarks"),
+        help="Directory for results files (default: benchmarks/)",
     )
     parser.add_argument(
         "--seed", type=int, default=None,
@@ -4699,6 +4706,10 @@ def main():
     parser.add_argument(
         "--categories", nargs="+", default=None,
         help="Only include specific categories (e.g. --categories tool_manipulation non_english_injection)",
+    )
+    parser.add_argument(
+        "--version", default=None,
+        help="Build version for results filename (e.g. v0.2.0-alpha)",
     )
     args = parser.parse_args()
 
@@ -4723,6 +4734,7 @@ def main():
         results_dir=str(results_dir),
         max_requests=args.max_requests,
         categories=args.categories,
+        version=args.version,
     )
     test.run()
 
