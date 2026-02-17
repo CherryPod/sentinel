@@ -13,31 +13,31 @@ A defence-in-depth AI assistant built on the [CaMeL architecture](https://arxiv.
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                    sentinel (Python/FastAPI)                  │
-│                  HTTPS :8443 / HTTP :8080                     │
-│                                                              │
-│  Static UI (/)  │  REST API (/api/*)  │  WebSocket (/ws)     │
-│  SSE (/api/events)  │  MCP server (/mcp/)                    │
-│                                                              │
-│  POST /task  ─→  Input validation  ─→  Conversation analysis │
-│              ─→  Prompt Guard scan ─→  Claude plans          │
-│              ─→  Human approval    ─→  Per-step execution:   │
-│                                                              │
-│     llm_task:  prompt gate → Qwen → CodeShield → scan       │
-│     tool_call: policy check → execute → tag provenance       │
-│                                                              │
-│  10 security layers  │  Policy engine  │  Provenance store   │
-│  Memory (SQLite+vec) │  Event bus      │  Channel router     │
-└───────────────────────────┬─────────────────────────────────┘
-                            │ sentinel_internal (air-gapped)
-┌───────────────────────────▼─────────────────────────────────┐
-│              sentinel-ollama (Ollama, GPU)                    │
-│                                                              │
-│     Qwen 3 14B Q4_K_M — text in, text out (GPU)             │
-│     nomic-embed-text — embeddings for memory search (CPU)    │
-│     No internet  │  No tools  │  No file access              │
-└─────────────────────────────────────────────────────────────┘
++-----------------------------------------------------------------+
+|                    sentinel (Python/FastAPI)                     |
+|                  HTTPS :8443 / HTTP :8080                       |
+|                                                                 |
+|  Static UI (/)  |  REST API (/api/*)  |  WebSocket (/ws)       |
+|  SSE (/api/events)  |  MCP server (/mcp/)                      |
+|                                                                 |
+|  POST /task  -->  Input validation  -->  Conversation analysis  |
+|              -->  Prompt Guard scan -->  Claude plans            |
+|              -->  Human approval    -->  Per-step execution:     |
+|                                                                 |
+|     llm_task:  prompt gate -> Qwen -> CodeShield -> scan        |
+|     tool_call: policy check -> execute -> tag provenance        |
+|                                                                 |
+|  10 security layers  |  Policy engine  |  Provenance store      |
+|  Memory (SQLite+vec) |  Event bus      |  Channel router        |
++-----------------------------+-----------------------------------+
+                              | sentinel_internal (air-gapped)
++-----------------------------v-----------------------------------+
+|              sentinel-ollama (Ollama, GPU)                       |
+|                                                                 |
+|     Qwen 3 14B Q4_K_M -- text in, text out (GPU)               |
+|     nomic-embed-text -- embeddings for memory search (CPU)      |
+|     No internet  |  No tools  |  No file access                 |
++-----------------------------------------------------------------+
 ```
 
 | Component | Role | Trust Level | Network |
@@ -88,42 +88,99 @@ Full benchmark data and analysis scripts are in [`benchmarks/`](benchmarks/). As
 - NVIDIA GPU with 12GB+ VRAM (for Qwen 3 14B)
 - [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html) with CDI configured
 - Anthropic API key (for Claude planner)
+- HuggingFace token (for Prompt Guard model download during build — [get one here](https://huggingface.co/settings/tokens))
 
-### Setup
+### 1. Clone and create secrets
 
 ```bash
-# Clone
-git clone https://github.com/yourusername/sentinel.git
+git clone https://github.com/CherryPod/sentinel.git
 cd sentinel
 
-# Create secrets
-mkdir -p ~/.secrets
-echo "your-anthropic-api-key" > ~/.secrets/claude_api_key.txt
-echo "your-pin-code" > ~/.secrets/sentinel_pin.txt
-chmod 600 ~/.secrets/*.txt
+# Create the secrets directory (gitignored)
+mkdir -p secrets
 
-# Create Podman secrets
-podman secret create claude_api_key ~/.secrets/claude_api_key.txt
-podman secret create sentinel_pin ~/.secrets/sentinel_pin.txt
-
-# Build the controller (needs HuggingFace token for Prompt Guard model)
-echo "your-hf-token" > ~/.secrets/hf_token.txt
-podman build \
-  --secret id=hf_token,src=$HOME/.secrets/hf_token.txt \
-  -t sentinel-controller:latest \
-  -t sentinel_sentinel-controller:latest \
-  -f controller/Dockerfile controller/
-
-# Start all containers
-podman compose up -d
-
-# Verify
-curl -sf http://localhost:8000/health | python3 -m json.tool
+# Required: Anthropic API key for the Claude planner
+echo "sk-ant-your-key-here" > secrets/claude_api_key.txt
+chmod 600 secrets/claude_api_key.txt
 ```
 
-Open `https://your-host:3001` in a browser (accept the self-signed certificate warning).
+### 2. Optional: Set a PIN
 
-For detailed deployment instructions, see [docs/deployment.md](docs/deployment.md).
+PIN authentication is optional. Without a PIN file, the UI works with no authentication — fine for local development.
+
+```bash
+# Optional: set a 4-digit PIN to protect the UI
+echo "1234" > secrets/sentinel_pin.txt
+chmod 600 secrets/sentinel_pin.txt
+```
+
+### 3. Build the sentinel image
+
+The build downloads the Prompt Guard model from HuggingFace, which requires an access token passed as a build secret.
+
+```bash
+# Store your HuggingFace token somewhere outside the repo
+echo "hf_your-token-here" > /tmp/hf_token.txt
+
+# Build (takes a few minutes — installs PyTorch, transformers, downloads Prompt Guard)
+podman build \
+  --secret id=hf_token,src=/tmp/hf_token.txt \
+  -t sentinel \
+  -f container/Containerfile .
+
+# Tag with the compose name (podman-compose looks for this)
+podman tag sentinel sentinel_sentinel
+
+# Clean up the token
+rm /tmp/hf_token.txt
+```
+
+### 4. Start the stack
+
+```bash
+podman compose up -d
+```
+
+This starts two containers:
+- **sentinel** — the security gateway, API, and UI (ports 3001 HTTPS, 3002 HTTP)
+- **sentinel-ollama** — air-gapped Ollama instance with GPU access
+
+### 5. Download the Qwen model
+
+On first run, the Ollama container has no models loaded. Pull Qwen 3 14B:
+
+```bash
+podman exec sentinel-ollama ollama pull qwen3:14b
+```
+
+This downloads ~8GB and takes a few minutes. The model is stored in a persistent volume, so you only need to do this once.
+
+### 6. Open the UI
+
+Go to **https://localhost:3001** in your browser.
+
+- Accept the self-signed certificate warning (Advanced → Accept the Risk)
+- If you set a PIN in step 2, you'll see a PIN prompt — enter it
+- If you skipped the PIN, the UI loads directly
+- Type a task and hit Send — Claude will plan it, you approve, Qwen executes
+
+### Verify the stack
+
+```bash
+# Health check (should return JSON with all subsystems loaded)
+curl -sk https://localhost:3001/health | python3 -m json.tool
+
+# Full smoke test
+bash scripts/smoke_test.sh
+```
+
+## Using the UI
+
+- **Send a task** — type in the input box and press Enter or click Send
+- **Approve/deny plans** — Claude's plan is shown with expandable step details. Click a step to see the full prompt that Qwen will receive. Approve or deny the plan
+- **Clear history** — **Shift+click** the "Sentinel" title in the header to clear conversation history. History is stored in your browser's localStorage only — it never leaves your machine
+- **Transport** — the UI automatically connects via WebSocket for real-time updates, falling back to HTTP polling if WebSocket isn't available
+- **Multiple tabs** — each tab gets its own session (stored in sessionStorage, cleared on tab close)
 
 ## Project Structure
 
@@ -134,31 +191,27 @@ sentinel/
 ├── CONTRIBUTING.md             Contributor guide
 ├── SECURITY.md                 Vulnerability reporting
 ├── pyproject.toml              Python package config
-├── CLAUDE.md                   Claude Code project instructions
+├── podman-compose.yaml         2-container deployment
 │
 ├── sentinel/                   Python package (security gateway + orchestrator)
 │   ├── core/                   Config, database, event bus, models
 │   ├── security/               Scanners, policy engine, pipeline
 │   ├── planner/                Claude planner, orchestrator, trust router
-│   ├── worker/                 Ollama/Qwen client
+│   ├── worker/                 Ollama/Qwen client, provider ABCs
 │   ├── tools/                  Policy-checked tool executor
 │   ├── session/                Session + conversation tracking
 │   ├── api/                    FastAPI app, auth, middleware
 │   ├── audit/                  Structured JSON logging
 │   ├── memory/                 Embeddings, chunks, RRF search
-│   └── channels/               WebSocket, SSE, MCP, Signal
+│   ├── channels/               WebSocket, SSE, MCP, Signal
+│   └── routines/               Scheduled task engine (cron, event, interval)
 │
-├── tests/                      826 unit tests
+├── tests/                      1,006 unit tests
 ├── ui/                         Static chat UI (HTML/JS/CSS)
 │
-├── container/                  Containerfile + TLS config
-├── podman-compose.phase1.yaml  2-container deployment
-│
-├── controller/                 Legacy source (pre-Phase 0)
-├── gateway/                    Legacy UI (pre-Phase 1)
-│
-├── sidecar/                    Rust WASM sidecar skeleton
-├── policies/                   Deterministic security rules
+├── container/                  Containerfile for builds
+├── sidecar/                    Rust WASM tool sandbox (41 tests)
+├── policies/                   Deterministic security rules (YAML)
 ├── benchmarks/                 Stress test data + analysis
 ├── scripts/                    Test runners + analysis
 │
@@ -166,10 +219,27 @@ sentinel/
     ├── architecture.md         Technical reference
     ├── security-model.md       Security deep dive
     ├── deployment.md           Operations guide
+    ├── codebase-map.md         Module map for contributors
     ├── roadmap.md              Planned features
     ├── CHANGELOG.md            Version history
     ├── design/                 Active design documents
     └── assessments/            Benchmark reports + audits
+```
+
+## Running Tests
+
+```bash
+# Python tests (requires a virtualenv with dependencies)
+python -m venv .venv
+source .venv/bin/activate
+pip install -e ".[dev,mcp]"
+pytest tests/
+
+# Or run inside the container (no local setup needed)
+podman exec sentinel pytest /app/tests/
+
+# Rust sidecar tests
+cargo test --manifest-path sidecar/Cargo.toml
 ```
 
 ## Documentation
@@ -179,22 +249,25 @@ sentinel/
 | [Architecture](docs/architecture.md) | Container specs, network topology, API endpoints, data flow |
 | [Security Model](docs/security-model.md) | CaMeL trust model, 10 security layers, threat model |
 | [Deployment](docs/deployment.md) | Prerequisites, setup, rebuild procedures, troubleshooting |
+| [Codebase Map](docs/codebase-map.md) | Module responsibilities, key classes, cross-dependencies |
 | [Roadmap](docs/roadmap.md) | Planned features and evolution path |
 | [Changelog](docs/CHANGELOG.md) | Full version history with decision rationale |
 | [Benchmarks](benchmarks/) | v3 stress test data and analysis tools |
 
 ## Current Status
 
-**Phase 3 complete.** Phases 0-3 delivered, all 15 code review issues closed. The system is operational with:
+**v0.1.0-alpha** — Phases 0–6 delivered, 2-container stack deployed and validated.
 
-- 826 unit tests passing
+- 1,006 Python tests + 41 Rust tests passing (1,047 total)
 - v3 stress test benchmarked (1,136 prompts, 0.12% real risk rate)
 - Infrastructure hardened (TLS, CSP, CSRF, resource limits, read-only FS, pinned images, health checks)
 - Persistent memory with RRF hybrid search (FTS5 + sqlite-vec)
 - Multi-channel access: WebSocket, SSE, MCP server, Signal (code ready)
+- WASM tool sandbox (Rust sidecar with Wasmtime, capability model, leak detection)
+- Routine scheduling engine (cron, event, interval triggers)
 - Trust level 0 (text in/out only — no file writes or tool execution by the worker)
 
-Next steps: WASM tool sandbox (Phase 4), routines + multi-provider (Phase 5), hardening + open-source release (Phase 6). See [docs/roadmap.md](docs/roadmap.md).
+See [docs/roadmap.md](docs/roadmap.md) for planned features.
 
 ## License
 
