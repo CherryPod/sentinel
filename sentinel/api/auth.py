@@ -77,9 +77,18 @@ class PinAuthMiddleware(BaseHTTPMiddleware):
         if pin is None:
             return await call_next(request)
 
-        # Health, WebSocket, and MCP endpoints are exempt (they have their own auth)
+        # Health, WebSocket, MCP, and static UI assets are exempt.
+        # Static assets must load without PIN so the JS can show the PIN overlay.
+        # API endpoints enforce PIN separately via X-Sentinel-Pin header.
         path = request.url.path
-        if path in ("/health", "/api/health", "/ws") or path.startswith("/mcp"):
+        _EXEMPT_PATHS = ("/health", "/api/health", "/ws")
+        _EXEMPT_EXTENSIONS = (".html", ".js", ".css", ".png", ".ico", ".svg", ".woff", ".woff2")
+        if (
+            path in _EXEMPT_PATHS
+            or path.startswith("/mcp")
+            or path == "/"
+            or any(path.endswith(ext) for ext in _EXEMPT_EXTENSIONS)
+        ):
             return await call_next(request)
 
         # Check lockout before doing any comparison
