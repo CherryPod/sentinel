@@ -3,6 +3,13 @@ import time
 
 import httpx
 
+from sentinel.worker.base import (
+    ProviderConnectionError,
+    ProviderModelNotFound,
+    ProviderTimeoutError,
+    WorkerBase,
+)
+
 logger = logging.getLogger("sentinel.audit")
 
 # NOTE: Qwen 3 thinking mode is intentionally left enabled for code generation
@@ -35,19 +42,19 @@ SECURITY RULES:
 """
 
 
-class OllamaConnectionError(Exception):
+class OllamaConnectionError(ProviderConnectionError):
     """Cannot reach the Ollama server."""
 
 
-class OllamaTimeoutError(Exception):
+class OllamaTimeoutError(ProviderTimeoutError):
     """Request to Ollama timed out."""
 
 
-class OllamaModelNotFound(Exception):
+class OllamaModelNotFound(ProviderModelNotFound):
     """Requested model is not available on the Ollama server."""
 
 
-class OllamaWorker:
+class OllamaWorker(WorkerBase):
     """Async client for the Ollama /api/generate endpoint."""
 
     def __init__(

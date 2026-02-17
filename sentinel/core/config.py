@@ -89,6 +89,18 @@ class Settings(BaseSettings):
     # Request size limit (Tier 4, code review #13) — 1MB
     max_request_bytes: int = 1_048_576
 
+    # Provider selection (Phase 5) — which backend for each LLM role
+    worker_provider: str = "ollama"
+    planner_provider: str = "claude"
+    embedding_provider: str = "ollama"
+
+    # Routine scheduling (Phase 5) — opt-in, disabled by default
+    routine_enabled: bool = False
+    routine_max_concurrent: int = 3
+    routine_scheduler_interval: int = 15  # seconds between scheduler ticks
+    routine_execution_timeout: int = 300  # 5 minutes max per routine execution
+    routine_max_per_user: int = 50
+
     # WASM sidecar (Phase 4) — opt-in, disabled by default
     sidecar_enabled: bool = False
     sidecar_socket: str = "/tmp/sentinel-sidecar.sock"

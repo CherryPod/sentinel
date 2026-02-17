@@ -6,6 +6,7 @@ import anthropic
 
 from sentinel.core.config import settings
 from sentinel.core.models import Plan, PlanStep
+from sentinel.worker.base import PlannerBase
 
 logger = logging.getLogger("sentinel.audit")
 
@@ -203,7 +204,7 @@ class PlanValidationError(PlannerError):
     """The plan produced by Claude failed validation."""
 
 
-class ClaudePlanner:
+class ClaudePlanner(PlannerBase):
     """Claude API client that generates structured execution plans."""
 
     def __init__(self, api_key: str | None = None):

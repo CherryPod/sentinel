@@ -16,6 +16,7 @@ from .scanner import (
 )
 from . import prompt_guard
 from .spotlighting import apply_datamarking
+from sentinel.worker.base import WorkerBase
 from sentinel.worker.ollama import OllamaWorker
 
 logger = logging.getLogger("sentinel.audit")
@@ -75,7 +76,7 @@ class ScanPipeline:
         cred_scanner: CredentialScanner,
         path_scanner: SensitivePathScanner,
         cmd_scanner: CommandPatternScanner | None = None,
-        worker: OllamaWorker | None = None,
+        worker: WorkerBase | None = None,
         echo_scanner: VulnerabilityEchoScanner | None = None,
         encoding_scanner: EncodingNormalizationScanner | None = None,
     ):

@@ -23,7 +23,9 @@ SAFE_OPS = frozenset({
     "memory_search",
     "memory_list",
     "memory_store",
-    # Phase 5 adds: "routine_list", "routine_status"
+    "routine_list",
+    "routine_get",
+    "routine_history",
 })
 
 

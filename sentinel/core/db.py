@@ -125,7 +125,7 @@ def _create_tables(conn: sqlite3.Connection) -> None:
         )
     """)
 
-    # -- Routines (for Phase 5) --
+    # -- Routines (Phase 5) --
     conn.execute("""
         CREATE TABLE IF NOT EXISTS routines (
             routine_id      TEXT PRIMARY KEY,
@@ -142,6 +142,34 @@ def _create_tables(conn: sqlite3.Connection) -> None:
             created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
             updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
         )
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_routines_enabled_next
+        ON routines(enabled, next_run_at) WHERE enabled = 1
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_routines_user_id
+        ON routines(user_id)
+    """)
+
+    # -- Routine executions (Phase 5) --
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS routine_executions (
+            execution_id    TEXT PRIMARY KEY,
+            routine_id      TEXT NOT NULL REFERENCES routines(routine_id) ON DELETE CASCADE,
+            user_id         TEXT NOT NULL DEFAULT 'default',
+            triggered_by    TEXT NOT NULL DEFAULT 'scheduler',
+            started_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+            completed_at    TEXT,
+            status          TEXT NOT NULL DEFAULT 'running',
+            result_summary  TEXT NOT NULL DEFAULT '',
+            error           TEXT NOT NULL DEFAULT '',
+            task_id         TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_routine_exec_routine
+        ON routine_executions(routine_id, started_at)
     """)
 
     # -- Audit log (structured supplement to JSONL) --

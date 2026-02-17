@@ -16,10 +16,11 @@ sentinel/              # Main Python package
 ├── core/              # Config, models, approval, database, event bus
 ├── memory/            # Persistent memory (embeddings, chunks, hybrid search)
 ├── planner/           # Claude planner + CaMeL orchestrator
+├── routines/          # Routine scheduling engine (cron, event, interval triggers)
 ├── security/          # All scanning, policy, provenance, spotlighting
 ├── session/           # Session store
 ├── tools/             # Tool executor (policy-checked)
-└── worker/            # Ollama/Qwen client
+└── worker/            # Provider ABCs, Ollama client, factory
 
 tests/                 # All test files (project root)
 sidecar/               # Rust WASM sidecar (Phase 4)
@@ -132,12 +133,21 @@ container/             # Containerfile for builds
 - `planner.ClaudePlanner.create_plan()` — calls Claude API, validates JSON response
 - `executor.ToolExecutor.execute()` — dispatches to tool handler with policy check
 
-### Worker & State (`sentinel/worker/`, `sentinel/session/`)
+### Worker, Providers & State (`sentinel/worker/`, `sentinel/session/`)
 
 | Module | Lines | Purpose |
 |--------|-------|---------|
-| `worker/ollama.py` | ~143 | Ollama/Qwen async HTTP client, retry logic |
+| `worker/base.py` | ~110 | Provider ABCs: WorkerBase, PlannerBase, EmbeddingBase + generic exceptions |
+| `worker/ollama.py` | ~150 | Ollama/Qwen async HTTP client, retry logic (implements WorkerBase) |
+| `worker/factory.py` | ~40 | Config-driven provider factory: create_worker/planner/embedding |
 | `session/store.py` | ~305 | SQLite-backed session store (with in-memory fallback), write-through Session objects, TTL eviction |
+
+**Key classes:**
+- `base.WorkerBase` — ABC for text generation providers
+- `base.PlannerBase` — ABC for task planning providers
+- `base.EmbeddingBase` — ABC for vector embedding providers
+- `base.ProviderError` → `ProviderConnectionError`, `ProviderTimeoutError`, `ProviderModelNotFound`
+- `factory.create_worker()` / `create_planner()` / `create_embedding_client()` — config-driven construction
 
 **Key constants:**
 - `worker/ollama.py:12-35` — `QWEN_SYSTEM_PROMPT_TEMPLATE` (Qwen's system prompt with `{marker}` placeholder)
@@ -147,6 +157,25 @@ container/             # Containerfile for builds
 - `provenance.is_trust_safe_for_execution()` — called before every tool execution (the CaMeL guarantee)
 - `provenance.record_file_write()` / `get_file_writer()` — file trust inheritance
 - `session.SessionStore.get_or_create()` — per-source sessions with TTL
+
+### Routines (`sentinel/routines/`)
+
+| Module | Lines | Purpose |
+|--------|-------|---------|
+| `routines/store.py` | ~230 | RoutineStore CRUD (SQLite + in-memory fallback), Routine dataclass |
+| `routines/engine.py` | ~310 | Scheduler loop, event trigger subscriptions, execution management with asyncio tasks |
+| `routines/cron.py` | ~60 | Cron expression validation (croniter), next_run calculation, trigger_config validation |
+
+**Key classes:**
+- `store.Routine` — dataclass: routine_id, user_id, name, trigger_type/config, action_config, enabled, cooldown_s
+- `store.RoutineStore` — CRUD + list_due() + update_run_state(), dual-mode (SQLite/in-memory)
+- `engine.RoutineEngine` — background scheduler, event bus subscriber, execution management
+
+**Key functions:**
+- `engine.RoutineEngine.start()` / `stop()` — lifecycle management (spawns asyncio task)
+- `engine.RoutineEngine.trigger_manual()` — public API for manual routine execution
+- `engine.RoutineEngine.get_execution_history()` — query routine_executions table
+- `cron.validate_cron()` / `next_run()` / `validate_trigger_config()` — validation helpers
 
 ---
 
@@ -224,9 +253,12 @@ WASM tool sandbox with Wasmtime. Executes tools in isolated WASM instances with 
 | `test_mcp.py` | 16 | MCP tools, trust tiers, search/store/run_task/health |
 | `test_signal_channel.py` | 17 | Signal subprocess, backoff, JSON-RPC protocol, crash recovery |
 | `test_sidecar_client.py` | 29 | SidecarClient mock socket, ToolExecutor WASM dispatch, config |
+| `test_provider_abc.py` | 24 | Provider ABCs, factory, isinstance checks, exception hierarchy |
+| `test_routine_store.py` | 29 | RoutineStore CRUD, list filtering, cron validation, cascade delete |
+| `test_routine_engine.py` | 21 | Scheduler loop, event/manual triggers, cooldown, timeout, bus emissions |
 | `conftest.py` | — | Fixtures: engine, cred_scanner, path_scanner, cmd_scanner, encoding_scanner |
 
-**Total: 855 Python tests + 41 Rust tests passing** (`pytest tests/` + `cargo test` from project root)
+**Total: 929 Python tests + 41 Rust tests passing** (`pytest tests/` + `cargo test` from project root)
 
 ---
 
@@ -292,7 +324,7 @@ User → HTTPS (uvicorn TLS) or HTTP (redirect.HTTPSRedirectApp → 301)
 ## Module Dependency Graph
 
 ```
-sentinel/api/app.py [lifespan: init_db → SessionStore, ApprovalManager, ProvenanceStore, MemoryStore, EmbeddingClient]
+sentinel/api/app.py [lifespan: init_db → SessionStore, ApprovalManager, ProvenanceStore, MemoryStore, EmbeddingClient, RoutineStore, RoutineEngine]
   ├── api/middleware.py (SecurityHeaders, CSRF, RequestSizeLimit)
   ├── api/auth.py (PinAuth middleware)
   ├── api/redirect.py (HTTPSRedirectApp — background uvicorn for HTTP→HTTPS)
@@ -312,7 +344,7 @@ sentinel/api/app.py [lifespan: init_db → SessionStore, ApprovalManager, Proven
   │     │     ├── security/scanner.py (5 scanners)
   │     │     ├── security/prompt_guard.py → HuggingFace model
   │     │     ├── security/spotlighting.py
-  │     │     └── worker/ollama.py → Ollama/Qwen
+  │     │     └── worker/base.py (WorkerBase ABC) → worker/ollama.py → Ollama/Qwen
   │     ├── tools/executor.py
   │     │     ├── security/policy_engine.py → sentinel-policy.yaml
   │     │     └── security/provenance.py [ProvenanceStore — SQLite recursive CTE]
@@ -324,5 +356,9 @@ sentinel/api/app.py [lifespan: init_db → SessionStore, ApprovalManager, Proven
   ├── channels/base.py (Channel ABC, ChannelRouter)
   ├── channels/web.py (WebSocketChannel, SSEWriter)
   ├── channels/mcp_server.py (FastMCP server — mounted at /mcp/)
-  └── channels/signal_channel.py (SignalChannel — signal-cli subprocess)
+  ├── channels/signal_channel.py (SignalChannel — signal-cli subprocess)
+  ├── routines/store.py (RoutineStore — CRUD, dual-mode)
+  ├── routines/engine.py (RoutineEngine — scheduler + event triggers + execution)
+  ├── routines/cron.py (croniter validation + next_run calculation)
+  └── worker/factory.py (config-driven provider factory)
 ```

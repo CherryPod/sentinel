@@ -8,6 +8,7 @@ import logging
 
 import httpx
 
+from sentinel.worker.base import EmbeddingBase
 from sentinel.worker.ollama import (
     OllamaConnectionError,
     OllamaModelNotFound,
@@ -17,7 +18,7 @@ from sentinel.worker.ollama import (
 logger = logging.getLogger("sentinel.audit")
 
 
-class EmbeddingClient:
+class EmbeddingClient(EmbeddingBase):
     """Async client for Ollama /api/embed — produces 768-dim vectors."""
 
     def __init__(

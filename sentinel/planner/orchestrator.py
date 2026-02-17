@@ -19,6 +19,7 @@ from sentinel.core.config import settings
 from sentinel.security import codeshield
 from sentinel.security.conversation import ConversationAnalyzer
 from sentinel.security.pipeline import ScanPipeline, SecurityViolation, _generate_marker
+from sentinel.worker.base import EmbeddingBase, PlannerBase
 from .planner import ClaudePlanner, PlannerError, PlannerRefusalError
 from sentinel.security.provenance import create_tagged_data, is_trust_safe_for_execution
 from sentinel.session.store import ConversationTurn, SessionStore
@@ -140,14 +141,14 @@ class Orchestrator:
 
     def __init__(
         self,
-        planner: ClaudePlanner,
+        planner: PlannerBase,
         pipeline: ScanPipeline,
         tool_executor=None,
         approval_manager=None,
         session_store: SessionStore | None = None,
         conversation_analyzer: ConversationAnalyzer | None = None,
         memory_store=None,
-        embedding_client=None,
+        embedding_client: EmbeddingBase | None = None,
         event_bus: EventBus | None = None,
     ):
         self._planner = planner

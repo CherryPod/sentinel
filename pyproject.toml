@@ -17,6 +17,7 @@ dependencies = [
     "llamafirewall>=0.1.0,<2.0.0",
     "slowapi>=0.1.9,<1.0.0",
     "sse-starlette>=2.0.0,<3.0.0",
+    "croniter>=3.0.0,<4.0.0",
 ]
 
 [project.optional-dependencies]

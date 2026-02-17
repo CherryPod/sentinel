@@ -122,15 +122,15 @@ Progress checklist for the evolution plan. Design rationale lives in `evolution-
 
 ---
 
-## Phase 5: Routines + Multi-Provider
+## Phase 5: Routines + Multi-Provider — COMPLETE (2026-02-17)
 
 > Goal: Background automation and model flexibility.
 
-- [ ] **5.1 — Routine engine** — cron + event triggers, SQLite state, cooldowns, capacity limits
-- [ ] **5.2 — Routine API** — CRUD + manual trigger
-- [ ] **5.3 — Multi-provider LLM** — OllamaProvider + ClaudeProvider ABC, config-driven model swap
+- [x] **5.1 — Routine engine** — cron + event + interval triggers, SQLite state, cooldowns, max concurrent, execution timeouts
+- [x] **5.2 — Routine API** — CRUD (POST/GET/PATCH/DELETE), manual trigger, execution history
+- [x] **5.3 — Multi-provider LLM** — WorkerBase/PlannerBase/EmbeddingBase ABCs, config-driven factory, generic exception hierarchy
 
-**Verify:** cron runs on schedule, events trigger, model swap works end-to-end
+**Verified:** 74 new tests (929 total, all pass). Provider ABCs backwards-compatible, factory creates correct instances, routine CRUD roundtrip, cron/event/manual triggers, cooldown enforcement, max concurrent respected, execution timeouts, cascade deletes, bus emissions
 
 ---
 

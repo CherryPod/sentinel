@@ -39,7 +39,11 @@ from sentinel.memory.splitter import split_text
 from sentinel.session.store import SessionStore
 from sentinel.channels.base import ChannelRouter, IncomingMessage
 from sentinel.channels.web import SSEWriter, WebSocketChannel
+from sentinel.routines.cron import validate_trigger_config
+from sentinel.routines.engine import RoutineEngine
+from sentinel.routines.store import RoutineStore
 from sentinel.tools.executor import ToolExecutor
+from sentinel.worker.factory import create_embedding_client, create_planner
 
 # Rate limiter — per-IP, in-memory storage
 limiter = Limiter(key_func=get_remote_address)
@@ -60,6 +64,8 @@ _memory_store: MemoryStore | None = None
 _embedding_client: EmbeddingClient | None = None
 _event_bus: EventBus | None = None
 _mcp_server = None
+_routine_store: RoutineStore | None = None
+_routine_engine: RoutineEngine | None = None
 _ws_failure_tracker = _FailureTracker()
 _audit = None
 
@@ -179,14 +185,10 @@ async def lifespan(app: FastAPI):
         },
     )
 
-    # Initialize memory store + embedding client (Phase 2)
+    # Initialize memory store + embedding client (Phase 2, factory in Phase 5)
     global _memory_store, _embedding_client
     _memory_store = MemoryStore(db=db_conn)
-    _embedding_client = EmbeddingClient(
-        base_url=settings.ollama_url,
-        model=settings.embeddings_model,
-        timeout=settings.embeddings_timeout,
-    )
+    _embedding_client = create_embedding_client(settings)
     _audit.info(
         "Memory store initialized",
         extra={
@@ -201,10 +203,10 @@ async def lifespan(app: FastAPI):
     _event_bus = EventBus()
     _audit.info("Event bus initialized", extra={"event": "bus_init"})
 
-    # Initialize Claude planner + orchestrator (Phase 3)
+    # Initialize planner + orchestrator (Phase 3, factory in Phase 5)
     global _orchestrator, _planner_available
     try:
-        planner = ClaudePlanner()
+        planner = create_planner(settings)
         approval_mgr = ApprovalManager(db=db_conn)
         tool_executor = ToolExecutor(policy_engine=_engine)
         _orchestrator = Orchestrator(
@@ -252,6 +254,38 @@ async def lifespan(app: FastAPI):
                 extra={"event": "mcp_init_failed", "error": str(exc)},
             )
 
+    # Initialize routine engine (Phase 5) — opt-in via SENTINEL_ROUTINE_ENABLED
+    global _routine_store, _routine_engine
+    _routine_store = RoutineStore(db=db_conn)
+    if settings.routine_enabled and _orchestrator is not None:
+        _routine_engine = RoutineEngine(
+            store=_routine_store,
+            orchestrator=_orchestrator,
+            event_bus=_event_bus,
+            db=db_conn,
+            tick_interval=settings.routine_scheduler_interval,
+            max_concurrent=settings.routine_max_concurrent,
+            execution_timeout=settings.routine_execution_timeout,
+        )
+        await _routine_engine.start()
+        _audit.info(
+            "Routine engine started",
+            extra={
+                "event": "routine_engine_init",
+                "tick_interval": settings.routine_scheduler_interval,
+                "max_concurrent": settings.routine_max_concurrent,
+            },
+        )
+    else:
+        _audit.info(
+            "Routine engine disabled",
+            extra={
+                "event": "routine_engine_disabled",
+                "routine_enabled": settings.routine_enabled,
+                "orchestrator_available": _orchestrator is not None,
+            },
+        )
+
     # Start HTTP→HTTPS redirect server (only when TLS is active)
     redirect_server = None
     if settings.redirect_enabled and settings.tls_cert_file:
@@ -281,6 +315,10 @@ async def lifespan(app: FastAPI):
             )
 
     yield
+
+    # Shutdown routine engine if running
+    if _routine_engine is not None:
+        await _routine_engine.stop()
 
     # Shutdown redirect server if running
     if redirect_server is not None:
@@ -804,6 +842,314 @@ async def delete_memory_chunk(chunk_id: str):
         )
 
     return {"status": "ok", "deleted": chunk_id}
+
+
+# ── Routine endpoints (Phase 5) ─────────────────────────────────
+
+
+class CreateRoutineRequest(BaseModel):
+    name: str
+    trigger_type: str
+    trigger_config: dict
+    action_config: dict
+    description: str = ""
+    enabled: bool = True
+    cooldown_s: int = 0
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, v: str) -> str:
+        return _normalize_text(v, min_length=1, max_length=200, field_name="Name")
+
+    @field_validator("trigger_type")
+    @classmethod
+    def validate_trigger_type(cls, v: str) -> str:
+        if v not in ("cron", "event", "interval"):
+            raise ValueError("trigger_type must be 'cron', 'event', or 'interval'")
+        return v
+
+    @field_validator("action_config")
+    @classmethod
+    def validate_action_config(cls, v: dict) -> dict:
+        if "prompt" not in v or not v["prompt"]:
+            raise ValueError("action_config must contain a non-empty 'prompt' key")
+        return v
+
+
+class UpdateRoutineRequest(BaseModel):
+    name: str | None = None
+    description: str | None = None
+    trigger_type: str | None = None
+    trigger_config: dict | None = None
+    action_config: dict | None = None
+    enabled: bool | None = None
+    cooldown_s: int | None = None
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, v: str | None) -> str | None:
+        if v is not None:
+            return _normalize_text(v, min_length=1, max_length=200, field_name="Name")
+        return v
+
+    @field_validator("trigger_type")
+    @classmethod
+    def validate_trigger_type(cls, v: str | None) -> str | None:
+        if v is not None and v not in ("cron", "event", "interval"):
+            raise ValueError("trigger_type must be 'cron', 'event', or 'interval'")
+        return v
+
+    @field_validator("action_config")
+    @classmethod
+    def validate_action_config(cls, v: dict | None) -> dict | None:
+        if v is not None:
+            if "prompt" not in v or not v["prompt"]:
+                raise ValueError("action_config must contain a non-empty 'prompt' key")
+        return v
+
+
+def _routine_to_dict(r) -> dict:
+    return {
+        "routine_id": r.routine_id,
+        "user_id": r.user_id,
+        "name": r.name,
+        "description": r.description,
+        "trigger_type": r.trigger_type,
+        "trigger_config": r.trigger_config,
+        "action_config": r.action_config,
+        "enabled": r.enabled,
+        "last_run_at": r.last_run_at,
+        "next_run_at": r.next_run_at,
+        "cooldown_s": r.cooldown_s,
+        "created_at": r.created_at,
+        "updated_at": r.updated_at,
+    }
+
+
+@api_router.post("/routine")
+@limiter.limit("10/minute")
+async def create_routine(req: CreateRoutineRequest, request: Request):
+    """Create a new routine."""
+    if _routine_store is None:
+        return JSONResponse(
+            status_code=503,
+            content={"status": "error", "reason": "Routine system not initialized"},
+        )
+
+    # Validate trigger_config matches trigger_type
+    try:
+        validate_trigger_config(req.trigger_type, req.trigger_config)
+    except ValueError as exc:
+        return JSONResponse(
+            status_code=400,
+            content={"status": "error", "reason": str(exc)},
+        )
+
+    # Calculate initial next_run_at for cron/interval triggers
+    next_run_at = None
+    if req.trigger_type == "cron" and req.enabled:
+        from sentinel.routines.cron import next_run
+        try:
+            dt = next_run(req.trigger_config["cron"])
+            next_run_at = dt.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+        except ValueError:
+            pass
+    elif req.trigger_type == "interval" and req.enabled:
+        from datetime import datetime, timedelta, timezone
+        seconds = req.trigger_config.get("seconds", 0)
+        if seconds > 0:
+            dt = datetime.now(timezone.utc) + timedelta(seconds=seconds)
+            next_run_at = dt.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+    routine = _routine_store.create(
+        name=req.name,
+        trigger_type=req.trigger_type,
+        trigger_config=req.trigger_config,
+        action_config=req.action_config,
+        description=req.description,
+        enabled=req.enabled,
+        cooldown_s=req.cooldown_s,
+        next_run_at=next_run_at,
+    )
+
+    return {"status": "ok", "routine": _routine_to_dict(routine)}
+
+
+@api_router.get("/routine")
+async def list_routines(
+    enabled_only: bool = Query(False, description="Only return enabled routines"),
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+):
+    """List all routines for the current user."""
+    if _routine_store is None:
+        return JSONResponse(
+            status_code=503,
+            content={"status": "error", "reason": "Routine system not initialized"},
+        )
+
+    routines = _routine_store.list(enabled_only=enabled_only, limit=limit, offset=offset)
+    return {
+        "status": "ok",
+        "routines": [_routine_to_dict(r) for r in routines],
+        "count": len(routines),
+    }
+
+
+@api_router.get("/routine/{routine_id}")
+async def get_routine(routine_id: str):
+    """Get a single routine by ID."""
+    if _routine_store is None:
+        return JSONResponse(
+            status_code=503,
+            content={"status": "error", "reason": "Routine system not initialized"},
+        )
+
+    routine = _routine_store.get(routine_id)
+    if routine is None:
+        return JSONResponse(
+            status_code=404,
+            content={"status": "error", "reason": "Routine not found"},
+        )
+
+    return {"status": "ok", "routine": _routine_to_dict(routine)}
+
+
+@api_router.patch("/routine/{routine_id}")
+async def update_routine(routine_id: str, req: UpdateRoutineRequest):
+    """Update a routine."""
+    if _routine_store is None:
+        return JSONResponse(
+            status_code=503,
+            content={"status": "error", "reason": "Routine system not initialized"},
+        )
+
+    # Build kwargs from non-None fields
+    updates = {}
+    if req.name is not None:
+        updates["name"] = req.name
+    if req.description is not None:
+        updates["description"] = req.description
+    if req.trigger_type is not None:
+        updates["trigger_type"] = req.trigger_type
+    if req.trigger_config is not None:
+        updates["trigger_config"] = req.trigger_config
+    if req.action_config is not None:
+        updates["action_config"] = req.action_config
+    if req.enabled is not None:
+        updates["enabled"] = req.enabled
+    if req.cooldown_s is not None:
+        updates["cooldown_s"] = req.cooldown_s
+
+    # Validate trigger_config if both type and config are being updated
+    trigger_type = req.trigger_type
+    trigger_config = req.trigger_config
+    if trigger_type or trigger_config:
+        # Need both to validate — fetch existing if one is missing
+        existing = _routine_store.get(routine_id)
+        if existing is None:
+            return JSONResponse(
+                status_code=404,
+                content={"status": "error", "reason": "Routine not found"},
+            )
+        effective_type = trigger_type or existing.trigger_type
+        effective_config = trigger_config or existing.trigger_config
+        try:
+            validate_trigger_config(effective_type, effective_config)
+        except ValueError as exc:
+            return JSONResponse(
+                status_code=400,
+                content={"status": "error", "reason": str(exc)},
+            )
+
+    if not updates:
+        return JSONResponse(
+            status_code=400,
+            content={"status": "error", "reason": "No fields to update"},
+        )
+
+    routine = _routine_store.update(routine_id, **updates)
+    if routine is None:
+        return JSONResponse(
+            status_code=404,
+            content={"status": "error", "reason": "Routine not found"},
+        )
+
+    return {"status": "ok", "routine": _routine_to_dict(routine)}
+
+
+@api_router.delete("/routine/{routine_id}")
+async def delete_routine(routine_id: str):
+    """Delete a routine."""
+    if _routine_store is None:
+        return JSONResponse(
+            status_code=503,
+            content={"status": "error", "reason": "Routine system not initialized"},
+        )
+
+    deleted = _routine_store.delete(routine_id)
+    if not deleted:
+        return JSONResponse(
+            status_code=404,
+            content={"status": "error", "reason": "Routine not found"},
+        )
+
+    return {"status": "ok", "deleted": routine_id}
+
+
+@api_router.post("/routine/{routine_id}/run")
+@limiter.limit("5/minute")
+async def trigger_routine(routine_id: str, request: Request):
+    """Manually trigger a routine execution."""
+    if _routine_engine is None:
+        return JSONResponse(
+            status_code=503,
+            content={"status": "error", "reason": "Routine engine not running"},
+        )
+
+    execution_id = await _routine_engine.trigger_manual(routine_id)
+    if execution_id is None:
+        return JSONResponse(
+            status_code=404,
+            content={"status": "error", "reason": "Routine not found"},
+        )
+
+    return {"status": "ok", "execution_id": execution_id}
+
+
+@api_router.get("/routine/{routine_id}/executions")
+async def get_routine_executions(
+    routine_id: str,
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+):
+    """Get execution history for a routine."""
+    if _routine_engine is None and _routine_store is None:
+        return JSONResponse(
+            status_code=503,
+            content={"status": "error", "reason": "Routine system not initialized"},
+        )
+
+    # Verify routine exists
+    if _routine_store is not None:
+        routine = _routine_store.get(routine_id)
+        if routine is None:
+            return JSONResponse(
+                status_code=404,
+                content={"status": "error", "reason": "Routine not found"},
+            )
+
+    executions = []
+    if _routine_engine is not None:
+        executions = _routine_engine.get_execution_history(
+            routine_id, limit=limit, offset=offset,
+        )
+
+    return {
+        "status": "ok",
+        "executions": executions,
+        "count": len(executions),
+    }
 
 
 # ── WebSocket endpoint (Phase 3) ────────────────────────────────
