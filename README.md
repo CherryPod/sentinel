@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="ui/social-preview.png" alt="Sentinel — Defence-in-depth AI assistant" width="800">
+</p>
+
 # Sentinel
 
 A defence-in-depth AI assistant built on the [CaMeL architecture](https://arxiv.org/abs/2503.18813). A frontier model (Claude) plans tasks, an air-gapped local LLM (Qwen) executes them, and a Python security gateway enforces 10 layers of scanning between every step. The worker LLM is assumed compromised at all times — it only receives text and returns text, and every output is scanned before the system acts on it.
