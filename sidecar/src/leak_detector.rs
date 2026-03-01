@@ -23,6 +23,9 @@ struct PatternDef {
 }
 
 /// Built-in leak detection patterns covering common credential formats.
+/// O-008: Only detects literal patterns, not base64/hex encoded secrets.
+/// Encoding detection would require decoding all output, adding latency
+/// and false positives. The Python-side pipeline scans for encoded patterns.
 const BUILTIN_PATTERNS: &[PatternDef] = &[
     // AWS access keys
     PatternDef { name: "aws_access_key", pattern: "AKIA" },
@@ -57,6 +60,8 @@ const BUILTIN_PATTERNS: &[PatternDef] = &[
 ];
 
 /// Pre-compiled leak detector using Aho-Corasick automaton.
+/// O-012: The automaton is built once at sidecar startup (main.rs) and reused
+/// across executions via &mut reference — not rebuilt per sandbox creation.
 pub struct LeakDetector {
     automaton: AhoCorasick,
     /// Pattern names in the same order as automaton patterns.

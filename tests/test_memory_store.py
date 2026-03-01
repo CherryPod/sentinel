@@ -271,3 +271,57 @@ class TestInMemoryFallback:
 
     def test_has_vec_table_false(self, mem_store):
         assert mem_store._has_vec_table() is False
+
+
+# ── V-004: SQL injection boundary tests ──────────────────────────
+
+
+_EVIL_INPUTS = [
+    "'; DROP TABLE memory_chunks; --",
+    "' OR '1'='1",
+    "'; DELETE FROM memory_chunks_fts; --",
+    "\x00null_byte\x00",
+    "a" * 100_000,
+    "SELECT * FROM memory_chunks",
+    "Robert'); DROP TABLE students;--",
+    "1; ATTACH DATABASE '/tmp/evil.db' AS evil; --",
+]
+
+
+class TestMemoryStoreSQLInjection:
+    """Regression guard: V-004 — user-provided strings stored as literals, never executed."""
+
+    @pytest.mark.parametrize("evil_input", _EVIL_INPUTS, ids=[
+        "drop_table", "or_1_1", "delete_fts", "null_bytes",
+        "very_long_string", "select_star", "bobby_tables", "attach_db",
+    ])
+    def test_evil_content(self, store, evil_input):
+        """Evil strings as chunk content are stored and retrieved as literals."""
+        chunk_id = store.store(content=evil_input, source="test")
+        chunk = store.get(chunk_id)
+        assert chunk is not None
+        assert chunk.content == evil_input
+
+    @pytest.mark.parametrize("evil_input", _EVIL_INPUTS, ids=[
+        "drop_table", "or_1_1", "delete_fts", "null_bytes",
+        "very_long_string", "select_star", "bobby_tables", "attach_db",
+    ])
+    def test_evil_source(self, store, evil_input):
+        """Evil strings as chunk source survive roundtrip."""
+        chunk_id = store.store(content="Safe content", source=evil_input)
+        chunk = store.get(chunk_id)
+        assert chunk is not None
+        assert chunk.source == evil_input
+
+    @pytest.mark.parametrize("evil_input", _EVIL_INPUTS, ids=[
+        "drop_table", "or_1_1", "delete_fts", "null_bytes",
+        "very_long_string", "select_star", "bobby_tables", "attach_db",
+    ])
+    def test_evil_user_id(self, store, evil_input):
+        """Evil strings as user_id survive roundtrip."""
+        chunk_id = store.store(
+            content="Test", source="test", user_id=evil_input
+        )
+        chunk = store.get(chunk_id)
+        assert chunk is not None
+        assert chunk.user_id == evil_input

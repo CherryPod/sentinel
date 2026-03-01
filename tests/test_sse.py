@@ -137,7 +137,7 @@ class TestSSEWriter:
 
 
 class TestSSEEndpoint:
-    @patch("sentinel.api.app._pin", None)
+    @patch("sentinel.api.app._pin_verifier", None)
     @patch("sentinel.api.app._event_bus", None)
     def test_sse_no_bus_returns_503(self):
         """SSE endpoint returns 503 when event bus is not initialized."""
@@ -148,7 +148,7 @@ class TestSSEEndpoint:
         resp = client.get("/api/events?task_id=test-123")
         assert resp.status_code == 503
 
-    @patch("sentinel.api.app._pin", None)
+    @patch("sentinel.api.app._pin_verifier", None)
     def test_sse_missing_task_id_returns_422(self):
         """SSE endpoint returns 422 when task_id is missing."""
         from starlette.testclient import TestClient
@@ -158,7 +158,7 @@ class TestSSEEndpoint:
         resp = client.get("/api/events")
         assert resp.status_code == 422
 
-    @patch("sentinel.api.app._pin", None)
+    @patch("sentinel.api.app._pin_verifier", None)
     def test_sse_with_bus_returns_200(self):
         """SSE endpoint returns 200 when event bus is available.
 

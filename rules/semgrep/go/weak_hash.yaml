@@ -1,0 +1,30 @@
+rules:
+- id: weak-hash-md5
+  pattern-either:
+      - pattern: md5.New()
+      - pattern: md5.Sum(...)
+  message: >-
+    MD5 is cryptographically broken. Use sha256.New() or stronger.
+  metadata:
+    cwe:
+    - 'CWE-328: Use of Weak Hash'
+    cwe_id: CWE-328
+    prescan_regex: md5\.(New|Sum)
+  severity: WARNING
+  languages:
+  - go
+
+- id: weak-hash-sha1
+  pattern-either:
+      - pattern: sha1.New()
+      - pattern: sha1.Sum(...)
+  message: >-
+    SHA-1 is cryptographically weak. Use sha256.New() or stronger.
+  metadata:
+    cwe:
+    - 'CWE-328: Use of Weak Hash'
+    cwe_id: CWE-328
+    prescan_regex: sha1\.(New|Sum)
+  severity: WARNING
+  languages:
+  - go

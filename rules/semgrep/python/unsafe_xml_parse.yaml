@@ -1,0 +1,20 @@
+rules:
+- id: unsafe-xml-parse
+  pattern-either:
+      - pattern: xml.etree.ElementTree.parse(...)
+      - pattern: xml.etree.ElementTree.fromstring(...)
+      - pattern: ET.parse(...)
+      - pattern: ET.fromstring(...)
+      - pattern: ElementTree.parse(...)
+      - pattern: ElementTree.fromstring(...)
+  message: >-
+    XML parsing with xml.etree.ElementTree is vulnerable to XXE
+    (XML External Entity) attacks. Use defusedxml.ElementTree instead.
+  metadata:
+    cwe:
+    - 'CWE-611: Improper Restriction of XML External Entity Reference'
+    cwe_id: CWE-611
+    prescan_regex: (ElementTree\.(parse|fromstring)|ET\.(parse|fromstring))
+  severity: WARNING
+  languages:
+  - python

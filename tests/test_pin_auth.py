@@ -3,13 +3,13 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from starlette.responses import JSONResponse
 
-from sentinel.api.auth import PinAuthMiddleware
+from sentinel.api.auth import PinAuthMiddleware, PinVerifier
 
 
-def _make_app(pin_getter):
+def _make_app(pin_verifier_getter):
     """Minimal FastAPI app with PinAuthMiddleware for isolated testing."""
     app = FastAPI()
-    app.add_middleware(PinAuthMiddleware, pin_getter=pin_getter)
+    app.add_middleware(PinAuthMiddleware, pin_verifier_getter=pin_verifier_getter)
 
     @app.get("/health")
     async def health():
@@ -35,7 +35,7 @@ class TestPinAuthEnabled:
 
     @pytest.fixture
     def client(self):
-        app = _make_app(pin_getter=lambda: "1234")
+        app = _make_app(pin_verifier_getter=lambda: PinVerifier("1234"))
         return TestClient(app)
 
     def test_health_exempt(self, client):
@@ -75,7 +75,7 @@ class TestPinAuthLockout:
 
     @pytest.fixture
     def client(self):
-        app = _make_app(pin_getter=lambda: "1234")
+        app = _make_app(pin_verifier_getter=lambda: PinVerifier("1234"))
         return TestClient(app)
 
     def test_lockout_after_max_failures(self, client):
@@ -129,7 +129,7 @@ class TestPinAuthDisabled:
 
     @pytest.fixture
     def client(self):
-        app = _make_app(pin_getter=lambda: None)
+        app = _make_app(pin_verifier_getter=lambda: None)
         return TestClient(app)
 
     def test_health_passes(self, client):

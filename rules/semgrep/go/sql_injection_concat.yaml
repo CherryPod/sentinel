@@ -1,0 +1,17 @@
+rules:
+- id: sql-injection-concat
+  pattern-either:
+      - pattern: $DB.Query($X + ..., ...)
+      - pattern: $DB.QueryRow($X + ..., ...)
+      - pattern: $DB.Exec($X + ..., ...)
+  message: >-
+    SQL query built via string concatenation. Use parameterized queries
+    with $1/$2 placeholders to prevent SQL injection.
+  metadata:
+    cwe:
+    - 'CWE-89: Improper Neutralization of Special Elements used in an SQL Command (SQL Injection)'
+    cwe_id: CWE-89
+    prescan_regex: (\.Query\(|\.QueryRow\(|\.Exec\()
+  severity: WARNING
+  languages:
+  - go

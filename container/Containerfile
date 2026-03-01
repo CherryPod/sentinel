@@ -2,30 +2,45 @@ FROM python@sha256:9e01bf1ae5db7649a236da7be1e94ffbbbdd7a93f867dd0d8d5720d9e1f89
 
 WORKDIR /app
 
-# Build deps for torch/transformers native extensions
+# Build deps (torch/transformers native extensions) + worker build tools
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    gcc g++ openssl \
+    gcc g++ openssl wget make rustc \
     && rm -rf /var/lib/apt/lists/*
+
+# Install signal-cli (A3) — GraalVM native binary (no JRE needed)
+# Data dir (keys + trust store) lives on a bind mount at /app/signal-data.
+ARG SIGNAL_CLI_VERSION=0.13.24
+RUN wget -q "https://github.com/AsamK/signal-cli/releases/download/v${SIGNAL_CLI_VERSION}/signal-cli-${SIGNAL_CLI_VERSION}-Linux-native.tar.gz" \
+    -O /tmp/signal-cli.tar.gz \
+    && tar xf /tmp/signal-cli.tar.gz -C /usr/local/bin \
+    && chmod +x /usr/local/bin/signal-cli \
+    && rm /tmp/signal-cli.tar.gz
 
 COPY pyproject.toml .
 
 # Install torch CPU-only first (separate index), then the rest
 RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu \
-    && pip install --no-cache-dir ".[dev,mcp]"
+    && pip install --no-cache-dir ".[dev,mcp,worker]"
 
 # Pre-download Prompt Guard model at build time (uses HF token via build secret)
 RUN --mount=type=secret,id=hf_token \
     HF_TOKEN=$(cat /run/secrets/hf_token) \
     python -c "from transformers import pipeline; pipeline('text-classification', model='meta-llama/Llama-Prompt-Guard-2-86M')"
 
-# Pre-create semgrep symlink at build time (semgrep tries to create this at
-# runtime via os.symlink, which fails on read-only filesystem)
-RUN ln -sf /usr/local/lib/python3.12/site-packages/semgrep/bin/semgrep-core \
-        /usr/local/lib/python3.12/site-packages/semgrep/bin/osemgrep
-
 COPY sentinel/ ./sentinel/
+COPY rules/ ./rules/
 COPY tests/ ./tests/
 COPY ui/ ./ui/
+
+# WASM sidecar binary + tool modules (pre-built on host, Phase 4)
+COPY sidecar/target/release/sentinel-sidecar ./sidecar/sentinel-sidecar
+RUN chmod +x ./sidecar/sentinel-sidecar
+COPY sidecar/wasm/ ./wasm/
+
+# Radicale CalDAV server config + container entrypoint
+COPY container/radicale.conf /app/radicale.conf
+COPY container/entrypoint.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh
 
 # Generate self-signed TLS cert at build time (swap for real cert in production)
 RUN mkdir -p /data /app/tls /logs /workspace && \
@@ -36,5 +51,4 @@ RUN mkdir -p /data /app/tls /logs /workspace && \
 
 EXPOSE 8443 8080
 
-CMD ["uvicorn", "sentinel.api.app:app", "--host", "0.0.0.0", "--port", "8443", \
-     "--ssl-keyfile", "/app/tls/sentinel.key", "--ssl-certfile", "/app/tls/sentinel.crt"]
+CMD ["/app/entrypoint.sh"]

@@ -1,0 +1,20 @@
+rules:
+- id: unsafe-marshal-use
+  patterns:
+      - pattern-either:
+          - pattern: marshal.loads(...)
+          - pattern: marshal.load(...)
+      - pattern-not: marshal.loads("...")
+      - pattern-not: marshal.load("...")
+  message: >-
+    Potential arbitrary code execution via marshal deserialization.
+    marshal is not intended for untrusted data — use json or pickle with
+    proper safeguards instead.
+  metadata:
+    cwe:
+    - 'CWE-502: Deserialization of Untrusted Data'
+    cwe_id: CWE-502
+    prescan_regex: marshal\.load
+  severity: WARNING
+  languages:
+  - python

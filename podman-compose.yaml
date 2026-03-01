@@ -23,12 +23,14 @@ services:
       - SENTINEL_LOG_DIR=/logs
       - SENTINEL_LOG_LEVEL=INFO
       - SENTINEL_APPROVAL_MODE=full
+      - SENTINEL_TRUST_LEVEL=4
       - SENTINEL_VERBOSE_RESULTS=false
+      - SENTINEL_BENCHMARK_MODE=false
       - SENTINEL_PIN_REQUIRED=true
       - SENTINEL_PIN_FILE=/run/secrets/sentinel_pin
       - SENTINEL_OLLAMA_URL=http://sentinel-ollama:11434
       - SENTINEL_OLLAMA_MODEL=qwen3:14b
-      - SENTINEL_OLLAMA_TIMEOUT=1800
+      - SENTINEL_OLLAMA_TIMEOUT=7200
       - SENTINEL_DB_PATH=/data/sentinel.db
       - SENTINEL_STATIC_DIR=/app/ui
       - SENTINEL_TLS_CERT_FILE=/app/tls/sentinel.crt
@@ -37,29 +39,91 @@ services:
       - SENTINEL_HTTP_PORT=8080
       - SENTINEL_REDIRECT_ENABLED=true
       - SENTINEL_EXTERNAL_HTTPS_PORT=3001
-      - SENTINEL_ALLOWED_ORIGINS=https://localhost:3001,https://localhost:3002
+      - SENTINEL_ALLOWED_ORIGINS=https://localhost:3001
+      # Routine engine (Phase 5)
+      - SENTINEL_ROUTINE_ENABLED=true
+      # Signal channel (A3) — requires signal-cli registration
+      - SENTINEL_SIGNAL_ENABLED=false
+      - SENTINEL_SIGNAL_ACCOUNT=+YOUR_SIGNAL_NUMBER
+      - SENTINEL_SIGNAL_ALLOWED_SENDERS=+ALLOWED_PHONE,ALLOWED_UUID
+      - SENTINEL_SIGNAL_RATE_LIMIT=10
+      - SENTINEL_SIGNAL_MAX_MESSAGE_LENGTH=2000
+      - SENTINEL_SIGNAL_CLI_CONFIG=/app/signal-data
+      # WASM sidecar (Phase 4)
+      - SENTINEL_SIDECAR_ENABLED=true
+      - SENTINEL_SIDECAR_SOCKET=/tmp/sentinel-sidecar.sock
+      - SENTINEL_SIDECAR_BINARY=/app/sidecar/sentinel-sidecar
+      - SENTINEL_SIDECAR_TOOL_DIR=/app/wasm
+      # Telegram channel (BotFather bot)
+      - SENTINEL_TELEGRAM_ENABLED=true
+      - SENTINEL_TELEGRAM_BOT_TOKEN_FILE=/run/secrets/telegram_bot_token
+      - SENTINEL_TELEGRAM_ALLOWED_CHAT_IDS=YOUR_CHAT_ID
+      - SENTINEL_TELEGRAM_RATE_LIMIT=10
+      - SENTINEL_TELEGRAM_MAX_MESSAGE_LENGTH=4096
+      - SENTINEL_TELEGRAM_POLLING_TIMEOUT=30
+      # Brave web search
+      - SENTINEL_WEB_SEARCH_ENABLED=true
+      - SENTINEL_WEB_SEARCH_BACKEND=brave
+      - SENTINEL_BRAVE_API_KEY_FILE=/run/secrets/brave_api_key
+      # Email — Brevo SMTP (send) + Disroot IMAP (receive)
+      - SENTINEL_EMAIL_ENABLED=true
+      - SENTINEL_EMAIL_BACKEND=imap
+      - SENTINEL_SMTP_HOST=smtp.example.com
+      - SENTINEL_SMTP_PORT=587
+      - SENTINEL_SMTP_USERNAME=your-email@example.com
+      - SENTINEL_SMTP_PASSWORD_FILE=/run/secrets/smtp_password
+      - SENTINEL_SMTP_FROM=your-email@example.com
+      - SENTINEL_SMTP_USE_TLS=true
+      - SENTINEL_IMAP_HOST=imap.example.com
+      - SENTINEL_IMAP_PORT=993
+      - SENTINEL_IMAP_USERNAME=your-email@example.com
+      - SENTINEL_IMAP_PASSWORD_FILE=/run/secrets/imap_password
+      - SENTINEL_IMAP_USE_TLS=true
+      # CalDAV calendar (Radicale, runs inside container)
+      - SENTINEL_CALENDAR_ENABLED=true
+      - SENTINEL_CALENDAR_BACKEND=caldav
+      - SENTINEL_CALDAV_URL=http://127.0.0.1:5232
+      - SENTINEL_CALDAV_USERNAME=sentinel
+      - SENTINEL_CALDAV_PASSWORD_FILE=/run/secrets/caldav_password
+      # Podman sandbox (E5) — disposable containers for shell at TL2+
+      - SENTINEL_SANDBOX_ENABLED=true
+      - SENTINEL_SANDBOX_SOCKET=/tmp/podman-proxy.sock
+      - SENTINEL_SANDBOX_IMAGE=python:3.12-slim
+      # Sandbox workspace — must match the compose-prefixed volume name so the
+      # sandbox containers mount the same volume as sentinel's /workspace
+      - SENTINEL_SANDBOX_WORKSPACE_VOLUME=sentinel_sentinel-workspace
+      # Podman proxy — restricts socket access to sandbox operations only
+      - SENTINEL_PODMAN_PROXY_UPSTREAM=/run/podman/podman-host.sock
+      - SENTINEL_PODMAN_PROXY_LISTEN=/tmp/podman-proxy.sock
     volumes:
       - ./policies:/policies:ro
       - sentinel-data:/data
       - sentinel-workspace:/workspace
       - ./logs:/logs
+      - /run/user/1000/podman/podman.sock:/run/podman/podman-host.sock:ro
+      - ./data/signal-cli:/app/signal-data:Z
     secrets:
       - claude_api_key
       - sentinel_pin
+      - brave_api_key
+      - telegram_bot_token
+      - smtp_password
+      - imap_password
+      - caldav_password
     ports:
       - "3001:8443"
       - "3002:8080"
     restart: always
     depends_on:
       - sentinel-ollama
-    # Resource limits
-    mem_limit: 4G
-    mem_reservation: 1G
-    cpus: 4.0
+    # Resource limits (bumped for Signal + Radicale + sandbox)
+    mem_limit: 8G
+    mem_reservation: 2G
+    cpus: 6.0
     # Read-only filesystem
     read_only: true
     tmpfs:
-      - /tmp:size=100M,noexec
+      - /tmp:size=512M
     # Health check
     healthcheck:
       test: ["CMD-SHELL", "python -c 'import urllib.request, ssl; ctx=ssl.create_default_context(); ctx.check_hostname=False; ctx.verify_mode=ssl.CERT_NONE; urllib.request.urlopen(\"https://localhost:8443/health\", context=ctx)'"]
@@ -76,8 +140,7 @@ services:
     environment:
       - OLLAMA_HOST=0.0.0.0:11434
       - OLLAMA_KEEP_ALIVE=5m
-      - OLLAMA_NUM_CTX=16384
-      - OLLAMA_NUM_PREDICT=-1
+      - OLLAMA_NUM_CTX=20480
     volumes:
       - sentinel-ollama-data:/root/.ollama
     devices:
@@ -109,6 +172,16 @@ secrets:
     file: ./secrets/claude_api_key.txt
   sentinel_pin:
     file: ./secrets/sentinel_pin.txt
+  brave_api_key:
+    file: ./secrets/brave_api_key.txt
+  telegram_bot_token:
+    file: ./secrets/telegram_bot_token.txt
+  smtp_password:
+    file: ./secrets/smtp_password.txt
+  imap_password:
+    file: ./secrets/imap_password.txt
+  caldav_password:
+    file: ./secrets/caldav_password.txt
 
 volumes:
   sentinel-data:

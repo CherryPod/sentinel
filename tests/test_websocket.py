@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from starlette.testclient import TestClient
 
+from sentinel.api.auth import PinVerifier
 from sentinel.channels.web import WebSocketChannel
 from sentinel.core.bus import EventBus
 
@@ -69,7 +70,7 @@ class TestWebSocketAuth:
         ws.push_message({"type": "auth", "pin": "1234"})
         tracker = FakeFailureTracker()
 
-        channel = WebSocketChannel(ws, pin_getter=lambda: "1234", failure_tracker=tracker)
+        channel = WebSocketChannel(ws, pin_verifier_getter=lambda: PinVerifier("1234"), failure_tracker=tracker)
         result = await channel.authenticate()
 
         assert result is True
@@ -81,7 +82,7 @@ class TestWebSocketAuth:
         ws = FakeWebSocket()
         tracker = FakeFailureTracker()
 
-        channel = WebSocketChannel(ws, pin_getter=lambda: None, failure_tracker=tracker)
+        channel = WebSocketChannel(ws, pin_verifier_getter=lambda: None, failure_tracker=tracker)
         result = await channel.authenticate()
 
         assert result is True
@@ -93,7 +94,7 @@ class TestWebSocketAuth:
         ws.push_message({"type": "auth", "pin": "9999"})
         tracker = FakeFailureTracker()
 
-        channel = WebSocketChannel(ws, pin_getter=lambda: "1234", failure_tracker=tracker)
+        channel = WebSocketChannel(ws, pin_verifier_getter=lambda: PinVerifier("1234"), failure_tracker=tracker)
         result = await channel.authenticate()
 
         assert result is False
@@ -107,7 +108,7 @@ class TestWebSocketAuth:
         ws = FakeWebSocket()
         tracker = FakeFailureTracker(locked=True)
 
-        channel = WebSocketChannel(ws, pin_getter=lambda: "1234", failure_tracker=tracker)
+        channel = WebSocketChannel(ws, pin_verifier_getter=lambda: PinVerifier("1234"), failure_tracker=tracker)
         result = await channel.authenticate()
 
         assert result is False
@@ -119,7 +120,7 @@ class TestWebSocketAuth:
         ws.push_message("not json at all {{{")
         tracker = FakeFailureTracker()
 
-        channel = WebSocketChannel(ws, pin_getter=lambda: "1234", failure_tracker=tracker)
+        channel = WebSocketChannel(ws, pin_verifier_getter=lambda: PinVerifier("1234"), failure_tracker=tracker)
         result = await channel.authenticate()
 
         assert result is False
@@ -131,7 +132,7 @@ class TestWebSocketAuth:
         ws.push_message({"type": "task", "request": "hello"})
         tracker = FakeFailureTracker()
 
-        channel = WebSocketChannel(ws, pin_getter=lambda: "1234", failure_tracker=tracker)
+        channel = WebSocketChannel(ws, pin_verifier_getter=lambda: PinVerifier("1234"), failure_tracker=tracker)
         result = await channel.authenticate()
 
         assert result is False
@@ -142,7 +143,7 @@ class TestWebSocketAuth:
         ws = FakeWebSocket()
         tracker = FakeFailureTracker()
 
-        channel = WebSocketChannel(ws, pin_getter=lambda: "1234", failure_tracker=tracker)
+        channel = WebSocketChannel(ws, pin_verifier_getter=lambda: PinVerifier("1234"), failure_tracker=tracker)
         # Don't push any message — will timeout
         # Patch the timeout to be very short
         with patch("sentinel.channels.web.asyncio.wait_for", side_effect=asyncio.TimeoutError):
@@ -159,7 +160,7 @@ class TestWebSocketSend:
 
         ws = FakeWebSocket()
         tracker = FakeFailureTracker()
-        channel = WebSocketChannel(ws, pin_getter=lambda: None, failure_tracker=tracker)
+        channel = WebSocketChannel(ws, pin_verifier_getter=lambda: None, failure_tracker=tracker)
 
         msg = OutgoingMessage(
             channel_id="ch1",
@@ -178,7 +179,7 @@ class TestWebSocketReceive:
         """receive() yields IncomingMessage for valid JSON."""
         ws = FakeWebSocket()
         tracker = FakeFailureTracker()
-        channel = WebSocketChannel(ws, pin_getter=lambda: None, failure_tracker=tracker)
+        channel = WebSocketChannel(ws, pin_verifier_getter=lambda: None, failure_tracker=tracker)
 
         ws.push_message({"type": "task", "request": "hello"})
 
@@ -196,7 +197,7 @@ class TestWebSocketReceive:
         """Invalid JSON → error response sent, continues listening."""
         ws = FakeWebSocket()
         tracker = FakeFailureTracker()
-        channel = WebSocketChannel(ws, pin_getter=lambda: None, failure_tracker=tracker)
+        channel = WebSocketChannel(ws, pin_verifier_getter=lambda: None, failure_tracker=tracker)
 
         ws.push_message("not json")
         ws.push_message({"type": "task", "request": "real message"})
@@ -220,7 +221,7 @@ class TestWebSocketEndpointIntegration:
     These require the FastAPI app to be importable but use mocked internals.
     """
 
-    @patch("sentinel.api.app._pin", None)
+    @patch("sentinel.api.app._pin_verifier", None)
     @patch("sentinel.api.app._orchestrator", None)
     @patch("sentinel.api.app._event_bus", None)
     def test_ws_no_orchestrator_returns_error(self):
@@ -237,7 +238,7 @@ class TestWebSocketEndpointIntegration:
             msg = ws.receive_json()
             assert msg["type"] == "error"
 
-    @patch("sentinel.api.app._pin", "1234")
+    @patch("sentinel.api.app._pin_verifier", PinVerifier("1234"))
     @patch("sentinel.api.app._orchestrator", None)
     def test_ws_wrong_pin_closes(self):
         """Wrong PIN → connection closed."""

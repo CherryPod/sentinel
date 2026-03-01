@@ -153,3 +153,68 @@ class TestSessionStoreSQLite:
 
         s2 = store.get("s1")
         assert s2.cumulative_risk == 3.5
+
+
+# ── V-004: SQL injection boundary tests ──────────────────────────
+
+
+_EVIL_INPUTS = [
+    "'; DROP TABLE sessions; --",
+    "' OR '1'='1",
+    "'; DELETE FROM conversation_turns; --",
+    "\x00null_byte\x00",
+    "a" * 100_000,
+    "SELECT * FROM sessions",
+    "Robert'); DROP TABLE students;--",
+    "1; ATTACH DATABASE '/tmp/evil.db' AS evil; --",
+]
+
+
+class TestSessionSQLInjection:
+    """Regression guard: V-004 — user-provided strings stored as literals, never executed."""
+
+    @pytest.mark.parametrize("evil_input", _EVIL_INPUTS, ids=[
+        "drop_table", "or_1_1", "delete_turns", "null_bytes",
+        "very_long_string", "select_star", "bobby_tables", "attach_db",
+    ])
+    def test_evil_session_id(self, db, evil_input):
+        """Evil strings as session_id are stored and retrieved as literals."""
+        store = SessionStore(db=db, ttl=3600, max_count=100)
+        session = store.get_or_create(evil_input, source="test")
+        assert session.session_id == evil_input
+
+        # Re-fetch and verify the evil string survived the roundtrip
+        s2 = store.get(evil_input)
+        assert s2 is not None
+        assert s2.session_id == evil_input
+
+    @pytest.mark.parametrize("evil_input", _EVIL_INPUTS, ids=[
+        "drop_table", "or_1_1", "delete_turns", "null_bytes",
+        "very_long_string", "select_star", "bobby_tables", "attach_db",
+    ])
+    def test_evil_request_text(self, store, evil_input):
+        """Evil strings in ConversationTurn.request_text survive roundtrip."""
+        session = store.get_or_create("safe_session")
+        session.add_turn(ConversationTurn(
+            request_text=evil_input,
+            result_status="success",
+        ))
+
+        s2 = store.get("safe_session")
+        assert s2 is not None
+        assert len(s2.turns) == 1
+        assert s2.turns[0].request_text == evil_input
+
+    @pytest.mark.parametrize("evil_input", _EVIL_INPUTS, ids=[
+        "drop_table", "or_1_1", "delete_turns", "null_bytes",
+        "very_long_string", "select_star", "bobby_tables", "attach_db",
+    ])
+    def test_evil_source(self, db, evil_input):
+        """Evil strings as session source are stored and retrieved as literals."""
+        store = SessionStore(db=db, ttl=3600, max_count=100)
+        session = store.get_or_create("s1", source=evil_input)
+        assert session.source == evil_input
+
+        s2 = store.get("s1")
+        assert s2 is not None
+        assert s2.source == evil_input

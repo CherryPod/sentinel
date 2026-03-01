@@ -25,8 +25,7 @@ pub struct HostState {
     pub http_allowlist: Vec<String>,
     /// HTTP client configuration.
     pub http_config: HttpConfig,
-    /// Shell command timeout in milliseconds (reserved for per-command timeout).
-    #[allow(dead_code)]
+    /// Shell command timeout in milliseconds.
     pub shell_timeout_ms: u64,
     /// Shell command max output size in bytes.
     pub shell_max_output_bytes: u64,
@@ -50,6 +49,12 @@ pub fn host_call_dispatch(mut caller: Caller<'_, HostState>, op: i32, req_len: i
         Err(_) => return -4,
     };
 
+    // O-003: Validate req_len before casting to usize — negative i32 would wrap
+    if req_len < 0 || req_len > 1_048_576 {
+        // Reject negative lengths and requests > 1 MiB (sane upper bound)
+        return -4;
+    }
+
     // Read request JSON from guest memory
     let request_json = match read_from_guest(&mut caller, io_buffer_ptr, req_len as usize) {
         Ok(json) => json,
@@ -63,11 +68,11 @@ pub fn host_call_dispatch(mut caller: Caller<'_, HostState>, op: i32, req_len: i
 
     // Dispatch based on operation code
     let result = match op {
-        1 => handle_read_file(caller.data(), &request),
-        2 => handle_write_file(caller.data(), &request),
-        3 => handle_shell_exec(caller.data(), &request),
-        4 => handle_http_fetch(caller.data(), &request),
-        5 => handle_get_credential(caller.data(), &request),
+        1 => handle_read_file(&caller.data(), &request),
+        2 => handle_write_file(&caller.data(), &request),
+        3 => handle_shell_exec(&caller.data(), &request),
+        4 => handle_http_fetch(&caller.data(), &request),
+        5 => handle_get_credential(&caller.data(), &request),
         _ => return -1,
     };
 
@@ -79,7 +84,8 @@ pub fn host_call_dispatch(mut caller: Caller<'_, HostState>, op: i32, req_len: i
             };
             // Write response back to guest IO_BUFFER
             match write_to_guest(&mut caller, io_buffer_ptr, &response_bytes) {
-                Ok(()) => response_bytes.len() as i32,
+                // O-004: Safe i32 conversion — prevent overflow on large responses
+                Ok(()) => i32::try_from(response_bytes.len()).unwrap_or(i32::MAX),
                 Err(_) => -4,
             }
         }
@@ -173,19 +179,19 @@ fn validate_path(path_str: &str, allowed_paths: &[String]) -> Result<PathBuf> {
         canon_parent.join(filename)
     };
 
-    // Check against allowed directories
+    // Check against allowed directories (O-002: require path boundary after prefix)
     let canonical_str = canonical.to_string_lossy();
-    let allowed = allowed_paths.iter().any(|allowed| {
-        canonical_str.starts_with(allowed)
+    let allowed = allowed_paths.iter().any(|dir| {
+        // Exact match or path starts with dir + "/" separator
+        // Prevents /workspace-evil from matching allowed path /workspace
+        canonical_str == dir.as_str()
+            || canonical_str.starts_with(&format!("{}/", dir.trim_end_matches('/')))
     });
 
     if !allowed {
-        bail!(
-            "path '{}' (resolved: '{}') not under allowed directories: {:?}",
-            path_str,
-            canonical_str,
-            allowed_paths
-        );
+        // O-010: Don't leak resolved path or allowed directories list in error
+        // messages — these are internal implementation details.
+        bail!("path '{}' is not under an allowed directory", path_str);
     }
 
     Ok(canonical)
@@ -368,5 +374,25 @@ mod tests {
         assert!(result.is_ok());
 
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn test_validate_path_rejects_prefix_bypass() {
+        // O-002: /workspace-evil must NOT match allowed path /workspace
+        let tmp = std::env::temp_dir().join("sentinel_test_ws");
+        let evil = std::env::temp_dir().join("sentinel_test_ws-evil");
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::create_dir_all(&evil).unwrap();
+        let evil_file = evil.join("steal.txt");
+        std::fs::write(&evil_file, "secret").unwrap();
+
+        let result = validate_path(
+            &evil_file.to_string_lossy(),
+            &[tmp.to_string_lossy().to_string()],
+        );
+        assert!(result.is_err(), "prefix bypass should be rejected");
+
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::remove_dir_all(&evil).ok();
     }
 }

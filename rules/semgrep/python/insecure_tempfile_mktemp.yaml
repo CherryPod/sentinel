@@ -1,0 +1,14 @@
+rules:
+- id: insecure-tempfile-mktemp
+  pattern: tempfile.mktemp(...)
+  message: >-
+    tempfile.mktemp() is vulnerable to race conditions (TOCTOU).
+    Use tempfile.mkstemp() or tempfile.NamedTemporaryFile() instead.
+  metadata:
+    cwe:
+    - 'CWE-377: Insecure Temporary File'
+    cwe_id: CWE-377
+    prescan_regex: tempfile\.mktemp
+  severity: WARNING
+  languages:
+  - python

@@ -1,0 +1,16 @@
+rules:
+- id: unsafe-unserialize
+  patterns:
+      - pattern: unserialize($X)
+      - pattern-not: unserialize('...')
+  message: >-
+    unserialize() with untrusted data can lead to arbitrary code execution
+    via PHP object injection. Use json_decode() for data interchange.
+  metadata:
+    cwe:
+    - 'CWE-502: Deserialization of Untrusted Data'
+    cwe_id: CWE-502
+    prescan_regex: unserialize\(
+  severity: WARNING
+  languages:
+  - php

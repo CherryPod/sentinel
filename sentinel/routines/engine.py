@@ -64,8 +64,37 @@ class RoutineEngine:
     # -- lifecycle --
 
     async def start(self) -> None:
-        """Start the scheduler loop and subscribe to event bus."""
+        """Start the scheduler loop and subscribe to event bus.
+
+        On startup, marks any executions left in 'running' state as
+        'interrupted' — these are stale from a previous engine crash/restart
+        and would otherwise block max_concurrent slots forever.
+        """
         self._stopped = False
+
+        # Clean up stale executions from previous engine instance
+        if self._db is not None:
+            stale_count = self._db.execute(
+                "SELECT COUNT(*) FROM routine_executions WHERE status = 'running'"
+            ).fetchone()[0]
+            if stale_count > 0:
+                self._db.execute(
+                    """UPDATE routine_executions
+                       SET status = 'interrupted',
+                           error = 'Engine restarted while execution was in progress',
+                           completed_at = ?
+                       WHERE status = 'running'""",
+                    (_now_iso(),),
+                )
+                self._db.commit()
+                logger.warning(
+                    "Marked stale executions as interrupted",
+                    extra={
+                        "event": "routine_stale_cleanup",
+                        "count": stale_count,
+                    },
+                )
+
         self._scheduler_task = asyncio.create_task(self._scheduler_loop())
         self._event_bus.subscribe("*", self._on_event)
         logger.info(
@@ -153,6 +182,9 @@ class RoutineEngine:
         # Find enabled event-triggered routines
         # TODO: add user_id filter for multi-user — currently all users' event
         # routines fire on matching topics. Single-user v1 limitation.
+        # M-003: Accesses private store attributes (_row_to_routine, _mem) to
+        # avoid adding a public query method for this single-caller pattern.
+        # Refactor if RoutineStore grows a public list_by_trigger_type() method.
         if self._db is not None:
             rows = self._db.execute(
                 "SELECT * FROM routines WHERE enabled = 1 AND trigger_type = 'event'"
@@ -212,7 +244,7 @@ class RoutineEngine:
                 "routine_id": routine.routine_id,
                 "execution_id": execution_id,
                 "triggered_by": triggered_by,
-                "name": routine.name,
+                "routine_name": routine.name,
             },
         )
 
@@ -235,7 +267,14 @@ class RoutineEngine:
         execution_id: str,
         triggered_by: str,
     ) -> None:
-        """Run a routine through the orchestrator with timeout."""
+        """Run a routine through the orchestrator with timeout.
+
+        Supports multi-turn execution when ``max_iterations`` > 1 in
+        ``action_config``.  Each iteration feeds the previous result back
+        as context, and a ``[DONE]`` signal in the plan summary terminates
+        early.  Single-iteration routines (the default) follow the original
+        fast path.
+        """
         prompt = routine.action_config.get("prompt", "")
         if not prompt:
             self._record_execution_result(
@@ -244,41 +283,126 @@ class RoutineEngine:
             return
 
         approval_mode = routine.action_config.get("approval_mode", "auto")
+        max_iterations = routine.action_config.get("max_iterations", 1)
+        per_iteration_timeout = routine.action_config.get(
+            "per_iteration_timeout", self._execution_timeout,
+        )
         now = _now_iso()
 
-        try:
-            result = await asyncio.wait_for(
-                self._orchestrator.handle_task(
-                    user_request=prompt,
-                    source=f"routine:{routine.routine_id}",
-                    approval_mode=approval_mode,
-                    source_key=f"routine:{routine.user_id}",
-                    task_id=execution_id,
-                ),
-                timeout=self._execution_timeout,
-            )
+        if max_iterations <= 1:
+            # ── Single-iteration fast path (backward compatible) ──
+            try:
+                result = await asyncio.wait_for(
+                    self._orchestrator.handle_task(
+                        user_request=prompt,
+                        source=f"routine:{routine.routine_id}",
+                        approval_mode=approval_mode,
+                        source_key=f"routine:{routine.user_id}",
+                        task_id=execution_id,
+                    ),
+                    timeout=self._execution_timeout,
+                )
 
-            self._record_execution_result(
-                execution_id,
-                status=result.status,
-                result_summary=result.plan_summary,
-                task_id=result.task_id,
-            )
+                self._record_execution_result(
+                    execution_id,
+                    status=result.status,
+                    result_summary=result.plan_summary,
+                    task_id=result.task_id,
+                )
 
-        except asyncio.TimeoutError:
-            self._record_execution_result(
-                execution_id, "timeout",
-                error=f"Execution timed out after {self._execution_timeout}s",
-            )
-        except asyncio.CancelledError:
-            self._record_execution_result(
-                execution_id, "cancelled", error="Execution cancelled",
-            )
-            raise
-        except Exception as exc:
-            self._record_execution_result(
-                execution_id, "error", error=str(exc),
-            )
+            except asyncio.TimeoutError:
+                self._record_execution_result(
+                    execution_id, "timeout",
+                    error=f"Execution timed out after {self._execution_timeout}s",
+                )
+            except asyncio.CancelledError:
+                self._record_execution_result(
+                    execution_id, "cancelled", error="Execution cancelled",
+                )
+                raise
+            except Exception as exc:
+                self._record_execution_result(
+                    execution_id, "error", error=str(exc),
+                )
+        else:
+            # ── Multi-turn iteration loop ──
+            context = ""
+            final_result = None
+            for iteration in range(1, max_iterations + 1):
+                iter_prompt = prompt
+                if context:
+                    iter_prompt += (
+                        f"\n\n--- Previous iteration ({iteration - 1}) result ---\n"
+                        f"{context}"
+                    )
+
+                try:
+                    result = await asyncio.wait_for(
+                        self._orchestrator.handle_task(
+                            user_request=iter_prompt,
+                            source=f"routine:{routine.routine_id}",
+                            approval_mode=approval_mode,
+                            source_key=f"routine:{routine.user_id}",
+                            task_id=execution_id,
+                        ),
+                        timeout=per_iteration_timeout,
+                    )
+
+                    self._record_iteration(
+                        execution_id, iteration, result.status,
+                        result.plan_summary,
+                    )
+                    final_result = result
+
+                    # Check for done signal or error/blocked status
+                    if self._is_done_signal(result):
+                        self._record_execution_result(
+                            execution_id, "complete",
+                            result_summary=result.plan_summary,
+                            task_id=result.task_id,
+                        )
+                        break
+
+                    if result.status in ("blocked", "error"):
+                        self._record_execution_result(
+                            execution_id, result.status,
+                            result_summary=result.plan_summary,
+                            task_id=result.task_id,
+                        )
+                        break
+
+                    # Carry forward context for next iteration
+                    context = result.plan_summary or ""
+
+                except asyncio.TimeoutError:
+                    self._record_execution_result(
+                        execution_id, "timeout",
+                        error=(
+                            f"Iteration {iteration} timed out after "
+                            f"{per_iteration_timeout}s"
+                        ),
+                    )
+                    break
+                except asyncio.CancelledError:
+                    self._record_execution_result(
+                        execution_id, "cancelled",
+                        error=f"Cancelled during iteration {iteration}",
+                    )
+                    raise
+                except Exception as exc:
+                    self._record_execution_result(
+                        execution_id, "error",
+                        error=f"Iteration {iteration}: {exc}",
+                    )
+                    break
+            else:
+                # Exhausted max_iterations without done signal
+                if final_result is not None:
+                    self._record_execution_result(
+                        execution_id, final_result.status,
+                        result_summary=final_result.plan_summary,
+                        task_id=final_result.task_id,
+                    )
 
         # Update routine run state
         next_at = self._calculate_next_run(routine)
@@ -328,6 +452,39 @@ class RoutineEngine:
             },
         )
 
+    def _is_done_signal(self, result) -> bool:
+        """Check if an orchestrator result indicates the routine is complete.
+
+        A done signal is detected when the plan summary contains the
+        literal marker ``[DONE]`` (case-insensitive).
+
+        M-002: Substring match is intentional — plan_summary is generated by
+        Claude (trusted planner), not raw user input. False positives from
+        natural language mentioning "[DONE]" are acceptable since they only
+        cause early routine termination, not a security bypass.
+        """
+        summary = (result.plan_summary or "").lower()
+        return "[done]" in summary
+
+    def _record_iteration(
+        self,
+        execution_id: str,
+        iteration: int,
+        status: str,
+        result_summary: str = "",
+    ) -> None:
+        """Log a multi-turn iteration for auditing."""
+        logger.info(
+            "Routine iteration completed",
+            extra={
+                "event": "routine_iteration",
+                "execution_id": execution_id,
+                "iteration": iteration,
+                "status": status,
+                "summary_preview": (result_summary or "")[:200],
+            },
+        )
+
     # -- helpers --
 
     def _calculate_next_run(self, routine: Routine) -> str | None:
@@ -371,6 +528,63 @@ class RoutineEngine:
         if routine is None:
             return None
         return await self._spawn_execution(routine, triggered_by="manual")
+
+    def seed_defaults(self, user_id: str = "default") -> list[str]:
+        """Create starter routine templates if the user has no routines.
+
+        Returns a list of created routine IDs (empty if user already has routines).
+        """
+        if self._store.count_for_user(user_id) > 0:
+            return []
+
+        created = []
+
+        # Daily summary — runs at 09:00 UTC every day
+        r1 = self._store.create(
+            name="Daily Summary",
+            trigger_type="cron",
+            trigger_config={"cron": "0 9 * * *"},
+            action_config={
+                "prompt": (
+                    "Summarize the key activities and conversations from the "
+                    "past 24 hours. Include any important task results, security "
+                    "events, and memory updates."
+                ),
+                "approval_mode": "auto",
+            },
+            user_id=user_id,
+            description="Automated daily summary of recent activity.",
+            cooldown_s=3600,
+        )
+        created.append(r1.routine_id)
+
+        # Memory cleanup — runs at 03:00 UTC every Sunday
+        r2 = self._store.create(
+            name="Memory Cleanup",
+            trigger_type="cron",
+            trigger_config={"cron": "0 3 * * SUN"},
+            action_config={
+                "prompt": (
+                    "Review stored memories for outdated, redundant, or low-value "
+                    "entries. List candidates for cleanup with reasoning."
+                ),
+                "approval_mode": "auto",
+            },
+            user_id=user_id,
+            description="Weekly review of memory store for housekeeping.",
+            cooldown_s=3600,
+        )
+        created.append(r2.routine_id)
+
+        logger.info(
+            "Seeded default routines",
+            extra={
+                "event": "routine_seed_defaults",
+                "user_id": user_id,
+                "count": len(created),
+            },
+        )
+        return created
 
     def get_execution_history(
         self,

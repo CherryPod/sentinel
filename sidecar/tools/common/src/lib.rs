@@ -27,6 +27,7 @@ pub extern "C" fn get_io_buffer() -> *mut u8 {
 // Import from the "sentinel" host namespace.
 // `op` is the operation code, `len` is the request JSON length in IO_BUFFER.
 // Returns response length (positive) or error code (negative).
+#[link(wasm_import_module = "sentinel")]
 extern "C" {
     #[link_name = "host_call"]
     fn _host_call(op: i32, len: i32) -> i32;

@@ -17,8 +17,14 @@ if not _POLICY_PATH.exists():
 
 @pytest.fixture
 def engine() -> PolicyEngine:
-    """PolicyEngine loaded with the real sentinel-policy.yaml."""
+    """PolicyEngine loaded with the real sentinel-policy.yaml (TL0 default)."""
     return PolicyEngine(str(_POLICY_PATH), workspace_path="/workspace")
+
+
+@pytest.fixture
+def engine_tl4() -> PolicyEngine:
+    """PolicyEngine at TL4 — structural injection patterns relaxed."""
+    return PolicyEngine(str(_POLICY_PATH), workspace_path="/workspace", trust_level=4)
 
 
 @pytest.fixture

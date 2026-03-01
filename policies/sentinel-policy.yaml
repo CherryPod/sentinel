@@ -34,6 +34,56 @@ commands:
     - wc
     - grep
     - find
+    # File operations
+    - mv
+    - rm
+    - touch
+    - chmod
+    - chown
+    - ln
+    # Text processing
+    - echo
+    - sort
+    - uniq
+    - diff
+    - sed
+    - awk
+    - tee
+    - cut
+    - tr
+    - xargs
+    # Development tools (Python only — no Rust/Node toolchains in container)
+    - python3
+    - python
+    - pip3
+    - pip
+    - make
+    - gcc
+    - g++
+    # Archives
+    - tar
+    - gzip
+    - gunzip
+    - zip
+    - unzip
+    # Shells (direct invocation only — "bash -c", "| bash", "| sh" blocked by blocked_patterns)
+    - bash
+    - sh
+    # Navigation & path utilities
+    # NOTE: cd and test are shell builtins — only work via sandbox path (TL2+)
+    - cd
+    - test
+    - basename
+    - dirname
+    - realpath
+    # System info (read-only)
+    - env
+    - which
+    - whoami
+    - date
+    - pwd
+    - file
+    - stat
   blocked_patterns:
     - "rm -rf"
     - "rm -r /"
@@ -56,17 +106,11 @@ commands:
     - "| python"
     - "> /dev/"
     - "dd if="
-    - chmod
-    - chown
     - mount
     - umount
     - mkfs
     - fdisk
     - iptables
-    - systemctl
-    - journalctl
-    - "-exec"
-    - "-execdir"
 
   path_constrained:
     - cat
@@ -78,6 +122,15 @@ commands:
     - grep
     - ls
     - wc
+    - mv
+    - rm
+    - touch
+    - chmod
+    - chown
+    - ln
+    - sed
+    - awk
+    - tee
 
 network:
   qwen_outbound: none
@@ -85,6 +138,11 @@ network:
     - api.anthropic.com:443
   controller_internal_allowed:
     - sentinel-qwen:11434
+  http_tool_allowed_domains:
+    - "api.search.brave.com"
+    # R-001: Narrowed from *.googleapis.com — least-privilege for Gmail, Calendar, OAuth
+    - "www.googleapis.com"
+    - "oauth2.googleapis.com"
 
 human_approval_required:
   - podman run with -p flag

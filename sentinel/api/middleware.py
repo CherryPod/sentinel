@@ -55,7 +55,12 @@ class CSRFMiddleware(BaseHTTPMiddleware):
 
 
 class RequestSizeLimitMiddleware(BaseHTTPMiddleware):
-    """Reject requests with Content-Length exceeding the configured limit."""
+    """Reject requests with Content-Length exceeding the configured limit.
+
+    First-pass filter only. Chunked transfer-encoding (no Content-Length) bypasses
+    this check, but is caught downstream by FastAPI body limits and
+    MAX_TEXT_LENGTH (50K) in _normalize_text().
+    """
 
     def __init__(self, app, max_bytes: int):
         super().__init__(app)

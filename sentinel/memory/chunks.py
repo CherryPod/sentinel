@@ -41,6 +41,14 @@ class MemoryStore:
         self._mem: dict[str, MemoryChunk] = {}  # fallback for tests
         self._has_vec: bool | None = None  # cached check
 
+    @property
+    def db(self) -> sqlite3.Connection | None:
+        """Public accessor for the underlying database connection.
+
+        Used by hybrid_search() which needs direct DB access for FTS5 and vec queries.
+        """
+        return self._db
+
     def store(
         self,
         content: str,
@@ -201,8 +209,11 @@ class MemoryStore:
             source = existing[0]
             meta_json = json.dumps(metadata) if metadata is not None else None
 
-            # Delete old FTS5 entry, update row, insert new FTS5 entry
+            # Delete old FTS5 entry + stale vec entry, update row, insert new FTS5
+            # K-001: vec entry deleted on update — caller must re-embed and call
+            # store_with_embedding() for the new content to be vector-searchable.
             self._sync_fts_delete(chunk_id)
+            self._sync_vec_delete(chunk_id)
 
             if meta_json is not None:
                 self._db.execute(
@@ -233,14 +244,23 @@ class MemoryStore:
         return True
 
     def delete(self, chunk_id: str) -> bool:
-        """Delete chunk from all tables (chunk, FTS5, vec). Returns True if found."""
+        """Delete chunk from all tables (chunk, FTS5, vec). Returns True if found.
+
+        Raises ValueError if the chunk has a system-protected source (source
+        starts with ``system:``).  These entries are managed exclusively by
+        internal subsystems (e.g. heartbeat) and must not be removed via the
+        public API.
+        """
         if self._db is not None:
             existing = self._db.execute(
-                "SELECT chunk_id FROM memory_chunks WHERE chunk_id = ?",
+                "SELECT chunk_id, source FROM memory_chunks WHERE chunk_id = ?",
                 (chunk_id,),
             ).fetchone()
             if existing is None:
                 return False
+
+            if existing[1].startswith("system:"):
+                raise ValueError("Cannot delete system-protected memory entries")
 
             self._sync_fts_delete(chunk_id)
             self._sync_vec_delete(chunk_id)
@@ -257,10 +277,13 @@ class MemoryStore:
             return True
 
         # In-memory fallback
-        if chunk_id in self._mem:
-            del self._mem[chunk_id]
-            return True
-        return False
+        chunk = self._mem.get(chunk_id)
+        if chunk is None:
+            return False
+        if chunk.source.startswith("system:"):
+            raise ValueError("Cannot delete system-protected memory entries")
+        del self._mem[chunk_id]
+        return True
 
     # ── FTS5 sync (application-layer) ──────────────────────────────
 

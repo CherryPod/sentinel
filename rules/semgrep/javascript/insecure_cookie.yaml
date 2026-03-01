@@ -1,0 +1,15 @@
+rules:
+- id: insecure-cookie
+  pattern: document.cookie = $X
+  message: >-
+    Setting cookies via document.cookie without Secure and HttpOnly flags.
+    Use a server-side Set-Cookie header with Secure, HttpOnly, and SameSite.
+  metadata:
+    cwe:
+    - 'CWE-614: Sensitive Cookie in HTTPS Session Without Secure Attribute'
+    cwe_id: CWE-614
+    prescan_regex: document\.cookie\s*=
+  severity: WARNING
+  languages:
+  - javascript
+  - typescript

@@ -1,0 +1,16 @@
+rules:
+- id: unsafe-yaml-load
+  patterns:
+      - pattern: YAML.load($X)
+      - pattern-not: YAML.load("...")
+  message: >-
+    YAML.load() can instantiate arbitrary Ruby objects. Use YAML.safe_load()
+    for untrusted data.
+  metadata:
+    cwe:
+    - 'CWE-502: Deserialization of Untrusted Data'
+    cwe_id: CWE-502
+    prescan_regex: YAML\.load
+  severity: WARNING
+  languages:
+  - ruby

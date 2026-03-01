@@ -23,8 +23,10 @@ def init_db(db_path: str = "sentinel.db") -> sqlite3.Connection:
     conn.execute("PRAGMA foreign_keys=ON")
 
     _create_tables(conn)
+    _migrate_tables(conn)
     _create_fts_index(conn)
     _try_create_vec_table(conn)
+    _create_episodic_fts_index(conn)
 
     conn.commit()
     return conn
@@ -43,7 +45,8 @@ def _create_tables(conn: sqlite3.Connection) -> None:
             violation_count INTEGER NOT NULL DEFAULT 0,
             is_locked       INTEGER NOT NULL DEFAULT 0,
             created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-            last_active     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+            last_active     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+            task_in_progress INTEGER NOT NULL DEFAULT 0
         )
     """)
 
@@ -58,6 +61,9 @@ def _create_tables(conn: sqlite3.Connection) -> None:
             blocked_by      TEXT NOT NULL DEFAULT '[]',
             risk_score      REAL NOT NULL DEFAULT 0.0,
             plan_summary    TEXT NOT NULL DEFAULT '',
+            auto_approved   INTEGER NOT NULL DEFAULT 0,
+            elapsed_s       REAL,
+            step_outcomes   TEXT,
             created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
         )
     """)
@@ -172,7 +178,23 @@ def _create_tables(conn: sqlite3.Connection) -> None:
         ON routine_executions(routine_id, started_at)
     """)
 
+    # -- Webhooks (C1) --
+    # HMAC secrets stored plaintext — encryption requires raw value for verification.
+    # Mitigated by container read_only and file permissions. See H-002 for PIN hashing
+    # approach (PINs can be hashed; HMAC secrets cannot).
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS webhooks (
+            webhook_id      TEXT PRIMARY KEY,
+            name            TEXT NOT NULL,
+            secret          TEXT NOT NULL,
+            enabled         INTEGER NOT NULL DEFAULT 1,
+            user_id         TEXT NOT NULL DEFAULT 'default',
+            created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+        )
+    """)
+
     # -- Audit log (structured supplement to JSONL) --
+    # TODO: Add retention policy — consider daily cleanup of entries older than 90 days
     conn.execute("""
         CREATE TABLE IF NOT EXISTS audit_log (
             id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -191,6 +213,110 @@ def _create_tables(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_audit_session
         ON audit_log(session_id)
     """)
+
+    # -- Episodic records (F4: long-term structured memory) --
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS episodic_records (
+            record_id       TEXT PRIMARY KEY,
+            session_id      TEXT NOT NULL,
+            task_id         TEXT NOT NULL DEFAULT '',
+            user_id         TEXT NOT NULL DEFAULT 'default',
+            user_request    TEXT NOT NULL,
+            task_status     TEXT NOT NULL,
+            plan_summary    TEXT NOT NULL DEFAULT '',
+            step_count      INTEGER NOT NULL DEFAULT 0,
+            success_count   INTEGER NOT NULL DEFAULT 0,
+            file_paths      TEXT NOT NULL DEFAULT '[]',
+            error_patterns  TEXT NOT NULL DEFAULT '[]',
+            defined_symbols TEXT NOT NULL DEFAULT '[]',
+            step_outcomes   TEXT,
+            linked_records  TEXT NOT NULL DEFAULT '[]',
+            relevance_score REAL NOT NULL DEFAULT 1.0,
+            access_count    INTEGER NOT NULL DEFAULT 0,
+            last_accessed   TEXT,
+            memory_chunk_id TEXT,
+            created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+        )
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_episodic_session
+        ON episodic_records(session_id)
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_episodic_created
+        ON episodic_records(created_at DESC)
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_episodic_status
+        ON episodic_records(task_status)
+    """)
+
+    # -- Episodic file index (F4: normalised file-path-to-record mapping) --
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS episodic_file_index (
+            file_path   TEXT NOT NULL,
+            record_id   TEXT NOT NULL REFERENCES episodic_records(record_id) ON DELETE CASCADE,
+            action      TEXT NOT NULL DEFAULT 'modified',
+            PRIMARY KEY (file_path, record_id)
+        )
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_episodic_file_path
+        ON episodic_file_index(file_path)
+    """)
+
+    # -- Episodic facts (F4: short keyword-rich extracted facts) --
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS episodic_facts (
+            fact_id     TEXT PRIMARY KEY,
+            record_id   TEXT NOT NULL REFERENCES episodic_records(record_id) ON DELETE CASCADE,
+            fact_type   TEXT NOT NULL,
+            content     TEXT NOT NULL,
+            file_path   TEXT,
+            created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+        )
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_fact_record
+        ON episodic_facts(record_id)
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_fact_file_path
+        ON episodic_facts(file_path)
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_fact_type
+        ON episodic_facts(fact_type)
+    """)
+
+
+def _migrate_tables(conn: sqlite3.Connection) -> None:
+    """Add columns introduced after initial schema (idempotent)."""
+    cols = {
+        row[1]
+        for row in conn.execute("PRAGMA table_info(conversation_turns)").fetchall()
+    }
+    if "auto_approved" not in cols:
+        conn.execute(
+            "ALTER TABLE conversation_turns ADD COLUMN auto_approved INTEGER NOT NULL DEFAULT 0"
+        )
+    if "elapsed_s" not in cols:
+        conn.execute(
+            "ALTER TABLE conversation_turns ADD COLUMN elapsed_s REAL"
+        )
+    if "step_outcomes" not in cols:
+        conn.execute(
+            "ALTER TABLE conversation_turns ADD COLUMN step_outcomes TEXT"
+        )
+
+    # F2: task_in_progress on sessions
+    session_cols = {
+        row[1] for row in conn.execute("PRAGMA table_info(sessions)").fetchall()
+    }
+    if "task_in_progress" not in session_cols:
+        conn.execute(
+            "ALTER TABLE sessions ADD COLUMN task_in_progress INTEGER NOT NULL DEFAULT 0"
+        )
 
 
 def _create_fts_index(conn: sqlite3.Connection) -> None:
@@ -215,3 +341,11 @@ def _try_create_vec_table(conn: sqlite3.Connection) -> None:
     except sqlite3.OperationalError:
         # sqlite-vec extension not loaded — skip vector table
         pass
+
+
+def _create_episodic_fts_index(conn: sqlite3.Connection) -> None:
+    """Create FTS5 index on episodic_facts for keyword search."""
+    conn.execute("""
+        CREATE VIRTUAL TABLE IF NOT EXISTS episodic_facts_fts
+        USING fts5(content, fact_type, content=episodic_facts, content_rowid=rowid)
+    """)

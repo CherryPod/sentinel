@@ -180,7 +180,7 @@ class ConversationAnalyzer:
         scores: dict[str, float] = {}
         warnings: list[str] = []
 
-        # Run all 6 rules
+        # Run all 8 rules
         s, w = self._check_retry_after_block(session, current_request)
         if s > 0:
             scores["retry_after_block"] = s
@@ -263,7 +263,7 @@ class ConversationAnalyzer:
         """Detect rephrased retries of previously blocked requests.
 
         Score: 3.0 per similar blocked request, max 5.0
-        Trigger: SequenceMatcher ratio > 0.6 against any blocked turn in session
+        Trigger: SequenceMatcher ratio > 0.45 against any blocked turn in session
         """
         score = 0.0
         warnings: list[str] = []
@@ -361,7 +361,7 @@ class ConversationAnalyzer:
     ) -> tuple[float, list[str]]:
         """Detect first mention of sensitive topics after N benign turns.
 
-        Score: 2.0 if after 2+ benign turns, 3.0 if after 4+ benign turns
+        Score: 2.0 if after 1+ benign turns, 3.0 if after 4+ benign turns
         """
         # Check if current request contains sensitive topics
         current_lower = current_request.lower()

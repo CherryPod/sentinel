@@ -1,3 +1,4 @@
+import time
 from unittest.mock import AsyncMock, patch, MagicMock
 
 import httpx
@@ -55,6 +56,9 @@ class TestOllamaWorkerGenerate:
             assert "<UNTRUSTED_DATA>" in payload["system"]
             assert payload["model"] == "qwen3:14b"
             assert payload["stream"] is False
+            # Sampling options must be present
+            assert "options" in payload
+            assert payload["options"]["num_predict"] == 8192
 
     @pytest.mark.asyncio
     async def test_custom_system_prompt(self, worker):
@@ -194,3 +198,194 @@ class TestOllamaWorkerGenerate:
             payload = mock_client.post.call_args.kwargs["json"]
             assert "@#!" in payload["system"]
             assert "^" not in payload["system"]  # old static marker not present
+
+    @pytest.mark.asyncio
+    async def test_options_in_payload(self, worker):
+        """All 5 sampling params must be present in the request payload."""
+        mock_resp = _mock_response(200, {"response": "ok"})
+        with patch("sentinel.worker.ollama.httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.post.return_value = mock_resp
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=False)
+            mock_client_cls.return_value = mock_client
+
+            await worker.generate("test")
+            payload = mock_client.post.call_args.kwargs["json"]
+            opts = payload["options"]
+            assert opts["temperature"] == 0.6
+            assert opts["top_p"] == 0.95
+            assert opts["top_k"] == 20
+            assert opts["repeat_penalty"] == 1.1
+            assert opts["num_predict"] == 8192
+
+    @pytest.mark.asyncio
+    async def test_last_generate_stats_populated(self, worker):
+        """_last_generate_stats should be populated after a successful generate."""
+        mock_resp = _mock_response(200, {
+            "response": "Hello",
+            "eval_count": 42,
+            "prompt_eval_count": 100,
+            "eval_duration": 500_000_000,
+            "total_duration": 1_000_000_000,
+        })
+        with patch("sentinel.worker.ollama.httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.post.return_value = mock_resp
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=False)
+            mock_client_cls.return_value = mock_client
+
+            assert worker._last_generate_stats is None
+            await worker.generate("test")
+            stats = worker._last_generate_stats
+            assert stats is not None
+            assert stats["eval_count"] == 42
+            assert stats["prompt_eval_count"] == 100
+            assert stats["eval_duration"] == 500_000_000
+            assert stats["total_duration"] == 1_000_000_000
+
+    @pytest.mark.asyncio
+    async def test_last_generate_stats_none_fields(self, worker):
+        """Token stats should handle missing fields gracefully (None values)."""
+        mock_resp = _mock_response(200, {"response": "ok"})
+        with patch("sentinel.worker.ollama.httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.post.return_value = mock_resp
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=False)
+            mock_client_cls.return_value = mock_client
+
+            await worker.generate("test")
+            stats = worker._last_generate_stats
+            assert stats is not None
+            # All fields should be None when response doesn't include them
+            assert stats["eval_count"] is None
+            assert stats["prompt_eval_count"] is None
+
+
+# ── V-005: Retry exhaustion regression guards ────────────────────
+
+
+class TestRetryExhaustion:
+    """Regression guard: V-005 — full retry exhaustion produces correct exceptions.
+
+    The existing retry tests verify call_count and exception type. These tests
+    additionally verify:
+    - Exception message content after all retries are exhausted
+    - Exception chaining (original httpx error preserved via `from exc`)
+    - HTTP status error (500) retry path (not covered by existing tests)
+    - Absence of backoff delay between retries (current implementation has none)
+    """
+
+    @pytest.mark.asyncio
+    async def test_connection_error_exhaustion_message(self, worker):
+        """Regression guard: connection exhaustion message includes the base URL."""
+        with patch("sentinel.worker.ollama.httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.post.side_effect = httpx.ConnectError("Connection refused")
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=False)
+            mock_client_cls.return_value = mock_client
+
+            with pytest.raises(OllamaConnectionError) as exc_info:
+                await worker.generate("test")
+
+            # Regression guard: message must include the server URL for diagnostics
+            assert "http://test-ollama:11434" in str(exc_info.value)
+            # Original httpx error preserved in the chain
+            assert exc_info.value.__cause__ is not None
+            assert isinstance(exc_info.value.__cause__, httpx.ConnectError)
+
+    @pytest.mark.asyncio
+    async def test_timeout_error_exhaustion_message(self, worker):
+        """Regression guard: timeout exhaustion message includes the timeout duration."""
+        with patch("sentinel.worker.ollama.httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.post.side_effect = httpx.ReadTimeout("Timeout")
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=False)
+            mock_client_cls.return_value = mock_client
+
+            with pytest.raises(OllamaTimeoutError) as exc_info:
+                await worker.generate("test")
+
+            # Regression guard: message must include timeout duration for diagnostics
+            assert "30s" in str(exc_info.value)
+            # Original httpx error preserved in the chain
+            assert exc_info.value.__cause__ is not None
+            assert isinstance(exc_info.value.__cause__, httpx.TimeoutException)
+
+    @pytest.mark.asyncio
+    async def test_http_500_error_retries_and_exhausts(self, worker):
+        """Regression guard: HTTP 500 errors are retried and exhaust correctly.
+
+        This error path was not covered by existing retry tests — only
+        ConnectError and TimeoutException were tested.
+        """
+        mock_resp = _mock_response(500)
+        with patch("sentinel.worker.ollama.httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.post.return_value = mock_resp
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=False)
+            mock_client_cls.return_value = mock_client
+
+            with pytest.raises(OllamaConnectionError) as exc_info:
+                await worker.generate("test")
+
+            # Regression guard: should retry then exhaust
+            assert mock_client.post.call_count == 2
+            assert "500" in str(exc_info.value)
+            # Original HTTPStatusError preserved
+            assert exc_info.value.__cause__ is not None
+            assert isinstance(exc_info.value.__cause__, httpx.HTTPStatusError)
+
+    @pytest.mark.asyncio
+    async def test_model_not_found_is_not_retried(self, worker):
+        """Regression guard: 404 (model not found) raises immediately without retry."""
+        mock_resp = _mock_response(404)
+        with patch("sentinel.worker.ollama.httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.post.return_value = mock_resp
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=False)
+            mock_client_cls.return_value = mock_client
+
+            with pytest.raises(OllamaModelNotFound):
+                await worker.generate("test")
+
+            # Regression guard: 404 must NOT be retried — exactly 1 call
+            assert mock_client.post.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_no_backoff_delay_between_retries(self, worker):
+        """Regression guard: retries happen immediately with no backoff delay.
+
+        FINDING: The current implementation has NO sleep/delay between retries.
+        This test documents that behavior. If backoff is added later, this test
+        will catch the change and should be updated to verify the new delay.
+        """
+        call_times: list[float] = []
+
+        async def timed_post(*args, **kwargs):
+            call_times.append(time.monotonic())
+            raise httpx.ConnectError("Connection refused")
+
+        with patch("sentinel.worker.ollama.httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.post.side_effect = timed_post
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=False)
+            mock_client_cls.return_value = mock_client
+
+            with pytest.raises(OllamaConnectionError):
+                await worker.generate("test")
+
+        # Regression guard: both attempts happened, with negligible delay between them
+        assert len(call_times) == 2
+        interval = call_times[1] - call_times[0]
+        # No backoff = effectively instant retry. Allow 100ms for test overhead.
+        assert interval < 0.1, (
+            f"Expected near-instant retry (no backoff), got {interval:.3f}s delay"
+        )

@@ -1,7 +1,7 @@
 """Phase 5 hardening regression tests.
 
 Verifies all security gap fixes from red team testing:
-- Gap 1: CodeShield runs on ALL Qwen output (not just expects_code)
+- Gap 1: Semgrep runs on ALL Qwen output (not just expects_code)
 - Gap 2: CommandPatternScanner detects dangerous commands in prose
 - Gap 3: Planner prompt contains explicit security constraints
 - Gap 4: ToolExecutor is wired — tool_call steps execute, not skip
@@ -43,14 +43,14 @@ def _make_plan(steps: list[dict], summary: str = "Test plan") -> Plan:
     )
 
 
-# ── Gap 1: CodeShield on all output ──────────────────────────────
+# ── Gap 1: Semgrep on all output ─────────────────────────────────
 
 
-class TestGap1CodeShieldOnAllOutput:
-    """CodeShield must scan ALL Qwen output, regardless of expects_code."""
+class TestGap1SemgrepOnAllOutput:
+    """Semgrep must scan ALL Qwen output, regardless of expects_code."""
 
     @pytest.mark.asyncio
-    async def test_codeshield_catches_code_in_non_code_step(self):
+    async def test_semgrep_catches_code_in_non_code_step(self):
         """Non-expects_code step producing malicious code must be caught."""
         mock_planner = MagicMock(spec=ClaudePlanner)
         mock_pipeline = MagicMock(spec=ScanPipeline)
@@ -75,28 +75,28 @@ class TestGap1CodeShieldOnAllOutput:
         )
         mock_pipeline.process_with_qwen = AsyncMock(return_value=tagged)
 
-        with patch("sentinel.planner.orchestrator.codeshield") as mock_cs:
-            mock_cs.is_loaded.return_value = True
-            mock_cs.scan_blocks = AsyncMock(return_value=ScanResult(
+        with patch("sentinel.planner.orchestrator.semgrep_scanner") as mock_sg:
+            mock_sg.is_loaded.return_value = True
+            mock_sg.scan_blocks = AsyncMock(return_value=ScanResult(
                 found=True,
                 matches=[ScanMatch(
-                    pattern_name="codeshield_insecure",
+                    pattern_name="semgrep_insecure",
                     matched_text="destructive command",
                     position=0,
                 )],
-                scanner_name="codeshield",
+                scanner_name="semgrep",
             ))
 
             orch = Orchestrator(planner=mock_planner, pipeline=mock_pipeline)
             result = await orch.handle_task("Summarise the document")
 
             assert result.status == "blocked"
-            assert "CodeShield" in result.step_results[0].error
-            mock_cs.scan_blocks.assert_called_once()
+            assert "Semgrep" in result.step_results[0].error
+            mock_sg.scan_blocks.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_red_team_5_4_surveillance_script_blocked(self):
-        """Red team test 5.4: surveillance script must be blocked by CodeShield."""
+        """Red team test 5.4: surveillance script must be blocked by Semgrep."""
         surveillance_script = (
             "#!/bin/bash\n"
             "nohup bash -c 'while true; do\n"
@@ -129,23 +129,23 @@ class TestGap1CodeShieldOnAllOutput:
         )
         mock_pipeline.process_with_qwen = AsyncMock(return_value=tagged)
 
-        with patch("sentinel.planner.orchestrator.codeshield") as mock_cs:
-            mock_cs.is_loaded.return_value = True
-            mock_cs.scan_blocks = AsyncMock(return_value=ScanResult(
+        with patch("sentinel.planner.orchestrator.semgrep_scanner") as mock_sg:
+            mock_sg.is_loaded.return_value = True
+            mock_sg.scan_blocks = AsyncMock(return_value=ScanResult(
                 found=True,
                 matches=[ScanMatch(
-                    pattern_name="codeshield_insecure",
+                    pattern_name="semgrep_insecure",
                     matched_text="data exfiltration",
                     position=0,
                 )],
-                scanner_name="codeshield",
+                scanner_name="semgrep",
             ))
 
             orch = Orchestrator(planner=mock_planner, pipeline=mock_pipeline)
             result = await orch.handle_task("Set up monitoring")
 
             assert result.status == "blocked"
-            mock_cs.scan_blocks.assert_called_once()
+            mock_sg.scan_blocks.assert_called_once()
 
 
 # ── Gap 2: CommandPatternScanner ─────────────────────────────────
@@ -209,7 +209,7 @@ class TestGap3PlannerHardening:
         from sentinel.planner.planner import _PLANNER_SYSTEM_PROMPT_TEMPLATE
         prompt = _PLANNER_SYSTEM_PROMPT_TEMPLATE.lower()
         assert "expects_code" in prompt
-        assert "shell scripts" in prompt
+        assert "scripts" in prompt
 
     def test_workspace_boundary_enforced(self):
         from sentinel.planner.planner import _PLANNER_SYSTEM_PROMPT_TEMPLATE
@@ -230,7 +230,7 @@ class TestGap3PlannerHardening:
     def test_exfiltration_prohibited(self):
         from sentinel.planner.planner import _PLANNER_SYSTEM_PROMPT_TEMPLATE
         prompt = _PLANNER_SYSTEM_PROMPT_TEMPLATE.lower()
-        assert "exfiltrate" in prompt
+        assert "exfiltration" in prompt
 
     def test_worker_output_marked_untrusted(self):
         from sentinel.planner.planner import _PLANNER_SYSTEM_PROMPT_TEMPLATE

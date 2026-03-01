@@ -268,6 +268,57 @@ class TestUpdateRunState:
         assert fetched.next_run_at is None
 
 
+# ── V-004: SQL injection boundary tests ──────────────────────────
+
+
+_EVIL_INPUTS = [
+    "'; DROP TABLE routines; --",
+    "' OR '1'='1",
+    "'; DELETE FROM routine_executions; --",
+    "\x00null_byte\x00",
+    "a" * 100_000,
+    "SELECT * FROM routines",
+    "Robert'); DROP TABLE students;--",
+    "1; ATTACH DATABASE '/tmp/evil.db' AS evil; --",
+]
+
+
+class TestRoutineStoreSQLInjection:
+    """Regression guard: V-004 — user-provided strings stored as literals, never executed."""
+
+    @pytest.mark.parametrize("evil_input", _EVIL_INPUTS, ids=[
+        "drop_table", "or_1_1", "delete_executions", "null_bytes",
+        "very_long_string", "select_star", "bobby_tables", "attach_db",
+    ])
+    def test_evil_name(self, store, evil_input):
+        """Evil strings as routine name survive roundtrip."""
+        r = store.create(
+            name=evil_input,
+            trigger_type="cron",
+            trigger_config={"cron": "0 9 * * *"},
+            action_config={"prompt": "test"},
+        )
+        fetched = store.get(r.routine_id)
+        assert fetched is not None
+        assert fetched.name == evil_input
+
+    @pytest.mark.parametrize("evil_input", _EVIL_INPUTS, ids=[
+        "drop_table", "or_1_1", "delete_executions", "null_bytes",
+        "very_long_string", "select_star", "bobby_tables", "attach_db",
+    ])
+    def test_evil_prompt(self, store, evil_input):
+        """Evil strings as action prompt survive roundtrip."""
+        r = store.create(
+            name="Safe name",
+            trigger_type="cron",
+            trigger_config={"cron": "0 9 * * *"},
+            action_config={"prompt": evil_input},
+        )
+        fetched = store.get(r.routine_id)
+        assert fetched is not None
+        assert fetched.action_config["prompt"] == evil_input
+
+
 # ── In-memory mode ────────────────────────────────────────────────
 
 

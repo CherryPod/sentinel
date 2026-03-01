@@ -1,0 +1,18 @@
+rules:
+- id: assert-code-exec
+  patterns:
+      - pattern: assert($X)
+      - pattern-not: assert(true)
+      - pattern-not: assert(false)
+      - pattern-not: assert('...')
+  message: >-
+    assert() with a non-literal expression can execute arbitrary code
+    in PHP versions before 8.0. Use proper validation instead.
+  metadata:
+    cwe:
+    - 'CWE-94: Improper Control of Generation of Code (Code Injection)'
+    cwe_id: CWE-94
+    prescan_regex: assert\(
+  severity: WARNING
+  languages:
+  - php

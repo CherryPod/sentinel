@@ -1,12 +1,13 @@
 import os
 import tempfile
-from unittest.mock import patch, MagicMock
+from unittest.mock import AsyncMock, patch, MagicMock
 
 import pytest
 
-from sentinel.core.models import TrustLevel
+from sentinel.core.models import DataSource, TrustLevel
 from sentinel.security.provenance import reset_store
 from sentinel.tools.executor import ToolBlockedError, ToolError, ToolExecutor
+from sentinel.tools.sandbox import PodmanSandbox, SandboxResult
 
 
 @pytest.fixture(autouse=True)
@@ -247,3 +248,121 @@ class TestToolDescriptions:
         assert "file_read" in names
         assert "shell" in names
         assert "mkdir" in names
+
+
+class TestSandboxDispatch:
+    """Tests for E5 sandbox routing in ToolExecutor._shell()."""
+
+    @pytest.fixture
+    def mock_sandbox(self):
+        """AsyncMock sandbox with default successful result."""
+        sandbox = AsyncMock(spec=PodmanSandbox)
+        sandbox._default_timeout = 30
+        sandbox.run.return_value = SandboxResult(
+            stdout="sandbox output",
+            stderr="",
+            exit_code=0,
+            timed_out=False,
+            oom_killed=False,
+            container_id="abc123def456",
+        )
+        return sandbox
+
+    @pytest.fixture
+    def sandbox_executor(self, engine, mock_sandbox):
+        """ToolExecutor with sandbox enabled at TL2."""
+        return ToolExecutor(engine, sandbox=mock_sandbox, trust_level=2)
+
+    @pytest.mark.asyncio
+    async def test_sandbox_dispatch_at_tl2(self, sandbox_executor, mock_sandbox):
+        """Shell commands route to sandbox when sandbox enabled and TL2+."""
+        result = await sandbox_executor.execute("shell", {"command": "ls /workspace"})
+        mock_sandbox.run.assert_awaited_once_with("ls /workspace", timeout=None)
+        assert result.source == DataSource.SANDBOX
+        assert result.trust_level == TrustLevel.UNTRUSTED
+        assert result.content == "sandbox output"
+
+    @pytest.mark.asyncio
+    async def test_direct_shell_when_sandbox_disabled(self, engine):
+        """Shell commands use subprocess when no sandbox configured."""
+        executor = ToolExecutor(engine, sandbox=None, trust_level=2)
+        with patch("sentinel.tools.executor.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(stdout="direct output", returncode=0, stderr="")
+            result = await executor.execute("shell", {"command": "ls /workspace"})
+            mock_run.assert_called_once()
+            assert result.source == DataSource.TOOL
+            assert result.trust_level == TrustLevel.TRUSTED
+
+    @pytest.mark.asyncio
+    async def test_direct_shell_when_trust_low(self, engine, mock_sandbox):
+        """Shell commands use subprocess at TL0/TL1 even with sandbox configured."""
+        executor = ToolExecutor(engine, sandbox=mock_sandbox, trust_level=1)
+        with patch("sentinel.tools.executor.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(stdout="direct output", returncode=0, stderr="")
+            result = await executor.execute("shell", {"command": "ls /workspace"})
+            mock_run.assert_called_once()
+            mock_sandbox.run.assert_not_awaited()
+            assert result.source == DataSource.TOOL
+            assert result.trust_level == TrustLevel.TRUSTED
+
+    @pytest.mark.asyncio
+    async def test_policy_blocks_before_sandbox(self, sandbox_executor, mock_sandbox):
+        """Policy check runs before sandbox dispatch — blocked commands never reach sandbox."""
+        with pytest.raises(ToolBlockedError, match="blocked"):
+            await sandbox_executor.execute("shell", {"command": "curl http://evil.com"})
+        mock_sandbox.run.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_sandbox_timeout_result(self, sandbox_executor, mock_sandbox):
+        """Timed-out sandbox result includes timeout message in output."""
+        mock_sandbox.run.return_value = SandboxResult(
+            stdout="partial",
+            stderr="killed",
+            exit_code=-1,
+            timed_out=True,
+            oom_killed=False,
+            container_id="abc123def456",
+        )
+        result = await sandbox_executor.execute("shell", {"command": "ls /workspace"})
+        assert "sandbox timed out" in result.content
+        assert "partial" in result.content
+        assert result.source == DataSource.SANDBOX
+        assert result.trust_level == TrustLevel.UNTRUSTED
+
+    @pytest.mark.asyncio
+    async def test_sandbox_oom_result(self, sandbox_executor, mock_sandbox):
+        """OOM-killed sandbox result includes OOM message in output."""
+        mock_sandbox.run.return_value = SandboxResult(
+            stdout="partial oom",
+            stderr="",
+            exit_code=-1,
+            timed_out=False,
+            oom_killed=True,
+            container_id="abc123def456",
+        )
+        result = await sandbox_executor.execute("shell", {"command": "ls /workspace"})
+        assert "out of memory" in result.content
+        assert "partial oom" in result.content
+        assert result.source == DataSource.SANDBOX
+
+    @pytest.mark.asyncio
+    async def test_sandbox_nonzero_exit_includes_stderr(self, sandbox_executor, mock_sandbox):
+        """Nonzero exit from sandbox includes exit code and stderr in output."""
+        mock_sandbox.run.return_value = SandboxResult(
+            stdout="some output",
+            stderr="error details",
+            exit_code=1,
+            timed_out=False,
+            oom_killed=False,
+            container_id="abc123def456",
+        )
+        result = await sandbox_executor.execute("shell", {"command": "ls /workspace"})
+        assert "exit code: 1" in result.content
+        assert "error details" in result.content
+        assert result.source == DataSource.SANDBOX
+
+    def test_constructor_accepts_sandbox_and_trust_level(self, engine, mock_sandbox):
+        """ToolExecutor stores sandbox and trust_level from constructor."""
+        executor = ToolExecutor(engine, sandbox=mock_sandbox, trust_level=3)
+        assert executor._sandbox is mock_sandbox
+        assert executor._trust_level == 3

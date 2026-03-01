@@ -1,0 +1,16 @@
+rules:
+- id: dynamic-require
+  patterns:
+      - pattern: require($X)
+      - pattern-not: require("...")
+  message: >-
+    Dynamic require() with a non-literal argument can load arbitrary
+    modules. Use static imports or validate the module path.
+  metadata:
+    cwe:
+    - 'CWE-94: Improper Control of Generation of Code (Code Injection)'
+    cwe_id: CWE-94
+    prescan_regex: require\(
+  severity: WARNING
+  languages:
+  - javascript

@@ -1,0 +1,14 @@
+rules:
+- id: insecure-random
+  pattern: new Random(...)
+  message: >-
+    java.util.Random is not cryptographically secure. For security-sensitive
+    contexts, use java.security.SecureRandom instead.
+  metadata:
+    cwe:
+    - 'CWE-338: Use of Cryptographically Weak Pseudo-Random Number Generator (PRNG)'
+    cwe_id: CWE-338
+    prescan_regex: new Random
+  severity: WARNING
+  languages:
+  - java

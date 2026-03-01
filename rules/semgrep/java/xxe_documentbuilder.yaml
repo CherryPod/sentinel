@@ -1,0 +1,25 @@
+rules:
+- id: xxe-documentbuilder
+  patterns:
+      - pattern: |
+          $FACTORY = DocumentBuilderFactory.newInstance();
+          ...
+          $BUILDER = $FACTORY.newDocumentBuilder();
+      - pattern-not: |
+          $FACTORY = DocumentBuilderFactory.newInstance();
+          ...
+          $FACTORY.setFeature("...", ...);
+          ...
+          $BUILDER = $FACTORY.newDocumentBuilder();
+  message: >-
+    DocumentBuilderFactory used without disabling external entities.
+    Set setFeature(XMLConstants.FEATURE_SECURE_PROCESSING, true) and
+    disable external DTDs/entities to prevent XXE attacks.
+  metadata:
+    cwe:
+    - 'CWE-611: Improper Restriction of XML External Entity Reference'
+    cwe_id: CWE-611
+    prescan_regex: DocumentBuilderFactory
+  severity: WARNING
+  languages:
+  - java

@@ -1,0 +1,14 @@
+rules:
+- id: unsafe-xmldecoder
+  pattern: new XMLDecoder(...)
+  message: >-
+    XMLDecoder can deserialize arbitrary objects and execute code.
+    Do not use XMLDecoder with untrusted input.
+  metadata:
+    cwe:
+    - 'CWE-502: Deserialization of Untrusted Data'
+    cwe_id: CWE-502
+    prescan_regex: XMLDecoder
+  severity: WARNING
+  languages:
+  - java

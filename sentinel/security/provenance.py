@@ -7,6 +7,7 @@ Module-level functions delegate to a default store for backward compatibility
 
 import json
 import sqlite3
+import threading
 import uuid
 from datetime import datetime, timezone
 
@@ -58,7 +59,12 @@ class ProvenanceStore:
         if parent_ids:
             for pid in parent_ids:
                 parent = self.get_tagged_data(pid)
-                if parent and parent.trust_level == TrustLevel.UNTRUSTED:
+                if parent is None:
+                    # C-001: Parent evicted (in-memory mode) — can't verify
+                    # trust chain, default to UNTRUSTED (safe CaMeL default).
+                    effective_trust = TrustLevel.UNTRUSTED
+                    break
+                if parent.trust_level == TrustLevel.UNTRUSTED:
                     effective_trust = TrustLevel.UNTRUSTED
                     break
 
@@ -97,11 +103,35 @@ class ProvenanceStore:
             return self._get_tagged_data_sql(data_id)
         return self._store.get(data_id)
 
+    def update_content(self, data_id: str, content: str) -> bool:
+        """Update the content of an existing provenance entry.
+
+        Used by the orchestrator to persist post-processing (tag stripping,
+        emoji removal, fence closure) so downstream consumers reading from
+        the store get the cleaned content, not the raw worker output.
+
+        Returns True if the entry was found and updated.
+        """
+        if self._db is not None:
+            cursor = self._db.execute(
+                "UPDATE provenance SET content = ? WHERE data_id = ?",
+                (content, data_id),
+            )
+            self._db.commit()
+            return cursor.rowcount > 0
+        item = self._store.get(data_id)
+        if item is not None:
+            item.content = content
+            return True
+        return False
+
     def get_provenance_chain(self, data_id: str, max_depth: int = 50) -> list[TaggedData]:
         """Walk the provenance chain back to the roots.
 
         Returns a list ordered from the given item back to its oldest ancestor.
         Includes cycle detection via a visited set.
+        C-002: max_depth=50 caps recursive CTE depth. In practice chains are
+        ≤10 deep; 50 is a safety bound against pathological fan-out.
         """
         if self._db is not None:
             return self._get_provenance_chain_sql(data_id, max_depth)
@@ -213,12 +243,14 @@ class ProvenanceStore:
 # ── Module-level default store + wrapper functions ─────────────
 
 _default_store = ProvenanceStore(db=None)
+_store_lock = threading.Lock()  # C-004: protect default store swap
 
 
 def set_default_store(store: ProvenanceStore) -> None:
     """Switch the default provenance store (called at app startup with SQLite store)."""
     global _default_store
-    _default_store = store
+    with _store_lock:
+        _default_store = store
 
 
 def reset_store() -> None:
@@ -256,3 +288,7 @@ def record_file_write(path: str, data_id: str) -> None:
 
 def get_file_writer(path: str) -> str | None:
     return _default_store.get_file_writer(path)
+
+
+def update_content(data_id: str, content: str) -> bool:
+    return _default_store.update_content(data_id, content)

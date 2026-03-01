@@ -20,6 +20,9 @@ build/
 .venv/
 venv/
 
+# Signal-cli registration data (keys, account DB — bind-mounted into container)
+data/
+
 # Ollama data (pulled into container volume)
 ollama-data/
 
@@ -28,18 +31,12 @@ logs/
 
 # Claude Code
 .claude/
-CLAUDE.md
 
-# Project memory (private working notes)
-memory/
+# Serena
+.serena/
 
-# Benchmark data (regenerable)
-benchmarks/*.jsonl
-benchmarks/*.log
-
-# Script artifacts
-scripts/results/
-scripts/__pycache__/
+# Git worktrees
+.worktrees/
 
 # IDE
 .vscode/

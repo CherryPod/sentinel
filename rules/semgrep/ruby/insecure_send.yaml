@@ -1,0 +1,16 @@
+rules:
+- id: insecure-send
+  patterns:
+      - pattern: $OBJ.send($X, ...)
+      - pattern-not: $OBJ.send("...", ...)
+  message: >-
+    Object.send() with non-literal method name can invoke arbitrary
+    methods. Validate the method name against a whitelist.
+  metadata:
+    cwe:
+    - 'CWE-94: Improper Control of Generation of Code (Code Injection)'
+    cwe_id: CWE-94
+    prescan_regex: \.send\(
+  severity: WARNING
+  languages:
+  - ruby

@@ -138,3 +138,57 @@ class TestProvenanceStoreSQLite:
         retrieved = s2.get_tagged_data(t.id)
         assert retrieved is not None
         assert retrieved.content == "persistent"
+
+
+class TestUpdateContentSQLite:
+    """Tests for update_content with SQLite backend."""
+
+    def test_updates_content_in_db(self, store):
+        t = store.create_tagged_data(
+            "<RESPONSE>\ndef foo(): pass\n</RESPONSE>",
+            DataSource.QWEN, TrustLevel.UNTRUSTED,
+        )
+        assert store.update_content(t.id, "def foo(): pass")
+        retrieved = store.get_tagged_data(t.id)
+        assert retrieved.content == "def foo(): pass"
+
+    def test_returns_false_for_missing_id(self, store):
+        assert not store.update_content("nonexistent-id", "content")
+
+    def test_preserves_metadata(self, store):
+        t = store.create_tagged_data(
+            "raw", DataSource.QWEN, TrustLevel.UNTRUSTED,
+            originated_from="qwen_pipeline",
+        )
+        store.update_content(t.id, "cleaned")
+        retrieved = store.get_tagged_data(t.id)
+        assert retrieved.trust_level == TrustLevel.UNTRUSTED
+        assert retrieved.source == DataSource.QWEN
+        assert retrieved.originated_from == "qwen_pipeline"
+
+    def test_persists_across_store_instances(self, db):
+        """Updated content persists when re-reading from DB."""
+        s1 = ProvenanceStore(db=db)
+        t = s1.create_tagged_data(
+            "<RESPONSE>code</RESPONSE>",
+            DataSource.QWEN, TrustLevel.UNTRUSTED,
+        )
+        s1.update_content(t.id, "code")
+
+        s2 = ProvenanceStore(db=db)
+        retrieved = s2.get_tagged_data(t.id)
+        assert retrieved.content == "code"
+
+    def test_downstream_chain_trust_unaffected(self, store):
+        """Updating content doesn't change trust inheritance."""
+        parent = store.create_tagged_data(
+            "<RESPONSE>evil</RESPONSE>",
+            DataSource.QWEN, TrustLevel.UNTRUSTED,
+        )
+        store.update_content(parent.id, "evil")
+        child = store.create_tagged_data(
+            "derived", DataSource.TOOL, TrustLevel.TRUSTED,
+            parent_ids=[parent.id],
+        )
+        assert child.trust_level == TrustLevel.UNTRUSTED
+        assert not store.is_trust_safe_for_execution(child.id)

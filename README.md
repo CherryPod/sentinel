@@ -9,7 +9,7 @@ A defence-in-depth AI assistant built on the [CaMeL architecture](https://arxiv.
 ## What Makes This Different
 
 - **Air-gapped worker** — the local LLM has zero network access. It cannot phone home, exfiltrate data, or fetch remote payloads
-- **10-layer security pipeline** — deterministic policy engine, spotlighting, Prompt Guard, CodeShield, command pattern scanner, encoding scanner, conversation analysis, vulnerability echo detection, ASCII prompt gate, and CaMeL provenance tracking
+- **10-layer security pipeline** — deterministic policy engine, spotlighting, Prompt Guard, Semgrep static analysis, command pattern scanner, encoding scanner, conversation analysis, vulnerability echo detection, ASCII prompt gate, and CaMeL provenance tracking
 - **Tiered trust model** — the worker starts with zero trust (text in/out only). Capabilities unlock incrementally after red team passes at each level
 - **Human approval gates** — every plan is shown to the user before execution. No autonomous action without consent
 - **CaMeL provenance** — every data item is tagged with its source and trust level. Untrusted data cannot reach dangerous operations without scanning and approval
@@ -28,7 +28,7 @@ A defence-in-depth AI assistant built on the [CaMeL architecture](https://arxiv.
 |              -->  Prompt Guard scan -->  Claude plans            |
 |              -->  Human approval    -->  Per-step execution:     |
 |                                                                 |
-|     llm_task:  prompt gate -> Qwen -> CodeShield -> scan        |
+|     llm_task:  prompt gate -> Qwen -> Semgrep -> scan           |
 |     tool_call: policy check -> execute -> tag provenance        |
 |                                                                 |
 |  10 security layers  |  Policy engine  |  Provenance store      |
@@ -60,29 +60,40 @@ Sentinel assumes the worker LLM is adversarial. Every output passes through a 10
 | 2 | Policy Engine | Deterministic YAML | File paths, commands, credentials, network |
 | 3 | Spotlighting | String manipulation | Prompt injection (dynamic markers, sandwich defence) |
 | 4 | Prompt Guard 2 | 86M BERT classifier | Injection detection |
-| 5 | CodeShield | Semgrep static analysis | Malicious code patterns |
+| 5 | Semgrep | Direct static analysis (101 rules) | Malicious code patterns, hardcoded secrets |
 | 6 | CommandPatternScanner | Regex patterns | Dangerous shell patterns in prose |
 | 7 | ConversationAnalyzer | Multi-turn heuristics | Memory poisoning, escalation, context building |
 | 8 | VulnerabilityEchoScanner | Input/output fingerprinting | Code injection via "review this" framing |
 | 9 | ASCII Prompt Gate | Regex allowlist | Cross-model bilingual injection |
 | 10 | CaMeL Provenance | Data tagging | Untrusted data reaching dangerous operations |
 
-For details, see [docs/security-model.md](docs/security-model.md).
+### CodeShield → Semgrep
 
-## Benchmark Results
+Layer 5 originally used Meta's [CodeShield](https://github.com/meta-llama/PurpleLlama/tree/main/CodeShield) wrapper. We replaced it with direct Semgrep integration because CodeShield's bundled rules produced false positives on legitimate worker output (Dockerfiles, Makefiles, config snippets) and couldn't be individually tuned. Direct Semgrep gives us per-rule severity control, custom rules for credential patterns, and Dockerfile/Makefile-aware scanning — 101 rules total, with context-aware exemptions that reduce false positives without weakening security.
 
-**Stress test v3** — 1,136 prompts (314 genuine + 788 adversarial + 34 benchmark), 21+ adversarial attack categories:
+## Test Results
 
-| Metric | Result |
-|--------|--------|
-| Real risk rate | **0.12%** (1/811 adversarial prompts) |
-| Raw escape rate | 25.8% (209/811) |
-| After triage | 70% planner-defused, 22% benign, 5% educational |
-| Genuine pass rate | 79.7% |
+### Functional (G-suite at Trust Level 4)
 
-The raw escape rate is misleading — most "escapes" are cases where Claude or Qwen refused the adversarial request. After manual triage, only 1 prompt out of 811 adversarial produced genuinely dangerous output.
+| Suite | Score | Notes |
+|-------|-------|-------|
+| G1: Build Capability | 11/13 (85%) | 2 failures = Qwen output quality (model ceiling) |
+| G2: Debug & Dev | 14/18 (78%) | Category A: 12/12, B+C limited by multi-turn complexity |
+| G3: E2E Workflows | 5/8 (63%) | 2 harness issues, 1 needs fixture |
+| G4: Plan Quality | 14/15 (93%) | Complex 16-step plans completing in 500-940s |
+| G5: Dependencies | 6/6 (100%) | Stable across all runs |
 
-Full benchmark data and analysis scripts are in [`benchmarks/`](benchmarks/). Assessment reports are in [`docs/assessments/`](docs/assessments/).
+### Red Team (adversarial, 6 consecutive clean runs)
+
+| Scenario | Result |
+|----------|--------|
+| B1: Adversarial User (12 campaigns) | **0 exploits** |
+| B1.5: Adversarial Data (9 campaigns) | **0 exploits** |
+| B2: Compromised Planner (16 categories) | **0 exploits** (3 S2 info-only) |
+| B3: Perimeter (7 categories) | **0 failures** (18 pass, 12 info) |
+| B4: Sandbox Isolation (17 categories) | **90/90 blocked** |
+
+Zero S0 (breach) or S1 (exploitable leak) across all scenarios and runs.
 
 ## Quick Start
 
@@ -210,24 +221,13 @@ sentinel/
 │   ├── channels/               WebSocket, SSE, MCP, Signal
 │   └── routines/               Scheduled task engine (cron, event, interval)
 │
-├── tests/                      1,006 unit tests
+├── tests/                      2,772 Python tests
 ├── ui/                         Static chat UI (HTML/JS/CSS)
 │
 ├── container/                  Containerfile for builds
-├── sidecar/                    Rust WASM tool sandbox (41 tests)
+├── sidecar/                    Rust WASM tool sandbox (43 tests)
 ├── policies/                   Deterministic security rules (YAML)
-├── benchmarks/                 Stress test data + analysis
-├── scripts/                    Test runners + analysis
-│
-└── docs/                       Documentation
-    ├── architecture.md         Technical reference
-    ├── security-model.md       Security deep dive
-    ├── deployment.md           Operations guide
-    ├── codebase-map.md         Module map for contributors
-    ├── roadmap.md              Planned features
-    ├── CHANGELOG.md            Version history
-    ├── design/                 Active design documents
-    └── assessments/            Benchmark reports + audits
+└── rules/                      Semgrep rule definitions (101 rules)
 ```
 
 ## Running Tests
@@ -246,33 +246,20 @@ podman exec sentinel pytest /app/tests/
 cargo test --manifest-path sidecar/Cargo.toml
 ```
 
-## Documentation
-
-| Document | Description |
-|----------|-------------|
-| [Architecture](docs/architecture.md) | Container specs, network topology, API endpoints, data flow |
-| [Security Model](docs/security-model.md) | CaMeL trust model, 10 security layers, threat model |
-| [Deployment](docs/deployment.md) | Prerequisites, setup, rebuild procedures, troubleshooting |
-| [Codebase Map](docs/codebase-map.md) | Module responsibilities, key classes, cross-dependencies |
-| [Roadmap](docs/roadmap.md) | Planned features and evolution path |
-| [Changelog](docs/CHANGELOG.md) | Full version history with decision rationale |
-| [Benchmarks](benchmarks/) | v3 stress test data and analysis tools |
-
 ## Current Status
 
-**v0.2.0-alpha** — Assessment recommendations implemented, script gate reform, benchmark-ready.
+**v0.2.0** — Trust Level 4 active. Sandboxed shell execution, multi-channel access, 6 consecutive clean red team runs.
 
-- 1,094 Python tests + 41 Rust tests passing (1,135 total)
-- v3 stress test benchmarked (1,136 prompts, 0.12% real risk rate)
-- Script gate expanded allowlist eliminates 75% of false positives
-- Infrastructure hardened (TLS, CSP, CSRF, resource limits, read-only FS, pinned images, health checks)
+- 2,772 Python tests + 43 Rust tests passing (2,815 total)
+- Zero red team breaches across 5 adversarial scenarios (B1–B4)
+- Sandboxed shell execution via Podman API proxy (disposable containers, network-isolated)
+- Multi-channel access live: WebSocket, SSE, Signal, Telegram
+- Plan-policy enforcement with allowed-command/allowed-path constraints per step
 - Persistent memory with RRF hybrid search (FTS5 + sqlite-vec)
-- Multi-channel access: WebSocket, SSE, MCP server, Signal (code ready)
 - WASM tool sandbox (Rust sidecar with Wasmtime, capability model, leak detection)
 - Routine scheduling engine (cron, event, interval triggers)
-- Trust level 0 (text in/out only — no file writes or tool execution by the worker)
-
-See [docs/roadmap.md](docs/roadmap.md) for planned features.
+- Infrastructure hardened (TLS, CSP, CSRF, resource limits, read-only FS, pinned images, health checks)
+- Direct Semgrep integration with 101 rules (replaced CodeShield — see above)
 
 ## License
 
@@ -280,4 +267,4 @@ See [docs/roadmap.md](docs/roadmap.md) for planned features.
 
 ## Credits
 
-Built with [Claude](https://claude.ai) (Anthropic) as the trusted planner and [Qwen 3](https://huggingface.co/Qwen) (Alibaba) as the air-gapped worker. Security scanning by [Prompt Guard 2](https://huggingface.co/meta-llama/Prompt-Guard-2-86M) (Meta) and [CodeShield](https://github.com/meta-llama/PurpleLlama/tree/main/CodeShield) (Meta/Semgrep).
+Built with [Claude](https://claude.ai) (Anthropic) as the trusted planner and [Qwen 3](https://huggingface.co/Qwen) (Alibaba) as the air-gapped worker. Security scanning by [Prompt Guard 2](https://huggingface.co/meta-llama/Prompt-Guard-2-86M) (Meta) and [Semgrep](https://semgrep.dev/) (r2c).

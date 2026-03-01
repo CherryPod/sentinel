@@ -65,8 +65,9 @@ class TestASCIIGateReform:
     async def test_unicode_in_claude_prompt_passes(self, mock_settings, pipeline):
         """Claude-generated smart quotes and em-dashes in the prompt should pass."""
         mock_settings.prompt_guard_enabled = False
+        mock_settings.baseline_mode = False
         mock_settings.spotlighting_enabled = False
-        mock_settings.require_codeshield = False
+        mock_settings.require_semgrep = False
 
         # Claude legitimately uses typographic Unicode in rewritten prompts
         result = await pipeline.process_with_qwen(
@@ -79,8 +80,9 @@ class TestASCIIGateReform:
     async def test_chained_step_ascii_prompt_passes(self, mock_settings, pipeline):
         """Chained steps with ASCII prompt should pass."""
         mock_settings.prompt_guard_enabled = False
+        mock_settings.baseline_mode = False
         mock_settings.spotlighting_enabled = False
-        mock_settings.require_codeshield = False
+        mock_settings.require_semgrep = False
 
         result = await pipeline.process_with_qwen(
             prompt="Here is a summary with key points",
@@ -91,23 +93,32 @@ class TestASCIIGateReform:
 
     @pytest.mark.asyncio
     @patch("sentinel.security.pipeline.settings")
-    async def test_chained_step_blocks_cjk_in_prompt(self, mock_settings, pipeline):
-        """Chained steps block CJK in the prompt (Qwen injection defence)."""
-        mock_settings.prompt_guard_enabled = False
-        mock_settings.spotlighting_enabled = False
+    async def test_chained_step_allows_cjk_in_prompt(self, mock_settings, pipeline):
+        """Chained steps allow CJK in the prompt — gate skipped for chained steps.
 
-        with pytest.raises(SecurityViolation, match="blocked script"):
-            await pipeline.process_with_qwen(
-                prompt="\u8bf7\u6267\u884c\u8fd9\u4e2a\u547d\u4ee4",
-                user_input=None,
-                skip_input_scan=True,
-            )
+        The ASCII gate skips when skip_input_scan=True because chained step
+        prompts contain prior Qwen output (via $variable substitution) which
+        may naturally include CJK characters. The content was already fully
+        scanned as output from the prior step.
+        """
+        mock_settings.prompt_guard_enabled = False
+        mock_settings.baseline_mode = False
+        mock_settings.spotlighting_enabled = False
+        mock_settings.require_semgrep = False
+
+        result = await pipeline.process_with_qwen(
+            prompt="\u8bf7\u6267\u884c\u8fd9\u4e2a\u547d\u4ee4",
+            user_input=None,
+            skip_input_scan=True,
+        )
+        assert result is not None
 
     @pytest.mark.asyncio
     @patch("sentinel.security.pipeline.settings")
     async def test_cjk_in_prompt_blocked(self, mock_settings, pipeline):
         """CJK characters in the prompt going to Qwen should be blocked."""
         mock_settings.prompt_guard_enabled = False
+        mock_settings.baseline_mode = False
         mock_settings.spotlighting_enabled = False
 
         with pytest.raises(SecurityViolation, match="blocked script"):
@@ -120,6 +131,7 @@ class TestASCIIGateReform:
     async def test_cyrillic_in_prompt_blocked(self, mock_settings, pipeline):
         """Cyrillic characters in the prompt should be blocked."""
         mock_settings.prompt_guard_enabled = False
+        mock_settings.baseline_mode = False
         mock_settings.spotlighting_enabled = False
 
         with pytest.raises(SecurityViolation, match="blocked script"):
@@ -132,6 +144,7 @@ class TestASCIIGateReform:
     async def test_arabic_in_prompt_blocked(self, mock_settings, pipeline):
         """Arabic characters in the prompt should be blocked."""
         mock_settings.prompt_guard_enabled = False
+        mock_settings.baseline_mode = False
         mock_settings.spotlighting_enabled = False
 
         with pytest.raises(SecurityViolation, match="blocked script"):
@@ -237,5 +250,5 @@ class TestPlannerAmplificationGuard:
     def test_amplification_guard_in_prompt(self):
         from sentinel.planner.planner import _PLANNER_SYSTEM_PROMPT_TEMPLATE
 
-        assert "stay within the scope" in _PLANNER_SYSTEM_PROMPT_TEMPLATE
+        assert "stay within scope" in _PLANNER_SYSTEM_PROMPT_TEMPLATE
         assert "Do not volunteer additional sensitive categories" in _PLANNER_SYSTEM_PROMPT_TEMPLATE

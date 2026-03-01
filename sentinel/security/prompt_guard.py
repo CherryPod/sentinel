@@ -53,21 +53,31 @@ def scan(text: str, threshold: float = 0.9) -> ScanResult:
     malicious.
     """
     if _pipeline is None:
-        logger.debug(
-            "Prompt Guard not loaded, skipping scan",
+        logger.warning(
+            "Prompt Guard not loaded — scan skipped (degraded mode)",
             extra={"event": "prompt_guard_skipped", "text_length": len(text)},
         )
         return ScanResult(
             found=False,
             matches=[],
             scanner_name="prompt_guard",
+            degraded=True,
         )
 
     chunks = _segment_text(text, max_chars=2000)
     all_matches: list[ScanMatch] = []
 
     for i, chunk in enumerate(chunks):
-        results = _pipeline(chunk)
+        # F-006: Per-chunk exception handling — a single bad chunk shouldn't
+        # abort the entire scan.
+        try:
+            results = _pipeline(chunk)
+        except Exception:
+            logger.warning(
+                "Prompt Guard inference failed on chunk %d", i,
+                extra={"event": "prompt_guard_chunk_error", "chunk_index": i},
+            )
+            continue
         if not results:
             continue
 
@@ -110,7 +120,11 @@ def _segment_text(text: str, max_chars: int = 2000) -> list[str]:
     if len(text) <= max_chars:
         return [text]
 
+    # F-005: Overlap chunks by 200 chars so injections straddling a boundary
+    # are captured in at least one complete chunk.
+    overlap = 200
+    stride = max_chars - overlap
     chunks = []
-    for i in range(0, len(text), max_chars):
+    for i in range(0, len(text), stride):
         chunks.append(text[i : i + max_chars])
     return chunks

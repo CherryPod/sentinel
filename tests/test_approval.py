@@ -170,13 +170,13 @@ class TestApprovalManager:
 
 class TestApprovalWithOrchestrator:
     @pytest.fixture(autouse=True)
-    def _disable_codeshield_requirement(self):
-        """CodeShield isn't loaded in unit tests; disable fail-closed."""
+    def _disable_semgrep_requirement(self):
+        """Semgrep isn't loaded in unit tests; disable fail-closed."""
         from sentinel.core.config import settings
-        original = settings.require_codeshield
-        settings.require_codeshield = False
+        original = settings.require_semgrep
+        settings.require_semgrep = False
         yield
-        settings.require_codeshield = original
+        settings.require_semgrep = original
 
     @pytest.mark.asyncio
     async def test_full_approval_flow(self, db):

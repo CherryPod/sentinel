@@ -1,0 +1,16 @@
+rules:
+- id: command-injection-exec
+  patterns:
+      - pattern: exec.Command($X, ...)
+      - pattern-not: exec.Command("...", ...)
+  message: >-
+    exec.Command with non-literal command argument. Ensure the command
+    is not user-controlled to prevent command injection.
+  metadata:
+    cwe:
+    - 'CWE-78: Improper Neutralization of Special Elements used in an OS Command (OS Command Injection)'
+    cwe_id: CWE-78
+    prescan_regex: exec\.Command\(
+  severity: WARNING
+  languages:
+  - go

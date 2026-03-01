@@ -1,0 +1,17 @@
+rules:
+- id: insecure-importlib-import
+  patterns:
+      - pattern: importlib.import_module($X)
+      - pattern-not: importlib.import_module("...")
+  message: >-
+    Dynamic module import via importlib.import_module() with a non-literal
+    argument. This could allow importing arbitrary modules if the argument
+    is user-controlled.
+  metadata:
+    cwe:
+    - 'CWE-94: Improper Control of Generation of Code (Code Injection)'
+    cwe_id: CWE-94
+    prescan_regex: importlib\.import_module
+  severity: WARNING
+  languages:
+  - python

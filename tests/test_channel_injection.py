@@ -39,41 +39,26 @@ def _get_tool(mcp, name):
     return mcp._tool_manager._tools[name].fn
 
 
-class FakeProcess:
-    """Mock asyncio subprocess for Signal channel tests."""
+class FakeSocketReader:
+    """Mock asyncio.StreamReader backed by an asyncio.Queue."""
 
-    def __init__(self, *, returncode=None):
-        self.pid = 99999
-        self.returncode = returncode
-        self.stdin = MagicMock()
-        self.stdin.write = MagicMock()
-        self.stdin.drain = AsyncMock()
-        self.stdout = MagicMock()
-        self._stdout_lines: asyncio.Queue = asyncio.Queue()
-        self.stderr = MagicMock()
+    def __init__(self):
+        self._lines: asyncio.Queue = asyncio.Queue()
 
-    def push_stdout(self, data):
-        """Push a line for stdout.readline() to return."""
+    def push_line(self, data):
+        """Push a line for readline() to return."""
         if isinstance(data, dict):
             data = json.dumps(data).encode() + b"\n"
         elif isinstance(data, str):
             data = data.encode() + b"\n"
-        self._stdout_lines.put_nowait(data)
+        self._lines.put_nowait(data)
 
     def push_eof(self):
-        self._stdout_lines.put_nowait(b"")
+        """Signal EOF (empty bytes)."""
+        self._lines.put_nowait(b"")
 
-    async def _readline(self):
-        return await self._stdout_lines.get()
-
-    def terminate(self):
-        self.returncode = -15
-
-    def kill(self):
-        self.returncode = -9
-
-    async def wait(self):
-        return self.returncode
+    async def readline(self):
+        return await self._lines.get()
 
 
 # ── Group 1: MCP approval_mode enforcement ───────────────────────
@@ -194,9 +179,8 @@ class TestSignalChannelInjection:
         """Messages from Signal have source='signal' for audit trail."""
         cfg = SignalConfig()
         channel = SignalChannel(cfg)
-        proc = FakeProcess()
-        proc.stdout.readline = proc._readline
-        channel._process = proc
+        reader = FakeSocketReader()
+        channel._reader = reader
         channel._running = True
 
         notification = {
@@ -210,8 +194,8 @@ class TestSignalChannelInjection:
                 },
             },
         }
-        proc.push_stdout(notification)
-        proc.push_eof()
+        reader.push_line(notification)
+        reader.push_eof()
 
         await channel._read_loop()
 
@@ -223,9 +207,8 @@ class TestSignalChannelInjection:
         """Message containing JSON-RPC method injection is treated as plain text."""
         cfg = SignalConfig()
         channel = SignalChannel(cfg)
-        proc = FakeProcess()
-        proc.stdout.readline = proc._readline
-        channel._process = proc
+        reader = FakeSocketReader()
+        channel._reader = reader
         channel._running = True
 
         # An attacker sends a message whose content looks like a JSON-RPC command
@@ -241,8 +224,8 @@ class TestSignalChannelInjection:
                 },
             },
         }
-        proc.push_stdout(notification)
-        proc.push_eof()
+        reader.push_line(notification)
+        reader.push_eof()
 
         await channel._read_loop()
 
@@ -252,16 +235,15 @@ class TestSignalChannelInjection:
         assert msg.source == "signal"
 
     async def test_signal_malformed_json_does_not_crash(self):
-        """Malformed JSON on stdout is logged and skipped, not raised."""
+        """Malformed JSON on socket is logged and skipped, not raised."""
         cfg = SignalConfig()
         channel = SignalChannel(cfg)
-        proc = FakeProcess()
-        proc.stdout.readline = proc._readline
-        channel._process = proc
+        reader = FakeSocketReader()
+        channel._reader = reader
         channel._running = True
 
-        proc.push_stdout("this is not valid json {{{{")
-        proc.push_eof()
+        reader.push_line("this is not valid json {{{{")
+        reader.push_eof()
 
         # Must not raise
         await channel._read_loop()
@@ -271,9 +253,8 @@ class TestSignalChannelInjection:
         """A notification with missing envelope fields doesn't crash or queue garbage."""
         cfg = SignalConfig()
         channel = SignalChannel(cfg)
-        proc = FakeProcess()
-        proc.stdout.readline = proc._readline
-        channel._process = proc
+        reader = FakeSocketReader()
+        channel._reader = reader
         channel._running = True
 
         # Notification with missing dataMessage entirely
@@ -288,8 +269,8 @@ class TestSignalChannelInjection:
                 },
             },
         }
-        proc.push_stdout(notification)
-        proc.push_eof()
+        reader.push_line(notification)
+        reader.push_eof()
 
         await channel._read_loop()
 

@@ -455,10 +455,11 @@ class TestToolExecutorWasmDispatch:
                 os.unlink(f.name)
 
     @pytest.mark.asyncio
-    async def test_sidecar_failure_raises_tool_error(self):
-        """SidecarResponse failure should raise ToolError."""
+    async def test_sidecar_failure_falls_back_then_python_error_surfaces(self):
+        """Sidecar failure falls back to Python handler; Python error surfaces."""
         from sentinel.tools.executor import ToolExecutor, ToolError
         from sentinel.security.policy_engine import PolicyEngine
+        from sentinel.core.models import PolicyResult as PR
 
         mock_sidecar = AsyncMock(spec=SidecarClient)
         mock_sidecar.execute = AsyncMock(return_value=SidecarResponse(
@@ -466,11 +467,17 @@ class TestToolExecutorWasmDispatch:
             result="capability denied: ReadFile",
         ))
 
-        engine = PolicyEngine.__new__(PolicyEngine)
+        engine = MagicMock(spec=PolicyEngine)
+        mock_result = MagicMock()
+        mock_result.status = PR.ALLOWED
+        engine.check_file_read.return_value = mock_result
+
         executor = ToolExecutor(engine, sidecar=mock_sidecar)
 
-        with pytest.raises(ToolError, match="sidecar.*capability denied"):
-            await executor.execute("file_read", {"path": "/workspace/test.txt"})
+        # file_read on nonexistent file — sidecar fails, falls back to Python,
+        # Python handler raises ToolError from OSError
+        with pytest.raises(ToolError, match="file_read failed"):
+            await executor.execute("file_read", {"path": "/workspace/nonexistent_file_12345.txt"})
 
     @pytest.mark.asyncio
     async def test_sidecar_leak_logged(self):
@@ -493,6 +500,114 @@ class TestToolExecutorWasmDispatch:
         result = await executor.execute("file_read", {"path": "/workspace/secrets.txt"})
         # Should succeed — leak was already redacted by sidecar
         assert result.content
+
+    @pytest.mark.asyncio
+    async def test_sidecar_infra_failure_falls_back_to_python(self):
+        """When sidecar raises ToolError (infrastructure), Python handler runs."""
+        from sentinel.tools.executor import ToolExecutor, ToolError
+        from sentinel.security.policy_engine import PolicyEngine
+        from sentinel.core.models import PolicyResult as PR
+
+        mock_sidecar = AsyncMock(spec=SidecarClient)
+        mock_sidecar.execute = AsyncMock(return_value=SidecarResponse(
+            success=False,
+            result="execution failed: failed to instantiate WASM module",
+        ))
+
+        engine = MagicMock(spec=PolicyEngine)
+        mock_result = MagicMock()
+        mock_result.status = PR.ALLOWED
+        engine.check_file_read.return_value = mock_result
+
+        executor = ToolExecutor(engine, sidecar=mock_sidecar)
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+            f.write("fallback content")
+            f.flush()
+            try:
+                result = await executor.execute("file_read", {"path": f.name})
+                # Should succeed via Python handler fallback
+                assert "fallback content" in result.content
+            finally:
+                os.unlink(f.name)
+
+        # Sidecar was attempted first
+        mock_sidecar.execute.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_sidecar_security_block_does_not_fall_back(self):
+        """ToolBlockedError from sidecar must propagate — no fallback bypass."""
+        from sentinel.tools.executor import ToolExecutor, ToolBlockedError
+        from sentinel.security.policy_engine import PolicyEngine
+
+        mock_sidecar = AsyncMock(spec=SidecarClient)
+        mock_sidecar.execute = AsyncMock(return_value=SidecarResponse(
+            success=True,
+            result="ok",
+            data={"content": "[REDACTED:aws_access_key]"},
+            leaked=True,
+        ))
+
+        engine = PolicyEngine.__new__(PolicyEngine)
+        executor = ToolExecutor(engine, sidecar=mock_sidecar)
+
+        # The _execute_via_sidecar path detects leak and raises ToolBlockedError
+        # via the redaction path — but actually it doesn't raise ToolBlockedError,
+        # it redacts. Let's test with a direct ToolBlockedError from sidecar.
+        # Override _execute_via_sidecar to raise ToolBlockedError directly.
+        async def raise_blocked(*a, **kw):
+            raise ToolBlockedError("Semgrep pre-write scan blocked: 1 issue(s)")
+
+        executor._execute_via_sidecar = raise_blocked
+
+        with pytest.raises(ToolBlockedError, match="Semgrep pre-write scan blocked"):
+            await executor.execute("file_write", {"path": "/workspace/test.py", "content": "evil"})
+
+    @pytest.mark.asyncio
+    async def test_sidecar_success_no_fallback(self):
+        """When sidecar succeeds, Python handler is NOT invoked."""
+        from sentinel.tools.executor import ToolExecutor
+        from sentinel.security.policy_engine import PolicyEngine
+
+        mock_sidecar = AsyncMock(spec=SidecarClient)
+        mock_sidecar.execute = AsyncMock(return_value=SidecarResponse(
+            success=True,
+            result="ok",
+            data={"content": "sidecar result"},
+        ))
+
+        engine = PolicyEngine.__new__(PolicyEngine)
+        executor = ToolExecutor(engine, sidecar=mock_sidecar)
+
+        result = await executor.execute("file_read", {"path": "/workspace/test.txt"})
+
+        mock_sidecar.execute.assert_called_once()
+        # Content should be from sidecar, not Python handler
+        assert "sidecar result" in result.content
+
+    @pytest.mark.asyncio
+    async def test_shell_exec_alias_resolves(self):
+        """shell_exec tool name resolves to the same handler as shell."""
+        from sentinel.tools.executor import ToolExecutor
+        from sentinel.security.policy_engine import PolicyEngine
+        from sentinel.core.models import PolicyResult as PR
+
+        engine = MagicMock(spec=PolicyEngine)
+        mock_result = MagicMock()
+        mock_result.status = PR.ALLOWED
+        engine.check_command.return_value = mock_result
+
+        # No sidecar — goes straight to handler dict
+        executor = ToolExecutor(engine, sidecar=None)
+
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(
+                stdout="hello\n", stderr="", returncode=0
+            )
+            result = await executor.execute("shell_exec", {"command": "echo hello"})
+
+        assert "hello" in result.content
+        mock_run.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_wasm_tool_set_is_correct(self):

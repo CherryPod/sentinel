@@ -92,13 +92,13 @@ class TestExecutionContext:
 
 class TestHandleTask:
     @pytest.fixture(autouse=True)
-    def _disable_codeshield_requirement(self):
-        """CodeShield isn't loaded in unit tests; disable fail-closed for non-CS tests."""
+    def _disable_semgrep_requirement(self):
+        """Semgrep isn't loaded in unit tests; disable fail-closed for non-Semgrep tests."""
         from sentinel.core.config import settings
-        original = settings.require_codeshield
-        settings.require_codeshield = False
+        original = settings.require_semgrep
+        settings.require_semgrep = False
         yield
-        settings.require_codeshield = original
+        settings.require_semgrep = original
 
     @pytest.mark.asyncio
     async def test_full_llm_task_flow(self, mock_planner, mock_pipeline):
@@ -391,6 +391,86 @@ class TestHandleTask:
         assert len(result.step_results) == 1  # step 2 never ran
 
     @pytest.mark.asyncio
+    async def test_nonzero_exit_code_fails_step(self, mock_planner, mock_pipeline):
+        """Tool returning non-zero exit code results in status='failed' and halts the plan."""
+        plan = _make_plan([
+            {
+                "id": "step_1",
+                "type": "tool_call",
+                "description": "Run a command",
+                "tool": "shell",
+                "args": {"command": "cat /etc/shadow"},
+            },
+            {
+                "id": "step_2",
+                "type": "llm_task",
+                "description": "Never reached",
+                "prompt": "Should not run",
+            },
+        ])
+        mock_planner.create_plan.return_value = plan
+
+        tagged = create_tagged_data(
+            content="cat: /etc/shadow: Permission denied\n[exit code: 1]",
+            source=DataSource.TOOL,
+            trust_level=TrustLevel.TRUSTED,
+        )
+        mock_executor = MagicMock()
+        mock_executor.get_tool_descriptions.return_value = [
+            {"name": "shell", "description": "Run a shell command"},
+        ]
+        mock_executor.execute = AsyncMock(return_value=tagged)
+        mock_executor._last_exec_meta = {"exit_code": 1, "stderr": "Permission denied"}
+
+        orch = Orchestrator(
+            planner=mock_planner,
+            pipeline=mock_pipeline,
+            tool_executor=mock_executor,
+        )
+        result = await orch.handle_task("Read shadow file")
+
+        assert result.status == "failed"
+        assert len(result.step_results) == 1  # step 2 never ran
+        assert result.step_results[0].status == "failed"
+        assert "exited with code" in result.step_results[0].error.lower()
+
+    @pytest.mark.asyncio
+    async def test_zero_exit_code_succeeds(self, mock_planner, mock_pipeline):
+        """Tool returning exit code 0 results in status='success'."""
+        plan = _make_plan([
+            {
+                "id": "step_1",
+                "type": "tool_call",
+                "description": "Run a command",
+                "tool": "shell",
+                "args": {"command": "echo hello"},
+            },
+        ])
+        mock_planner.create_plan.return_value = plan
+
+        tagged = create_tagged_data(
+            content="hello",
+            source=DataSource.TOOL,
+            trust_level=TrustLevel.TRUSTED,
+        )
+        mock_executor = MagicMock()
+        mock_executor.get_tool_descriptions.return_value = [
+            {"name": "shell", "description": "Run a shell command"},
+        ]
+        mock_executor.execute = AsyncMock(return_value=tagged)
+        mock_executor._last_exec_meta = {"exit_code": 0, "stderr": ""}
+
+        orch = Orchestrator(
+            planner=mock_planner,
+            pipeline=mock_pipeline,
+            tool_executor=mock_executor,
+        )
+        result = await orch.handle_task("Echo hello")
+
+        assert result.status == "success"
+        assert result.step_results[0].status == "success"
+
+    @pytest.mark.asyncio
     async def test_approval_mode_full(self, mock_planner, mock_pipeline):
         """In full approval mode, task returns awaiting_approval."""
         plan = _make_plan([
@@ -417,8 +497,8 @@ class TestHandleTask:
         assert result.approval_id == "approval-123"
 
     @pytest.mark.asyncio
-    async def test_codeshield_runs_without_expects_code(self, mock_planner, mock_pipeline):
-        """CodeShield should scan ALL Qwen output, not just expects_code=True steps."""
+    async def test_semgrep_runs_without_expects_code(self, mock_planner, mock_pipeline):
+        """Semgrep should scan ALL Qwen output, not just expects_code=True steps."""
         plan = _make_plan([
             {
                 "id": "step_1",
@@ -437,28 +517,28 @@ class TestHandleTask:
         )
         mock_pipeline.process_with_qwen.return_value = tagged
 
-        with patch("sentinel.planner.orchestrator.codeshield") as mock_cs:
-            mock_cs.is_loaded.return_value = True
-            mock_cs.scan_blocks = AsyncMock(return_value=ScanResult(
+        with patch("sentinel.planner.orchestrator.semgrep_scanner") as mock_sg:
+            mock_sg.is_loaded.return_value = True
+            mock_sg.scan_blocks = AsyncMock(return_value=ScanResult(
                 found=True,
                 matches=[ScanMatch(
-                    pattern_name="codeshield_insecure",
+                    pattern_name="semgrep_insecure",
                     matched_text="dangerous code",
                     position=0,
                 )],
-                scanner_name="codeshield",
+                scanner_name="semgrep",
             ))
 
             orch = Orchestrator(planner=mock_planner, pipeline=mock_pipeline)
             result = await orch.handle_task("Describe a recipe")
 
             assert result.status == "blocked"
-            assert "CodeShield" in result.step_results[0].error
-            mock_cs.scan_blocks.assert_called_once()
+            assert "Semgrep" in result.step_results[0].error
+            mock_sg.scan_blocks.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_codeshield_runs_with_expects_code(self, mock_planner, mock_pipeline):
-        """CodeShield should still run when expects_code=True (regression)."""
+    async def test_semgrep_runs_with_expects_code(self, mock_planner, mock_pipeline):
+        """Semgrep should still run when expects_code=True (regression)."""
         plan = _make_plan([
             {
                 "id": "step_1",
@@ -477,23 +557,23 @@ class TestHandleTask:
         )
         mock_pipeline.process_with_qwen.return_value = tagged
 
-        with patch("sentinel.planner.orchestrator.codeshield") as mock_cs:
-            mock_cs.is_loaded.return_value = True
-            mock_cs.scan_blocks = AsyncMock(return_value=ScanResult(
+        with patch("sentinel.planner.orchestrator.semgrep_scanner") as mock_sg:
+            mock_sg.is_loaded.return_value = True
+            mock_sg.scan_blocks = AsyncMock(return_value=ScanResult(
                 found=True,
                 matches=[ScanMatch(
-                    pattern_name="codeshield_insecure",
+                    pattern_name="semgrep_insecure",
                     matched_text="dangerous code",
                     position=0,
                 )],
-                scanner_name="codeshield",
+                scanner_name="semgrep",
             ))
 
             orch = Orchestrator(planner=mock_planner, pipeline=mock_pipeline)
             result = await orch.handle_task("Write a script")
 
             assert result.status == "blocked"
-            mock_cs.scan_blocks.assert_called_once()
+            mock_sg.scan_blocks.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_plan_summary_in_result(self, mock_planner, mock_pipeline):
@@ -547,13 +627,13 @@ class TestTrustGate:
     """Provenance trust gate: block tool execution when args contain untrusted data."""
 
     @pytest.fixture(autouse=True)
-    def _disable_codeshield_requirement(self):
-        """CodeShield isn't loaded in unit tests; disable fail-closed for non-CS tests."""
+    def _disable_semgrep_requirement(self):
+        """Semgrep isn't loaded in unit tests; disable fail-closed for non-Semgrep tests."""
         from sentinel.core.config import settings
-        original = settings.require_codeshield
-        settings.require_codeshield = False
+        original = settings.require_semgrep
+        settings.require_semgrep = False
         yield
-        settings.require_codeshield = original
+        settings.require_semgrep = original
 
     @pytest.mark.asyncio
     async def test_untrusted_var_blocks_tool_call(self, mock_planner, mock_pipeline):
@@ -729,12 +809,12 @@ class TestOutputFormat:
     """P8: Structured output format validation."""
 
     @pytest.fixture(autouse=True)
-    def _disable_codeshield_requirement(self):
+    def _disable_semgrep_requirement(self):
         from sentinel.core.config import settings
-        original = settings.require_codeshield
-        settings.require_codeshield = False
+        original = settings.require_semgrep
+        settings.require_semgrep = False
         yield
-        settings.require_codeshield = original
+        settings.require_semgrep = original
 
     @pytest.mark.asyncio
     async def test_json_format_valid(self, mock_planner, mock_pipeline):
@@ -818,8 +898,8 @@ class TestOutputFormat:
         assert result.step_results[0].content == "extracted content"
 
     @pytest.mark.asyncio
-    async def test_tagged_format_invalid(self, mock_planner, mock_pipeline):
-        """Missing <RESPONSE> tags fails when output_format='tagged'."""
+    async def test_tagged_format_fallback(self, mock_planner, mock_pipeline):
+        """Missing <RESPONSE> tags falls back to using full output."""
         plan = _make_plan([
             {
                 "id": "step_1",
@@ -841,8 +921,35 @@ class TestOutputFormat:
         orch = Orchestrator(planner=mock_planner, pipeline=mock_pipeline)
         result = await orch.handle_task("Get tagged")
 
-        assert result.status == "error"
-        assert "format violation" in result.step_results[0].error.lower()
+        assert result.status == "success"
+        assert result.step_results[0].content == "Just plain text without tags"
+
+    @pytest.mark.asyncio
+    async def test_tagged_format_strips_think_blocks(self, mock_planner, mock_pipeline):
+        """Qwen 3 <think> blocks are stripped before tag extraction."""
+        plan = _make_plan([
+            {
+                "id": "step_1",
+                "type": "llm_task",
+                "description": "Generate tagged",
+                "prompt": "Produce tagged",
+                "output_format": "tagged",
+            }
+        ])
+        mock_planner.create_plan.return_value = plan
+
+        tagged = create_tagged_data(
+            content="<think>reasoning here</think>\n<RESPONSE>clean content</RESPONSE>",
+            source=DataSource.QWEN,
+            trust_level=TrustLevel.UNTRUSTED,
+        )
+        mock_pipeline.process_with_qwen.return_value = tagged
+
+        orch = Orchestrator(planner=mock_planner, pipeline=mock_pipeline)
+        result = await orch.handle_task("Get tagged")
+
+        assert result.status == "success"
+        assert result.step_results[0].content == "clean content"
 
     @pytest.mark.asyncio
     async def test_null_format_no_validation(self, mock_planner, mock_pipeline):
@@ -869,6 +976,61 @@ class TestOutputFormat:
 
         assert result.status == "success"
         assert result.step_results[0].content == "Any freeform text here"
+
+    @pytest.mark.asyncio
+    async def test_response_tags_stripped_before_execution_unwrap(self, mock_planner, mock_pipeline):
+        """<RESPONSE> tags must be stripped BEFORE code block extraction.
+
+        When Qwen wraps output in <RESPONSE> tags without markdown fences,
+        extract_code_blocks falls back to treating the entire text (tags
+        included) as a single code block. If RESPONSE stripping happens
+        AFTER extraction, the EXECUTION destination unwrap at line 1236
+        overwrites the stripped content with the tagged code block content.
+
+        Regression test for: t2_fastapi_app, t2_makefile_c_project, s6_debug_buggy
+        """
+        # Two-step plan: llm_task produces code → tool_call consumes it.
+        # This makes the llm_task's output_var an EXECUTION destination.
+        plan = _make_plan([
+            {
+                "id": "step_1",
+                "type": "llm_task",
+                "description": "Generate Python code",
+                "prompt": "Write a Python script",
+                "output_var": "$code",
+                "output_format": "tagged",
+            },
+            {
+                "id": "step_2",
+                "type": "tool_call",
+                "description": "Write code to file",
+                "tool": "file_write",
+                "args": {"path": "/workspace/app.py", "content": "$code"},
+                "input_vars": ["$code"],
+            },
+        ])
+        mock_planner.create_plan.return_value = plan
+
+        # Simulate Qwen returning <RESPONSE>-wrapped code WITHOUT markdown fences.
+        # This is the exact pattern that causes the bug: no ``` fences means
+        # extract_code_blocks falls back to a single block containing the full
+        # text including <RESPONSE> tags.
+        tagged = create_tagged_data(
+            content="<RESPONSE>\nimport requests\n\nr = requests.get('https://example.com')\nprint(r.status_code)\n</RESPONSE>",
+            source=DataSource.QWEN,
+            trust_level=TrustLevel.UNTRUSTED,
+        )
+        mock_pipeline.process_with_qwen.return_value = tagged
+
+        orch = Orchestrator(planner=mock_planner, pipeline=mock_pipeline)
+        result = await orch.handle_task("Write a fetch script")
+
+        # The llm_task step (step_1) must have clean content — no <RESPONSE> tags
+        step_1_result = result.step_results[0]
+        assert step_1_result.status == "success"
+        assert "<RESPONSE>" not in step_1_result.content
+        assert "</RESPONSE>" not in step_1_result.content
+        assert step_1_result.content.startswith("import requests")
 
 
 class TestChainSafeResolution:
@@ -939,12 +1101,12 @@ class TestChainSafeResolution:
         assert result.count(_CHAIN_REMINDER) == 1
 
     @pytest.fixture(autouse=True)
-    def _disable_codeshield_requirement(self):
+    def _disable_semgrep_requirement(self):
         from sentinel.core.config import settings
-        original = settings.require_codeshield
-        settings.require_codeshield = False
+        original = settings.require_semgrep
+        settings.require_semgrep = False
         yield
-        settings.require_codeshield = original
+        settings.require_semgrep = original
 
     @pytest.mark.asyncio
     async def test_chain_marker_passed_to_pipeline(self, mock_planner, mock_pipeline):
@@ -997,12 +1159,12 @@ class TestUserInputPassedForEchoScanner:
     """Part 3: Orchestrator passes raw user_request to pipeline for echo comparison."""
 
     @pytest.fixture(autouse=True)
-    def _disable_codeshield_requirement(self):
+    def _disable_semgrep_requirement(self):
         from sentinel.core.config import settings
-        original = settings.require_codeshield
-        settings.require_codeshield = False
+        original = settings.require_semgrep
+        settings.require_semgrep = False
         yield
-        settings.require_codeshield = original
+        settings.require_semgrep = original
 
     @pytest.mark.asyncio
     async def test_user_input_passed_to_pipeline(self, mock_planner, mock_pipeline):
@@ -1035,12 +1197,12 @@ class TestConversationHistoryToPlanner:
     """Part 2 Layer 2: Orchestrator builds and passes conversation history to planner."""
 
     @pytest.fixture(autouse=True)
-    def _disable_codeshield_requirement(self):
+    def _disable_semgrep_requirement(self):
         from sentinel.core.config import settings
-        original = settings.require_codeshield
-        settings.require_codeshield = False
+        original = settings.require_semgrep
+        settings.require_semgrep = False
         yield
-        settings.require_codeshield = original
+        settings.require_semgrep = original
 
     @pytest.mark.asyncio
     async def test_history_passed_on_second_turn(self, mock_planner, mock_pipeline):
@@ -1142,3 +1304,279 @@ class TestConversationHistoryToPlanner:
         assert session is not None
         assert len(session.turns) == 1
         assert session.turns[0].plan_summary == "Generate a greeting"
+
+
+class TestToolOutputScanning:
+    """Tests for output scanning on tool_call results (Fix W-Output)."""
+
+    @pytest.fixture(autouse=True)
+    def _disable_semgrep_requirement(self):
+        from sentinel.core.config import settings
+        original = settings.require_semgrep
+        settings.require_semgrep = False
+        yield
+        settings.require_semgrep = original
+
+    def _make_executor(self, tagged):
+        """Create a mock ToolExecutor that returns the given tagged data."""
+        executor = MagicMock()
+        executor.get_tool_descriptions.return_value = [
+            {"name": "shell_exec", "description": "Run a shell command"},
+            {"name": "file_read", "description": "Read a file"},
+        ]
+        executor.execute = AsyncMock(return_value=tagged)
+        executor._last_exec_meta = {"exit_code": 0, "stderr": ""}
+        return executor
+
+    def _dirty_scan(self, scanner_name, pattern_name, matched_text="bad"):
+        """Build a PipelineScanResult with one violation."""
+        result = PipelineScanResult()
+        result.results[scanner_name] = ScanResult(
+            found=True,
+            matches=[ScanMatch(pattern_name=pattern_name, matched_text=matched_text)],
+            scanner_name=scanner_name,
+        )
+        return result
+
+    @pytest.mark.asyncio
+    async def test_tool_output_credential_blocked(self, mock_planner, mock_pipeline):
+        """AWS key in file_read output → blocked by output scan."""
+        plan = _make_plan([{
+            "id": "step_1",
+            "type": "tool_call",
+            "description": "Read config file",
+            "tool": "file_read",
+            "args": {"path": "/workspace/config.txt"},
+        }])
+        mock_planner.create_plan.return_value = plan
+
+        tagged = create_tagged_data(
+            content="AKIAIOSFODNN7EXAMPLE",
+            source=DataSource.TOOL,
+            trust_level=TrustLevel.TRUSTED,
+        )
+        mock_pipeline.scan_output.return_value = self._dirty_scan(
+            "credential_scanner", "aws_access_key", "AKIAIOSFODNN7EXAMPLE",
+        )
+
+        orch = Orchestrator(
+            planner=mock_planner,
+            pipeline=mock_pipeline,
+            tool_executor=self._make_executor(tagged),
+        )
+        result = await orch.handle_task("Read config")
+
+        assert result.step_results[0].status == "blocked"
+        assert "credential_scanner" in result.step_results[0].error
+        assert "aws_access_key" in result.step_results[0].error
+
+    @pytest.mark.asyncio
+    async def test_tool_output_shadow_format_blocked(self, mock_planner, mock_pipeline):
+        """/etc/shadow format in shell_exec output → blocked."""
+        plan = _make_plan([{
+            "id": "step_1",
+            "type": "tool_call",
+            "description": "Run command",
+            "tool": "shell_exec",
+            "args": {"command": "cat /workspace/targets.txt | xargs cat"},
+        }])
+        mock_planner.create_plan.return_value = plan
+
+        shadow_line = "root:$6$rounds=656000$salt$hash:19000:0:99999:7:::"
+        tagged = create_tagged_data(
+            content=shadow_line,
+            source=DataSource.TOOL,
+            trust_level=TrustLevel.TRUSTED,
+        )
+        mock_pipeline.scan_output.return_value = self._dirty_scan(
+            "sensitive_path_scanner", "shadow_format", shadow_line,
+        )
+
+        orch = Orchestrator(
+            planner=mock_planner,
+            pipeline=mock_pipeline,
+            tool_executor=self._make_executor(tagged),
+        )
+        result = await orch.handle_task("Process targets")
+
+        assert result.step_results[0].status == "blocked"
+        assert "sensitive_path_scanner" in result.step_results[0].error
+
+    @pytest.mark.asyncio
+    async def test_tool_output_sensitive_path_blocked(self, mock_planner, mock_pipeline):
+        """/etc/passwd content in output → blocked."""
+        plan = _make_plan([{
+            "id": "step_1",
+            "type": "tool_call",
+            "description": "Run command",
+            "tool": "shell_exec",
+            "args": {"command": "cat /etc/passwd"},
+        }])
+        mock_planner.create_plan.return_value = plan
+
+        passwd_line = "root:x:0:0:root:/root:/bin/bash"
+        tagged = create_tagged_data(
+            content=passwd_line,
+            source=DataSource.TOOL,
+            trust_level=TrustLevel.TRUSTED,
+        )
+        mock_pipeline.scan_output.return_value = self._dirty_scan(
+            "sensitive_path_scanner", "passwd_format", passwd_line,
+        )
+
+        orch = Orchestrator(
+            planner=mock_planner,
+            pipeline=mock_pipeline,
+            tool_executor=self._make_executor(tagged),
+        )
+        result = await orch.handle_task("Read passwd")
+
+        assert result.step_results[0].status == "blocked"
+        assert "passwd_format" in result.step_results[0].error
+
+    @pytest.mark.asyncio
+    async def test_tool_output_clean_passthrough(self, mock_planner, mock_pipeline):
+        """Clean tool output passes through with content preserved."""
+        plan = _make_plan([{
+            "id": "step_1",
+            "type": "tool_call",
+            "description": "Run command",
+            "tool": "shell_exec",
+            "args": {"command": "echo hello"},
+        }])
+        mock_planner.create_plan.return_value = plan
+
+        tagged = create_tagged_data(
+            content="hello\n",
+            source=DataSource.TOOL,
+            trust_level=TrustLevel.TRUSTED,
+        )
+        mock_pipeline.scan_output.return_value = PipelineScanResult()
+
+        executor = self._make_executor(tagged)
+        orch = Orchestrator(
+            planner=mock_planner,
+            pipeline=mock_pipeline,
+            tool_executor=executor,
+        )
+        result = await orch.handle_task("Echo hello")
+
+        assert result.status == "success"
+        assert result.step_results[0].status == "success"
+        assert result.step_results[0].content == "hello\n"
+
+    @pytest.mark.asyncio
+    async def test_tool_output_destination_passed(self, mock_planner, mock_pipeline):
+        """scan_output() is called with the correct destination (EXECUTION for tool_calls)."""
+        from sentinel.core.models import OutputDestination
+
+        plan = _make_plan([{
+            "id": "step_1",
+            "type": "tool_call",
+            "description": "Run command",
+            "tool": "shell_exec",
+            "args": {"command": "echo test"},
+        }])
+        mock_planner.create_plan.return_value = plan
+
+        tagged = create_tagged_data(
+            content="test output",
+            source=DataSource.TOOL,
+            trust_level=TrustLevel.TRUSTED,
+        )
+        mock_pipeline.scan_output.return_value = PipelineScanResult()
+
+        orch = Orchestrator(
+            planner=mock_planner,
+            pipeline=mock_pipeline,
+            tool_executor=self._make_executor(tagged),
+        )
+        await orch.handle_task("Test")
+
+        # tool_call steps always get EXECUTION destination (strict scanning)
+        mock_pipeline.scan_output.assert_called_once_with(
+            "test output", OutputDestination.EXECUTION,
+        )
+
+    @pytest.mark.asyncio
+    async def test_tool_output_scan_crash_fails_closed(self, mock_planner, mock_pipeline):
+        """Scanner exception → blocked for safety (fail-closed)."""
+        plan = _make_plan([{
+            "id": "step_1",
+            "type": "tool_call",
+            "description": "Run command",
+            "tool": "shell_exec",
+            "args": {"command": "echo boom"},
+        }])
+        mock_planner.create_plan.return_value = plan
+
+        tagged = create_tagged_data(
+            content="some output",
+            source=DataSource.TOOL,
+            trust_level=TrustLevel.TRUSTED,
+        )
+        mock_pipeline.scan_output.side_effect = RuntimeError("Scanner crashed")
+
+        orch = Orchestrator(
+            planner=mock_planner,
+            pipeline=mock_pipeline,
+            tool_executor=self._make_executor(tagged),
+        )
+        result = await orch.handle_task("Crash test")
+
+        assert result.step_results[0].status == "blocked"
+        assert "blocked for safety" in result.step_results[0].error
+
+    @pytest.mark.asyncio
+    async def test_tool_output_scan_results_in_provenance(self, mock_planner, mock_pipeline):
+        """Clean scan results are stored in tagged.scan_results for audit trail."""
+        plan = _make_plan([{
+            "id": "step_1",
+            "type": "tool_call",
+            "description": "Run command",
+            "tool": "shell_exec",
+            "args": {"command": "echo clean"},
+        }])
+        mock_planner.create_plan.return_value = plan
+
+        tagged = create_tagged_data(
+            content="clean output",
+            source=DataSource.TOOL,
+            trust_level=TrustLevel.TRUSTED,
+        )
+        clean_result = PipelineScanResult()
+        clean_result.results["credential_scanner"] = ScanResult(
+            found=False, matches=[], scanner_name="credential_scanner",
+        )
+        mock_pipeline.scan_output.return_value = clean_result
+
+        orch = Orchestrator(
+            planner=mock_planner,
+            pipeline=mock_pipeline,
+            tool_executor=self._make_executor(tagged),
+        )
+        await orch.handle_task("Provenance test")
+
+        assert "credential_scanner" in tagged.scan_results
+        assert tagged.scan_results["credential_scanner"].found is False
+
+    @pytest.mark.asyncio
+    async def test_safe_handler_not_scanned(self, mock_planner, mock_pipeline):
+        """SAFE handlers (health_check etc.) don't trigger scan_output()."""
+        plan = _make_plan([{
+            "id": "step_1",
+            "type": "tool_call",
+            "description": "Check health",
+            "tool": "health_check",
+            "args": {},
+        }])
+        mock_planner.create_plan.return_value = plan
+
+        orch = Orchestrator(
+            planner=mock_planner,
+            pipeline=mock_pipeline,
+        )
+        result = await orch.handle_task("Health check")
+
+        assert result.step_results[0].status == "success"
+        mock_pipeline.scan_output.assert_not_called()

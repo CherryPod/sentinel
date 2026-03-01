@@ -4,12 +4,12 @@ import asyncio
 import uuid
 from unittest.mock import AsyncMock, MagicMock, patch
 
-# Common settings patch for orchestrator tests that bypass CodeShield/etc
+# Common settings patch for orchestrator tests that bypass Semgrep/etc
 _ORCH_SETTINGS = {
     "sentinel.planner.orchestrator.settings": MagicMock(
         conversation_enabled=False,
         spotlighting_enabled=False,
-        require_codeshield=False,
+        require_semgrep=False,
         verbose_results=False,
         auto_memory=False,
     ),
@@ -240,7 +240,7 @@ class TestChannelRouter:
 
 @patch("sentinel.planner.orchestrator.settings", MagicMock(
     conversation_enabled=False, spotlighting_enabled=False,
-    require_codeshield=False, verbose_results=False, auto_memory=False,
+    require_semgrep=False, verbose_results=False, auto_memory=False,
 ))
 class TestOrchestratorEventBusWiring:
     """Test that the orchestrator publishes events at the correct points."""

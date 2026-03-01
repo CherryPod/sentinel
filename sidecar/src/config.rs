@@ -5,6 +5,7 @@
 use std::path::PathBuf;
 
 /// Configuration for the sidecar's sandbox engine and host functions.
+/// O-009: All limits are configurable via SENTINEL_SIDECAR_* environment variables.
 pub struct SidecarConfig {
     /// Maximum WASM memory in bytes (default: 64 MiB).
     pub max_memory_bytes: u64,
@@ -56,6 +57,9 @@ impl Default for SidecarConfig {
     fn default() -> Self {
         Self {
             max_memory_bytes: 64 * 1024 * 1024,       // 64 MiB
+            // O-007: Fuel limit is configurable via SENTINEL_SIDECAR_MAX_FUEL env var.
+            // 1B instructions is appropriate for file I/O and HTTP tools; reduce via
+            // env var for lighter workloads if needed.
             max_fuel: 1_000_000_000,                    // 1 billion instructions
             timeout_ms: 30_000,                         // 30 seconds
             tool_dir: PathBuf::from("./wasm"),

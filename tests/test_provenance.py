@@ -9,6 +9,7 @@ from sentinel.security.provenance import (
     is_trust_safe_for_execution,
     record_file_write,
     reset_store,
+    update_content,
 )
 
 
@@ -243,3 +244,42 @@ class TestFileProvenance:
         )
         # Parent is untrusted → child should inherit UNTRUSTED
         assert read_result.trust_level == TrustLevel.UNTRUSTED
+
+
+class TestUpdateContent:
+    """Tests for update_content (in-memory store)."""
+
+    def test_updates_existing_entry(self):
+        t = create_tagged_data(
+            "<RESPONSE>\ndef foo(): pass\n</RESPONSE>",
+            DataSource.QWEN, TrustLevel.UNTRUSTED,
+        )
+        assert update_content(t.id, "def foo(): pass")
+        retrieved = get_tagged_data(t.id)
+        assert retrieved.content == "def foo(): pass"
+
+    def test_returns_false_for_missing_id(self):
+        assert not update_content("nonexistent-id", "new content")
+
+    def test_preserves_trust_level(self):
+        t = create_tagged_data("raw", DataSource.QWEN, TrustLevel.UNTRUSTED)
+        update_content(t.id, "cleaned")
+        retrieved = get_tagged_data(t.id)
+        assert retrieved.trust_level == TrustLevel.UNTRUSTED
+
+    def test_preserves_source(self):
+        t = create_tagged_data("raw", DataSource.QWEN, TrustLevel.UNTRUSTED)
+        update_content(t.id, "cleaned")
+        retrieved = get_tagged_data(t.id)
+        assert retrieved.source == DataSource.QWEN
+
+    def test_downstream_resolve_gets_updated_content(self):
+        """Simulates the execution variable resolution path."""
+        t = create_tagged_data(
+            "<RESPONSE>\nprint('hello')\n</RESPONSE>",
+            DataSource.QWEN, TrustLevel.UNTRUSTED,
+        )
+        update_content(t.id, "print('hello')")
+        retrieved = get_tagged_data(t.id)
+        assert "<RESPONSE>" not in retrieved.content
+        assert retrieved.content == "print('hello')"

@@ -290,27 +290,32 @@ class TestHostileQwenOutputBlocked:
 
     @patch("sentinel.security.pipeline.settings")
     @pytest.mark.asyncio
-    async def test_chinese_injection_in_output_blocked_as_prompt(self, mock_settings, hostile_pipeline):
-        """Chinese instructions in Qwen output must be blocked if used as a chained prompt.
+    async def test_chinese_injection_in_output_passes_chained_step(self, mock_settings, hostile_pipeline):
+        """CJK content in chained step prompts passes — gate skipped for chained steps.
 
-        Simulates: Qwen step 1 outputs Chinese injection text → orchestrator
-        feeds it into step 2 as the prompt → ASCII gate blocks it.
-        Uses skip_input_scan=True because in a real chained step, the
-        orchestrator already scanned this content as output from step 1.
+        The ASCII gate skips when skip_input_scan=True because chained step
+        prompts contain prior Qwen output (via $variable substitution) which
+        may naturally include CJK characters (e.g. CJK comments in code).
+        The content was already fully scanned as output from the prior step.
+        The output scanners (Semgrep, credentials, paths, commands, encoding)
+        remain active and will catch actual attack patterns regardless of script.
         """
         pipeline, worker = hostile_pipeline
         self._configure_settings(mock_settings)
-        # The attack payload is what Qwen returned from step 1. If the
-        # orchestrator naively used it as the next prompt, the ASCII gate
-        # should block it before it reaches Qwen.
         chinese_output = ATTACKS["chinese_injection_in_output"]
-        with pytest.raises(SecurityViolation, match="blocked script"):
-            await pipeline.process_with_qwen(chinese_output, skip_input_scan=True)
+        # Worker will be called since the gate no longer blocks.
+        # Set a clean return value so the test exercises the full pipeline.
+        worker.generate.return_value = "Task completed successfully."
+        mock_settings.require_semgrep = False
+
+        tagged = await pipeline.process_with_qwen(chinese_output, skip_input_scan=True)
+        assert tagged is not None
 
     @staticmethod
     def _configure_settings(mock_settings):
         mock_settings.prompt_guard_enabled = False
         mock_settings.spotlighting_enabled = False
+        mock_settings.baseline_mode = False
         mock_settings.ollama_model = "qwen3:14b"
 
 
@@ -323,6 +328,7 @@ class TestHostileQwenCleanOutputAllowed:
         pipeline, worker = hostile_pipeline
         mock_settings.prompt_guard_enabled = False
         mock_settings.spotlighting_enabled = False
+        mock_settings.baseline_mode = False
         mock_settings.ollama_model = "qwen3:14b"
         worker.generate.return_value = "<html><body><h1>Hello World</h1></body></html>"
 
@@ -335,6 +341,7 @@ class TestHostileQwenCleanOutputAllowed:
         pipeline, worker = hostile_pipeline
         mock_settings.prompt_guard_enabled = False
         mock_settings.spotlighting_enabled = False
+        mock_settings.baseline_mode = False
         mock_settings.ollama_model = "qwen3:14b"
         worker.generate.return_value = "def add(a, b):\n    return a + b"
 

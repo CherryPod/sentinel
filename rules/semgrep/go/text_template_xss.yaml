@@ -1,0 +1,20 @@
+rules:
+- id: text-template-xss
+  pattern-either:
+      - pattern: |
+          import "text/template"
+          ...
+      - pattern: |
+          $T = template.New(...)
+          ...
+  message: >-
+    Using text/template for web output does not escape HTML.
+    Use html/template instead to prevent XSS.
+  metadata:
+    cwe:
+    - 'CWE-79: Improper Neutralization of Input During Web Page Generation (XSS)'
+    cwe_id: CWE-79
+    prescan_regex: text/template
+  severity: WARNING
+  languages:
+  - go

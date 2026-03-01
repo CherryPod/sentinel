@@ -1,0 +1,20 @@
+rules:
+- id: vm-code-exec
+  pattern-either:
+      - pattern: vm.runInNewContext($X, ...)
+      - pattern: vm.runInThisContext($X, ...)
+      - pattern: vm.runInContext($X, ...)
+      - pattern: new vm.Script($X)
+  message: >-
+    Node.js vm module is NOT a security sandbox. Code can escape
+    the context and access the host process. Use isolated-vm or
+    worker_threads for untrusted code execution.
+  metadata:
+    cwe:
+    - 'CWE-94: Improper Control of Generation of Code (Code Injection)'
+    cwe_id: CWE-94
+    prescan_regex: vm\.(runIn|Script)
+  severity: WARNING
+  languages:
+  - javascript
+  - typescript

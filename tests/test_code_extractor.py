@@ -1,5 +1,6 @@
 from sentinel.security.code_extractor import (
     CodeBlock,
+    close_unclosed_fences,
     extract_code_blocks,
     strip_emoji_from_code_blocks,
 )
@@ -277,3 +278,98 @@ class TestStripEmojiFromCodeBlocks:
         assert "\U0001F389" not in result
         assert "x = 1" in result
         assert "let y = 2;" in result
+
+
+class TestCloseUnclosedFences:
+    """R9: fence closure post-processing for token-cap truncation."""
+
+    def test_no_fences_passthrough(self):
+        """Plain text with no code fences is returned unchanged."""
+        text = "Just some prose, no code blocks at all."
+        assert close_unclosed_fences(text) == text
+
+    def test_balanced_fences_passthrough(self):
+        """Text with properly closed code blocks is returned unchanged."""
+        text = "Here is code:\n\n```python\nprint('hi')\n```\n\nDone."
+        assert close_unclosed_fences(text) == text
+
+    def test_single_unclosed_fence(self):
+        """Single opening fence with no closing fence gets closed."""
+        text = "Here is code:\n\n```\nprint('hi')\n"
+        result = close_unclosed_fences(text)
+        assert result.endswith("```\n")
+        # Original content is preserved — only a closing fence is appended
+        assert result.startswith("Here is code:")
+        assert "print('hi')" in result
+
+    def test_unclosed_fence_with_language_tag(self):
+        """Opening fence with language tag but no closing fence gets closed."""
+        text = "```python\ndef hello():\n    return 'world'\n"
+        result = close_unclosed_fences(text)
+        assert result.endswith("```\n")
+        assert "def hello():" in result
+        assert "return 'world'" in result
+
+    def test_multiple_blocks_last_unclosed(self):
+        """Multiple code blocks where only the last is unclosed."""
+        text = (
+            "First block:\n\n```python\nprint('hello')\n```\n\n"
+            "Second block (truncated):\n\n```javascript\nconsole.log('hi')\n"
+        )
+        result = close_unclosed_fences(text)
+        assert result.endswith("```\n")
+        # First block still intact
+        assert "print('hello')" in result
+        assert "console.log('hi')" in result
+
+    def test_inline_backticks_not_counted(self):
+        """Inline code backticks (mid-line) don't count as fence delimiters."""
+        text = "Use `print()` to output text. Also `eval()` is dangerous."
+        assert close_unclosed_fences(text) == text
+
+    def test_already_closed_response_unchanged(self):
+        """A fully balanced multi-block response is returned unchanged."""
+        text = (
+            "```python\nimport os\n```\n\n"
+            "Some prose.\n\n"
+            "```bash\necho hello\n```\n"
+        )
+        assert close_unclosed_fences(text) == text
+
+    def test_unclosed_no_trailing_newline(self):
+        """Unclosed fence without trailing newline still gets proper closure."""
+        text = "```python\nprint('truncated')"
+        result = close_unclosed_fences(text)
+        # Should add newline before closing fence
+        assert result.endswith("\n```\n")
+        assert "print('truncated')" in result
+
+    def test_realistic_truncation(self):
+        """Simulates a real Qwen response truncated mid-code by num_predict cap."""
+        text = (
+            "Here's how to implement a web server:\n\n"
+            "```python\n"
+            "from flask import Flask\n"
+            "\n"
+            "app = Flask(__name__)\n"
+            "\n"
+            "@app.route('/')\n"
+            "def index():\n"
+            "    return 'Hello, World!'\n"
+            "\n"
+            "if __name__ == '__main__':\n"
+            "    app.run(host='0.0.0"  # truncated mid-line by token cap
+        )
+        result = close_unclosed_fences(text)
+        assert result.endswith("```\n")
+        assert "from flask import Flask" in result
+
+    def test_empty_string_passthrough(self):
+        """Empty string is returned unchanged."""
+        assert close_unclosed_fences("") == ""
+
+    def test_four_backtick_fence(self):
+        """Four-backtick fences (used for nesting) are also counted."""
+        text = "````python\nprint('hi')\n"
+        result = close_unclosed_fences(text)
+        assert result.endswith("```\n")

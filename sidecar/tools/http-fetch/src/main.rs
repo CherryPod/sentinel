@@ -43,7 +43,10 @@ fn main() {
         }
     };
 
-    // If auth_credential is specified, fetch it via host function and add to headers
+    // If auth_credential is specified, fetch it via host function and add to headers.
+    // P-002: No format validation on credential value (e.g. "Bearer " prefix) because
+    // the credential store is host-controlled, not guest-supplied. A compromised store
+    // would be a larger issue than header format validation can solve.
     if let Some(cred_name) = &args.auth_credential {
         let cred_request = serde_json::json!({"name": cred_name});
         match call_host(Op::GetCredential, &cred_request) {

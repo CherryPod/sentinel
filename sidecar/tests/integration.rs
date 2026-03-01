@@ -2,6 +2,10 @@
 //!
 //! Tests the leak detector, HTTP client validation, capabilities, and registry
 //! in isolation (no WASM execution — those require compiled .wasm modules).
+//!
+//! P-001: Some modules (leak_detector, http_client, capabilities) are placeholders
+//! — real coverage lives in unit tests within each source file. This file exists as
+//! a structural home for future cross-module integration tests (e.g. WASM execution).
 
 // ── Leak Detector Tests ─────────────────────────────────────────────────
 

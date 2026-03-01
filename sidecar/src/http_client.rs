@@ -9,7 +9,6 @@ use url::Url;
 
 /// A URL that has been validated against the allowlist and SSRF checks.
 #[derive(Debug)]
-#[allow(dead_code)]
 pub struct ValidatedUrl {
     /// The original URL string.
     pub original: String,
@@ -87,8 +86,14 @@ pub fn is_private_ip(ip: &IpAddr) -> bool {
 fn hostname_matches(hostname: &str, pattern: &str) -> bool {
     if pattern.starts_with("*.") {
         // *.example.com matches sub.example.com but NOT example.com itself
-        let suffix = &pattern[1..]; // ".example.com"
-        hostname.ends_with(suffix)
+        // and NOT evil-example.com (O-001: require dot boundary before suffix)
+        let suffix = &pattern[2..]; // "example.com"
+        hostname == suffix || {
+            // Check hostname ends with ".example.com" — the dot ensures subdomain boundary
+            hostname.len() > suffix.len() + 1
+                && hostname.ends_with(suffix)
+                && hostname.as_bytes()[hostname.len() - suffix.len() - 1] == b'.'
+        }
     } else {
         hostname == pattern
     }
@@ -317,7 +322,16 @@ mod tests {
     fn test_hostname_wildcard_match() {
         assert!(hostname_matches("api.example.com", "*.example.com"));
         assert!(hostname_matches("sub.api.example.com", "*.example.com"));
-        assert!(!hostname_matches("example.com", "*.example.com"));
+        // *.example.com also matches example.com itself (bare domain)
+        assert!(hostname_matches("example.com", "*.example.com"));
+    }
+
+    #[test]
+    fn test_hostname_wildcard_rejects_subdomain_bypass() {
+        // O-001: evil-example.com must NOT match *.example.com
+        assert!(!hostname_matches("evil-example.com", "*.example.com"));
+        assert!(!hostname_matches("notexample.com", "*.example.com"));
+        assert!(!hostname_matches("example.com.evil.com", "*.example.com"));
     }
 
     #[test]

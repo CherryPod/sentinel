@@ -4,7 +4,7 @@ import sqlite3
 
 import pytest
 
-from sentinel.core.db import init_db
+from sentinel.core.db import init_db, _migrate_tables
 
 
 @pytest.fixture
@@ -163,3 +163,57 @@ class TestAuditLogTable:
         )
         row = db.execute("SELECT event_type FROM audit_log WHERE session_id = 's1'").fetchone()
         assert row[0] == "task_complete"
+
+
+class TestMigration:
+    def test_migration_adds_new_columns(self):
+        """Simulate a pre-migration DB (no auto_approved/elapsed_s) and verify migration adds them."""
+        conn = sqlite3.connect(":memory:")
+        conn.execute("PRAGMA foreign_keys=ON")
+        # Create old-schema table WITHOUT the new columns
+        conn.execute("""
+            CREATE TABLE sessions (
+                session_id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL DEFAULT 'default',
+                source TEXT NOT NULL DEFAULT '',
+                cumulative_risk REAL NOT NULL DEFAULT 0.0,
+                violation_count INTEGER NOT NULL DEFAULT 0,
+                is_locked INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT '',
+                last_active TEXT NOT NULL DEFAULT ''
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE conversation_turns (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL REFERENCES sessions(session_id),
+                user_id TEXT NOT NULL DEFAULT 'default',
+                request_text TEXT NOT NULL,
+                result_status TEXT NOT NULL DEFAULT '',
+                blocked_by TEXT NOT NULL DEFAULT '[]',
+                risk_score REAL NOT NULL DEFAULT 0.0,
+                plan_summary TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT ''
+            )
+        """)
+        cols_before = {r[1] for r in conn.execute("PRAGMA table_info(conversation_turns)").fetchall()}
+        assert "auto_approved" not in cols_before
+        assert "elapsed_s" not in cols_before
+
+        _migrate_tables(conn)
+
+        cols_after = {r[1] for r in conn.execute("PRAGMA table_info(conversation_turns)").fetchall()}
+        assert "auto_approved" in cols_after
+        assert "elapsed_s" in cols_after
+        conn.close()
+
+    def test_migration_idempotent(self, db):
+        """Running migration on an already-migrated DB should not error."""
+        cols_before = {r[1] for r in db.execute("PRAGMA table_info(conversation_turns)").fetchall()}
+        assert "auto_approved" in cols_before  # fresh DB has the column
+
+        # Run migration again — should be a no-op
+        _migrate_tables(db)
+
+        cols_after = {r[1] for r in db.execute("PRAGMA table_info(conversation_turns)").fetchall()}
+        assert cols_before == cols_after

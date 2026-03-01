@@ -73,7 +73,7 @@ class EventBus:
         """
         matching_handlers: list[EventHandler] = []
 
-        for pattern, handlers in self._subscribers.items():
+        for pattern, handlers in list(self._subscribers.items()):
             if fnmatch.fnmatch(topic, pattern):
                 matching_handlers.extend(handlers)
 

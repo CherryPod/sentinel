@@ -5,7 +5,7 @@ import secrets
 import time
 
 from sentinel.core.config import settings
-from sentinel.core.models import DataSource, ScanMatch, ScanResult, TaggedData, TrustLevel
+from sentinel.core.models import DataSource, OutputDestination, ScanMatch, ScanResult, TaggedData, TrustLevel
 from .provenance import create_tagged_data
 from .scanner import (
     CommandPatternScanner,
@@ -23,6 +23,9 @@ logger = logging.getLogger("sentinel.audit")
 
 # Symbols unlikely to appear naturally in user data.
 # Excludes < > & " ' (XML-sensitive), $ (variable syntax), ^ (old static marker).
+# Excludes {}[]()\/_ (common in code). 12 symbols → 12^4 ≈ 20K combinations.
+# Marker changes per-request and Qwen is air-gapped, so brute-force guessing
+# of the 4-char marker is impractical.
 _MARKER_POOL = "~!@#%*+=|;:"
 
 _SANDWICH_REMINDER = (
@@ -87,6 +90,9 @@ class ScanPipeline:
         self._encoding_scanner = encoding_scanner or EncodingNormalizationScanner(
             cred_scanner, path_scanner, self._cmd_scanner
         )
+        # OllamaWorker created at init — required for most operations (process_with_qwen).
+        # Lazy init would add complexity for marginal benefit since the pipeline
+        # is typically long-lived and the worker is used on every task.
         self._worker = worker or OllamaWorker(
             base_url=settings.ollama_url,
             timeout=settings.ollama_timeout,
@@ -106,6 +112,7 @@ class ScanPipeline:
         r"\u0250-\u02af"       # IPA Extensions
         r"\u02b0-\u02ff"       # Spacing Modifier Letters
         r"\u0300-\u036f"       # Combining Diacritical Marks
+        r"\u0370-\u03ff"       # Greek and Coptic (α, β, γ, λ, π, Σ — math/science/CS)
         r"\u2000-\u206f"       # General Punctuation (dashes, quotes, ellipsis, bullets)
         r"\u2070-\u209f"       # Superscripts and Subscripts
         r"\u20a0-\u20cf"       # Currency Symbols (€, ₹, ₽, etc.)
@@ -131,6 +138,11 @@ class ScanPipeline:
         quotes, em-dashes, math, currency, arrows, box drawing, etc.).
         Blocks CJK, Cyrillic, Arabic, Hangul, and other scripts that Qwen
         might interpret as instructions.
+
+        Intentionally checks only the Claude-generated instruction text (prompt),
+        not the full_prompt which includes user-provided untrusted_data. User
+        content may legitimately contain non-Latin Unicode; the script gate
+        validates only the trusted instruction portion.
         """
         if self._ALLOWED_PROMPT_CHARS.match(prompt):
             return  # All good
@@ -165,8 +177,28 @@ class ScanPipeline:
             )},
         )
 
-    def scan_input(self, text: str) -> PipelineScanResult:
-        """Scan inbound text (Prompt Guard + deterministic scanners)."""
+    def scan_input(
+        self,
+        text: str,
+        *,
+        context_aware_paths: bool = False,
+    ) -> PipelineScanResult:
+        """Scan inbound text (Prompt Guard + deterministic scanners).
+
+        Args:
+            text: The text to scan.
+            context_aware_paths: When True, use the context-aware
+                ``scan_output_text()`` for the SensitivePathScanner instead
+                of the strict ``scan()``.  This is appropriate for
+                internally-generated text (e.g. Claude's planner prompt)
+                where educational path references in prose are expected.
+                Raw user input should always use the default (False).
+        """
+        # Baseline mode: skip all scanning to measure utility without security overhead
+        if settings.baseline_mode:
+            logger.info("Input scan skipped (baseline mode)", extra={"event": "baseline_skip_input_scan"})
+            return PipelineScanResult()
+
         t0 = time.monotonic()
         result = PipelineScanResult()
 
@@ -190,10 +222,39 @@ class ScanPipeline:
         # Run deterministic scanners on input too — catches obvious
         # credential leaks, sensitive path references, and dangerous
         # command patterns before they even reach the planner.
-        result.results["credential_scanner"] = self._cred_scanner.scan(text)
-        result.results["sensitive_path_scanner"] = self._path_scanner.scan(text)
-        result.results["command_pattern_scanner"] = self._cmd_scanner.scan(text)
-        result.results["encoding_normalization_scanner"] = self._encoding_scanner.scan(text)
+        # Each scanner is wrapped individually so a crash in one doesn't
+        # prevent the others from running, and the crashed scanner is
+        # identified in the result (fail-closed: found=True).
+        path_scan_fn = (
+            self._path_scanner.scan_output_text
+            if context_aware_paths
+            else self._path_scanner.scan
+        )
+        for scanner_name, scan_fn in [
+            ("credential_scanner", lambda: self._cred_scanner.scan(text)),
+            ("sensitive_path_scanner", lambda: path_scan_fn(text)),
+            ("command_pattern_scanner", lambda: self._cmd_scanner.scan(text)),
+            # Intentionally strict: encoding scanner always uses scan(), not
+            # context_aware_paths, because encoded payloads should be caught
+            # regardless of context (input scanning catches everything).
+            ("encoding_normalization_scanner", lambda: self._encoding_scanner.scan(text)),
+        ]:
+            try:
+                result.results[scanner_name] = scan_fn()
+            except Exception:
+                logger.error(
+                    "Scanner crashed — failing closed",
+                    extra={"event": "scanner_crash", "scanner": scanner_name},
+                    exc_info=True,
+                )
+                result.results[scanner_name] = ScanResult(
+                    found=True,
+                    matches=[ScanMatch(
+                        pattern_name="scanner_crash",
+                        matched_text=f"Scanner '{scanner_name}' crashed",
+                    )],
+                    scanner_name=scanner_name,
+                )
 
         elapsed = time.monotonic() - t0
 
@@ -222,8 +283,24 @@ class ScanPipeline:
         )
         return result
 
-    def scan_output(self, text: str) -> PipelineScanResult:
-        """Scan Qwen output (Prompt Guard + credential + sensitive path)."""
+    def scan_output(
+        self,
+        text: str,
+        destination: OutputDestination = OutputDestination.EXECUTION,
+    ) -> PipelineScanResult:
+        """Scan Qwen output (Prompt Guard + credential + sensitive path).
+
+        Args:
+            text: The output text to scan.
+            destination: Where this output is going. DISPLAY skips
+                CommandPatternScanner (educational content safe for screen).
+                EXECUTION (default) runs all scanners — fail-safe.
+        """
+        # Baseline mode: skip all scanning to measure utility without security overhead
+        if settings.baseline_mode:
+            logger.info("Output scan skipped (baseline mode)", extra={"event": "baseline_skip_output_scan"})
+            return PipelineScanResult()
+
         t0 = time.monotonic()
         result = PipelineScanResult()
 
@@ -244,12 +321,46 @@ class ScanPipeline:
                 text, threshold=settings.prompt_guard_threshold
             )
 
-        result.results["credential_scanner"] = self._cred_scanner.scan(text)
-        # Context-aware: only flag paths in code blocks, shell commands, or
-        # standalone lines — not educational prose mentioning paths.
-        result.results["sensitive_path_scanner"] = self._path_scanner.scan_output_text(text)
-        result.results["command_pattern_scanner"] = self._cmd_scanner.scan(text)
-        result.results["encoding_normalization_scanner"] = self._encoding_scanner.scan_output_text(text)
+        # Each scanner wrapped individually — same fail-closed pattern as scan_input.
+        # Context-aware: output scanners only flag patterns in code blocks,
+        # shell commands, or standalone lines — not educational prose or
+        # refusal explanations where Qwen mentions danger patterns.
+        scanners: list[tuple[str, object]] = [
+            ("credential_scanner", lambda: self._cred_scanner.scan(text)),
+            ("sensitive_path_scanner", lambda: self._path_scanner.scan_output_text(text)),
+            ("encoding_normalization_scanner", lambda: self._encoding_scanner.scan_output_text(text)),
+        ]
+        if destination == OutputDestination.EXECUTION:
+            # CommandPatternScanner only runs when output feeds into tool execution.
+            # DISPLAY output (going to human eyes) skips it — command patterns on
+            # screen don't execute, and blocking them causes FPs on educational content.
+            scanners.insert(2, (
+                "command_pattern_scanner",
+                lambda: self._cmd_scanner.scan_output_text(text),
+            ))
+        else:
+            # Record that CommandPatternScanner was skipped (audit trail)
+            result.results["command_pattern_scanner"] = ScanResult(
+                found=False, scanner_name="command_pattern_scanner"
+            )
+
+        for scanner_name, scan_fn in scanners:
+            try:
+                result.results[scanner_name] = scan_fn()
+            except Exception:
+                logger.error(
+                    "Scanner crashed — failing closed",
+                    extra={"event": "scanner_crash", "scanner": scanner_name},
+                    exc_info=True,
+                )
+                result.results[scanner_name] = ScanResult(
+                    found=True,
+                    matches=[ScanMatch(
+                        pattern_name="scanner_crash",
+                        matched_text=f"Scanner '{scanner_name}' crashed",
+                    )],
+                    scanner_name=scanner_name,
+                )
 
         elapsed = time.monotonic() - t0
 
@@ -271,6 +382,7 @@ class ScanPipeline:
             extra={
                 "event": "scan_output",
                 "clean": result.is_clean,
+                "destination": destination.value,
                 "scanners": list(result.results.keys()),
                 "violations": list(result.violations.keys()),
                 "text_length": len(text),
@@ -286,6 +398,7 @@ class ScanPipeline:
         marker: str | None = None,
         skip_input_scan: bool = False,
         user_input: str | None = None,
+        destination: OutputDestination = OutputDestination.EXECUTION,
     ) -> TaggedData:
         """Full pipeline: scan → spotlight → Qwen → scan → tag.
 
@@ -298,8 +411,12 @@ class ScanPipeline:
         # output from the previous step. Scanning our own defensive wrapper text
         # causes Prompt Guard false positives (the instruction-like reminders
         # look like injection).
+        # Context-aware paths: the prompt here is Claude's planner output —
+        # educational path references in prose (e.g. "prevent traversal like
+        # ../../etc/passwd") should not be blocked. The user's original input
+        # was already strict-scanned at the API layer.
         if not skip_input_scan:
-            input_scan = self.scan_input(prompt)
+            input_scan = self.scan_input(prompt, context_aware_paths=True)
             if not input_scan.is_clean:
                 logger.warning(
                     "Input blocked by scan pipeline",
@@ -327,7 +444,15 @@ class ScanPipeline:
         # The expanded allowlist (ASCII + Latin Extended + typographic symbols)
         # lets Claude's smart quotes/em-dashes through while blocking CJK,
         # Cyrillic, Arabic, Hangul, etc. that Qwen might follow as instructions.
-        self._check_prompt_ascii(prompt)
+        # Skip ascii gate for chained steps where the prompt contains prior Qwen
+        # output via $variable substitution.  Qwen's output was already fully scanned
+        # (Semgrep, credential, path, command, encoding scanners) as output from the
+        # prior step.  Running the gate on the resolved_prompt would block legitimate
+        # non-Latin chars (e.g. CJK comments) that Qwen naturally produces.
+        # This mirrors the input scan skip logic at lines 408-429.
+        # Baseline mode: skip script gate (measuring utility without security)
+        if not skip_input_scan and not settings.baseline_mode:
+            self._check_prompt_ascii(prompt)
 
         # 1.6. Prompt length gate: reject oversized prompts before they reach Qwen.
         # The per-field limit is 50K chars, but the orchestrator can combine
@@ -357,9 +482,11 @@ class ScanPipeline:
 
         # 2. Apply spotlighting to untrusted data + structural tags + sandwich
         # Use caller-provided marker, or generate a new one
+        # Baseline mode: skip spotlighting (measuring utility without security overhead)
+        spotlighting_active = settings.spotlighting_enabled and not settings.baseline_mode
         if marker is None:
-            marker = _generate_marker() if settings.spotlighting_enabled else ""
-        if untrusted_data and settings.spotlighting_enabled:
+            marker = _generate_marker() if spotlighting_active else ""
+        if untrusted_data and spotlighting_active:
             marked_data = apply_datamarking(untrusted_data, marker=marker)
             full_prompt = (
                 f"{prompt}\n\n"
@@ -382,7 +509,7 @@ class ScanPipeline:
                 "event": "qwen_request",
                 "prompt_length": len(full_prompt),
                 "prompt_hash": prompt_hash,
-                "spotlighted": bool(untrusted_data) and settings.spotlighting_enabled,
+                "spotlighted": bool(untrusted_data) and spotlighting_active,
                 "model": settings.ollama_model,
             },
         )
@@ -432,6 +559,8 @@ class ScanPipeline:
                     "This may indicate an Ollama hang or model issue."
                 )
 
+        # Include worker token stats in the log if available
+        worker_stats = getattr(self._worker, "_last_generate_stats", None) or {}
         logger.info(
             "Qwen response received",
             extra={
@@ -439,6 +568,7 @@ class ScanPipeline:
                 "response_length": len(response_text),
                 "elapsed_s": round(qwen_elapsed, 2),
                 "prompt_hash": prompt_hash,
+                **{k: v for k, v in worker_stats.items() if v is not None},
             },
         )
         logger.debug(
@@ -467,8 +597,17 @@ class ScanPipeline:
             },
         )
 
+        # 4.5. Strip <think> blocks before scanning — Qwen's internal
+        # reasoning is never written, executed, or shown to users. Scanning
+        # it only produces false positives (e.g. /proc/ paths in reasoning).
+        # The orchestrator also strips these from tagged.content before
+        # code extraction (orchestrator.py L1148), so this is scan-only.
+        scan_text = re.sub(
+            r"<think>.*?</think>\s*", "", response_text, flags=re.DOTALL
+        )
+
         # 5. Scan output
-        output_scan = self.scan_output(response_text)
+        output_scan = self.scan_output(scan_text, destination=destination)
         tagged.scan_results = output_scan.results
 
         if not output_scan.is_clean:
@@ -489,7 +628,7 @@ class ScanPipeline:
         # 6. Vulnerability echo scan: compare input vs output fingerprints.
         # Only runs when the caller provides the raw user input text.
         if user_input:
-            echo_result = self._echo_scanner.scan(user_input, response_text)
+            echo_result = self._echo_scanner.scan(user_input, scan_text)
             tagged.scan_results["vulnerability_echo_scanner"] = echo_result
             if echo_result.found:
                 logger.warning(

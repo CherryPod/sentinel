@@ -1,6 +1,6 @@
 """Extract fenced code blocks from markdown-formatted text.
 
-Used by the CodeShield integration to scan only actual code blocks
+Used by the Semgrep scanner to scan only actual code blocks
 rather than mixed prose+code, which Semgrep can't parse reliably.
 """
 
@@ -13,7 +13,7 @@ _FENCED_BLOCK_RE = re.compile(
     re.DOTALL,
 )
 
-# Language tag → CodeShield Language enum value (only supported languages)
+# Language tag → canonical language name (for Semgrep file extension mapping)
 _LANGUAGE_MAP: dict[str, str] = {
     "python": "python",
     "py": "python",
@@ -47,7 +47,7 @@ class CodeBlock:
     """A code block extracted from markdown text."""
 
     code: str
-    language: str | None  # CodeShield language string, or None
+    language: str | None  # Canonical language name, or None
 
 
 def _detect_language(code: str) -> str | None:
@@ -97,6 +97,38 @@ def strip_emoji_from_code_blocks(text: str) -> str:
     return _FENCED_BLOCK_RE.sub(_clean_block, text)
 
 
+# Fence delimiter: a line that starts (optionally after whitespace) with
+# three or more backticks. This matches both opening fences (```python)
+# and closing fences (```).  Used by close_unclosed_fences().
+_FENCE_LINE_RE = re.compile(r"^\s*`{3,}", re.MULTILINE)
+
+
+def close_unclosed_fences(text: str) -> str:
+    """Append a closing code fence if the text has an unclosed fence.
+
+    When Qwen hits the num_predict token cap mid-code-block, the response
+    ends with an unclosed ``` fence. This causes broken markdown rendering
+    and inflates "poor" quality grades. The fix is cosmetic: if the text
+    ends with an odd number of fence delimiters (= still inside a code
+    block), append a closing ``` so the markdown is structurally valid.
+
+    Only appends — never removes or modifies existing content.
+    """
+    # Count fence delimiters by scanning line-starts.  Inline backticks
+    # (e.g. `some code`) don't match because they don't start at column 0.
+    fence_count = len(_FENCE_LINE_RE.findall(text))
+
+    # Even count → all fences are balanced, nothing to do
+    if fence_count % 2 == 0:
+        return text
+
+    # Odd count → last fence was an opening fence with no closing pair.
+    # Append a closing fence, ensuring it starts on its own line.
+    if text.endswith("\n"):
+        return text + "```\n"
+    return text + "\n```\n"
+
+
 def extract_code_blocks(text: str) -> list[CodeBlock]:
     """Extract fenced code blocks from markdown-formatted text.
 
@@ -113,7 +145,7 @@ def extract_code_blocks(text: str) -> list[CodeBlock]:
         if not code:
             continue
 
-        # Map the language tag to a CodeShield-supported language
+        # Map the language tag to a canonical language name
         language = None
         if lang_tag:
             language = _LANGUAGE_MAP.get(lang_tag.lower())
@@ -124,7 +156,9 @@ def extract_code_blocks(text: str) -> list[CodeBlock]:
 
         blocks.append(CodeBlock(code=code, language=language))
 
-    # Fallback: no fenced blocks → scan entire text (preserves current behaviour)
+    # B-006: Fallback — no fenced blocks → scan entire text as a single block.
+    # This is intentional: Qwen sometimes emits code without fences, and scanning
+    # everything is safer than scanning nothing.
     if not blocks:
         language = _detect_language(text)
         blocks.append(CodeBlock(code=text, language=language))

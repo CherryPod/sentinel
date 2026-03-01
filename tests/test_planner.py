@@ -191,8 +191,8 @@ class TestPlannerSystemPrompt:
     def test_prompt_contains_expects_code_rules(self, planner):
         from sentinel.planner.planner import _PLANNER_SYSTEM_PROMPT_TEMPLATE
         assert "expects_code" in _PLANNER_SYSTEM_PROMPT_TEMPLATE
-        assert "shell scripts" in _PLANNER_SYSTEM_PROMPT_TEMPLATE
-        assert "Dockerfiles" in _PLANNER_SYSTEM_PROMPT_TEMPLATE
+        assert "scripts" in _PLANNER_SYSTEM_PROMPT_TEMPLATE
+        assert "Containerfile" in _PLANNER_SYSTEM_PROMPT_TEMPLATE
 
     def test_prompt_contains_workspace_constraint(self, planner):
         from sentinel.planner.planner import _PLANNER_SYSTEM_PROMPT_TEMPLATE
@@ -204,12 +204,13 @@ class TestPlannerSystemPrompt:
 
     def test_prompt_prohibits_credential_access(self, planner):
         from sentinel.planner.planner import _PLANNER_SYSTEM_PROMPT_TEMPLATE
-        assert "credentials" in _PLANNER_SYSTEM_PROMPT_TEMPLATE
+        # New prompt uses "Credentials" and "API keys" in security_rules
+        assert "redentials" in _PLANNER_SYSTEM_PROMPT_TEMPLATE
         assert "API keys" in _PLANNER_SYSTEM_PROMPT_TEMPLATE
 
     def test_prompt_prohibits_exfiltration(self, planner):
         from sentinel.planner.planner import _PLANNER_SYSTEM_PROMPT_TEMPLATE
-        assert "exfiltrate" in _PLANNER_SYSTEM_PROMPT_TEMPLATE
+        assert "exfiltration" in _PLANNER_SYSTEM_PROMPT_TEMPLATE.lower()
 
     def test_prompt_marks_worker_untrusted(self, planner):
         from sentinel.planner.planner import _PLANNER_SYSTEM_PROMPT_TEMPLATE
@@ -222,8 +223,53 @@ class TestPlannerSystemPrompt:
     def test_system_prompt_contains_language_safety_rule(self, planner):
         """W7 fix: planner must prohibit non-English text in worker prompts."""
         from sentinel.planner.planner import _PLANNER_SYSTEM_PROMPT_TEMPLATE
-        assert "LANGUAGE SAFETY RULE" in _PLANNER_SYSTEM_PROMPT_TEMPLATE
+        assert "LANGUAGE SAFETY" in _PLANNER_SYSTEM_PROMPT_TEMPLATE
         assert "non-English" in _PLANNER_SYSTEM_PROMPT_TEMPLATE
+
+
+class TestTokenUsageTracking:
+    """Per-prompt token counting: _last_usage includes cache fields."""
+
+    @pytest.mark.asyncio
+    async def test_last_usage_populated_after_create_plan(self, planner):
+        """_last_usage should contain input, output, and cache token counts."""
+        plan_dict = _valid_plan_dict()
+        mock_response = _make_claude_response(plan_dict)
+        # Add usage attrs to the mock response
+        usage = MagicMock()
+        usage.input_tokens = 500
+        usage.output_tokens = 120
+        usage.cache_creation_input_tokens = 450
+        usage.cache_read_input_tokens = 50
+        mock_response.usage = usage
+        planner._client.messages.create = AsyncMock(return_value=mock_response)
+
+        assert planner._last_usage is None
+        await planner.create_plan("Hello world")
+        assert planner._last_usage is not None
+        assert planner._last_usage["input_tokens"] == 500
+        assert planner._last_usage["output_tokens"] == 120
+        assert planner._last_usage["cache_creation_input_tokens"] == 450
+        assert planner._last_usage["cache_read_input_tokens"] == 50
+
+    @pytest.mark.asyncio
+    async def test_last_usage_handles_missing_cache_fields(self, planner):
+        """Cache fields should be None when not present on usage object."""
+        plan_dict = _valid_plan_dict()
+        mock_response = _make_claude_response(plan_dict)
+        # Simulate an older API response without cache fields
+        usage = MagicMock(spec=[])
+        usage.input_tokens = 200
+        usage.output_tokens = 50
+        mock_response.usage = usage
+        planner._client.messages.create = AsyncMock(return_value=mock_response)
+
+        await planner.create_plan("Test")
+        assert planner._last_usage["input_tokens"] == 200
+        assert planner._last_usage["output_tokens"] == 50
+        # getattr with default None when attr doesn't exist
+        assert planner._last_usage["cache_creation_input_tokens"] is None
+        assert planner._last_usage["cache_read_input_tokens"] is None
 
 
 class TestAPIKeyLoading:
@@ -248,8 +294,8 @@ class TestAPIErrors:
         )
         with pytest.raises(PlannerError, match="Cannot connect"):
             await planner.create_plan("test")
-        # Should have been called twice (initial + 1 retry)
-        assert planner._client.messages.create.call_count == 2
+        # Should have been called 3 times (initial + 2 retries)
+        assert planner._client.messages.create.call_count == 3
 
     @pytest.mark.asyncio
     async def test_timeout_retries(self, planner):
@@ -260,7 +306,7 @@ class TestAPIErrors:
         )
         with pytest.raises(PlannerError, match="timed out"):
             await planner.create_plan("test")
-        assert planner._client.messages.create.call_count == 2
+        assert planner._client.messages.create.call_count == 3
 
     @pytest.mark.asyncio
     async def test_status_error_no_retry(self, planner):
@@ -300,7 +346,7 @@ class TestConversationHistoryInjection:
 
         call_kwargs = planner._client.messages.create.call_args.kwargs
         user_msg = call_kwargs["messages"][0]["content"]
-        assert "CONVERSATION HISTORY" in user_msg
+        assert "OPERATIONAL LOG" in user_msg
         assert "Turn 1" in user_msg
         assert "list files in /workspace/" in user_msg
         assert "adversarial escalation" in user_msg
@@ -316,17 +362,17 @@ class TestConversationHistoryInjection:
 
         call_kwargs = planner._client.messages.create.call_args.kwargs
         user_msg = call_kwargs["messages"][0]["content"]
-        assert "CONVERSATION HISTORY" not in user_msg
+        assert "OPERATIONAL LOG" not in user_msg
         assert user_msg == "User request: hello world"
 
     @pytest.mark.asyncio
     async def test_history_truncates_long_requests(self, planner):
-        """Request text in history should be truncated to 200 chars."""
+        """Request text in history should be truncated to 1000 chars."""
         plan_dict = _valid_plan_dict()
         mock_response = _make_claude_response(plan_dict)
         planner._client.messages.create = AsyncMock(return_value=mock_response)
 
-        long_request = "x" * 500
+        long_request = "x" * 1500
         history = [
             {"turn": 1, "request": long_request, "outcome": "success", "summary": ""},
         ]
@@ -334,9 +380,9 @@ class TestConversationHistoryInjection:
 
         call_kwargs = planner._client.messages.create.call_args.kwargs
         user_msg = call_kwargs["messages"][0]["content"]
-        # The long request should be truncated — not all 500 chars
+        # The long request should be truncated — not all 1500 chars
         assert long_request not in user_msg
-        assert "x" * 200 in user_msg
+        assert "x" * 1000 in user_msg
 
 
 class TestOutputFormatValidation:
@@ -380,3 +426,378 @@ class TestOutputFormatValidation:
 
             plan = await planner.create_plan(f"Test {fmt}")
             assert len(plan.steps) == 1
+
+
+class TestR13DecompositionGuidance:
+    """R13: Verify planner system prompt contains refined decomposition guidance."""
+
+    def test_prompt_contains_decomposition_triggers(self):
+        """System prompt includes explicit triggers for when to decompose."""
+        from sentinel.planner.planner import _PLANNER_SYSTEM_PROMPT_TEMPLATE
+        prompt_lower = _PLANNER_SYSTEM_PROMPT_TEMPLATE.lower()
+        assert "decompose" in prompt_lower
+        assert "multiple files" in prompt_lower
+        assert "multiple classes" in prompt_lower
+        assert "do not decompose" in prompt_lower
+
+    def test_prompt_contains_size_targeting(self):
+        """System prompt includes size targeting guidance (100-200 lines per step)."""
+        from sentinel.planner.planner import _PLANNER_SYSTEM_PROMPT_TEMPLATE
+        assert "100-200 lines" in _PLANNER_SYSTEM_PROMPT_TEMPLATE
+        assert "8192-token" in _PLANNER_SYSTEM_PROMPT_TEMPLATE
+
+    def test_prompt_contains_descriptive_variable_names(self):
+        """System prompt shows GOOD/BAD examples of descriptive variable naming."""
+        from sentinel.planner.planner import _PLANNER_SYSTEM_PROMPT_TEMPLATE
+        assert "$data_models" in _PLANNER_SYSTEM_PROMPT_TEMPLATE
+        assert "$api_routes" in _PLANNER_SYSTEM_PROMPT_TEMPLATE
+        assert "$step1_output" in _PLANNER_SYSTEM_PROMPT_TEMPLATE
+
+    def test_prompt_contains_decomposition_patterns(self):
+        """System prompt includes common decomposition patterns for reference."""
+        from sentinel.planner.planner import _PLANNER_SYSTEM_PROMPT_TEMPLATE
+        prompt_lower = _PLANNER_SYSTEM_PROMPT_TEMPLATE.lower()
+        assert "common pattern" in prompt_lower
+        assert "web app" in prompt_lower
+        assert "feature" in prompt_lower and "test" in prompt_lower
+
+    def test_prompt_contains_context_threading_guidance(self):
+        """System prompt includes guidance on how to thread context between steps."""
+        from sentinel.planner.planner import _PLANNER_SYSTEM_PROMPT_TEMPLATE
+        assert "input_vars" in _PLANNER_SYSTEM_PROMPT_TEMPLATE
+        assert "$var_name" in _PLANNER_SYSTEM_PROMPT_TEMPLATE
+
+    @pytest.mark.asyncio
+    async def test_complex_multifile_task_produces_multistep_plan(self, planner):
+        """A complex multi-file task should produce a multi-step plan.
+
+        This tests that the system prompt guidance is compatible with multi-step
+        plans by validating a plan that Claude *would* produce for a complex task.
+        """
+        # Simulate Claude returning a decomposed plan for a complex task
+        plan_dict = {
+            "plan_summary": "Build REST API with data models, routes, and tests",
+            "steps": [
+                {
+                    "id": "step_1",
+                    "type": "llm_task",
+                    "description": "Generate SQLAlchemy data models",
+                    "prompt": "Write SQLAlchemy models for User and Post...",
+                    "output_var": "$data_models",
+                    "expects_code": True,
+                    "output_format": "tagged",
+                },
+                {
+                    "id": "step_2",
+                    "type": "llm_task",
+                    "description": "Generate FastAPI route handlers",
+                    "prompt": "Using these data models: $data_models\nWrite FastAPI routes...",
+                    "output_var": "$api_routes",
+                    "expects_code": True,
+                    "input_vars": ["$data_models"],
+                    "output_format": "tagged",
+                },
+                {
+                    "id": "step_3",
+                    "type": "llm_task",
+                    "description": "Generate pytest test suite",
+                    "prompt": "Given models $data_models and routes $api_routes, write tests...",
+                    "output_var": "$test_suite",
+                    "expects_code": True,
+                    "input_vars": ["$data_models", "$api_routes"],
+                },
+            ],
+        }
+        mock_response = _make_claude_response(plan_dict)
+        planner._client.messages.create = AsyncMock(return_value=mock_response)
+
+        plan = await planner.create_plan(
+            "Build a REST API with User and Post models, CRUD routes, and a test suite"
+        )
+        assert len(plan.steps) == 3
+        # Verify descriptive variable names
+        var_names = [s.output_var for s in plan.steps if s.output_var]
+        assert "$data_models" in var_names
+        assert "$api_routes" in var_names
+        assert "$test_suite" in var_names
+        # Intermediate steps use tagged format
+        assert plan.steps[0].output_format == "tagged"
+        assert plan.steps[1].output_format == "tagged"
+        # Final step has no output_format constraint (displays to user)
+        assert plan.steps[2].output_format is None
+
+    @pytest.mark.asyncio
+    async def test_simple_task_produces_single_step_plan(self, planner):
+        """A simple short-output task should remain a single-step plan."""
+        plan_dict = {
+            "plan_summary": "Write a Python function to validate email addresses",
+            "steps": [
+                {
+                    "id": "step_1",
+                    "type": "llm_task",
+                    "description": "Generate email validation function",
+                    "prompt": "Write a Python function that validates email addresses...",
+                    "output_var": "$result",
+                    "expects_code": True,
+                }
+            ],
+        }
+        mock_response = _make_claude_response(plan_dict)
+        planner._client.messages.create = AsyncMock(return_value=mock_response)
+
+        plan = await planner.create_plan(
+            "Write a Python function to validate email addresses using regex"
+        )
+        assert len(plan.steps) == 1
+        assert plan.steps[0].type == "llm_task"
+
+    @pytest.mark.asyncio
+    async def test_decomposed_plan_uses_descriptive_var_names(self, planner):
+        """Variable names in decomposed plans should be descriptive, not ordinal.
+
+        This validates that a multi-step plan passes validation when using
+        descriptive $var_name references (the style the guidance promotes).
+        """
+        plan_dict = {
+            "plan_summary": "Generate a Flask app with config and tests",
+            "steps": [
+                {
+                    "id": "step_1",
+                    "type": "llm_task",
+                    "description": "Generate Flask app configuration",
+                    "prompt": "Write a Flask config module with dev/prod/test classes...",
+                    "output_var": "$config_module",
+                    "expects_code": True,
+                    "output_format": "tagged",
+                },
+                {
+                    "id": "step_2",
+                    "type": "llm_task",
+                    "description": "Generate Flask application factory",
+                    "prompt": "The config module is: $config_module\nWrite a Flask app factory...",
+                    "output_var": "$flask_app",
+                    "expects_code": True,
+                    "input_vars": ["$config_module"],
+                    "output_format": "tagged",
+                },
+                {
+                    "id": "step_3",
+                    "type": "llm_task",
+                    "description": "Generate test suite",
+                    "prompt": "Given config $config_module and app $flask_app, write tests...",
+                    "output_var": "$test_suite",
+                    "expects_code": True,
+                    "input_vars": ["$config_module", "$flask_app"],
+                },
+            ],
+        }
+        mock_response = _make_claude_response(plan_dict)
+        planner._client.messages.create = AsyncMock(return_value=mock_response)
+
+        plan = await planner.create_plan(
+            "Build a Flask app with config, application factory, and tests"
+        )
+        assert len(plan.steps) == 3
+        # All variable names should be descriptive (not generic ordinals)
+        for step in plan.steps:
+            if step.output_var:
+                # Should not match ordinal patterns like $step1_output, $result1
+                assert not step.output_var.startswith("$step"), \
+                    f"Variable {step.output_var} uses ordinal naming"
+                assert not any(c.isdigit() for c in step.output_var.lstrip("$")), \
+                    f"Variable {step.output_var} contains numbers (avoid ordinal naming)"
+        # Variable references should resolve correctly (validation passed)
+        assert plan.steps[1].input_vars == ["$config_module"]
+        assert plan.steps[2].input_vars == ["$config_module", "$flask_app"]
+
+
+class TestD5ConstraintPrompt:
+    """D5: Planner prompt includes constraint generation instructions."""
+
+    def test_prompt_contains_constraint_section(self):
+        from sentinel.planner.planner import _PLANNER_SYSTEM_PROMPT_TEMPLATE
+        assert "PLAN-POLICY CONSTRAINTS" in _PLANNER_SYSTEM_PROMPT_TEMPLATE
+
+    def test_prompt_mentions_allowed_commands(self):
+        from sentinel.planner.planner import _PLANNER_SYSTEM_PROMPT_TEMPLATE
+        assert "allowed_commands" in _PLANNER_SYSTEM_PROMPT_TEMPLATE
+
+    def test_prompt_mentions_allowed_paths(self):
+        from sentinel.planner.planner import _PLANNER_SYSTEM_PROMPT_TEMPLATE
+        assert "allowed_paths" in _PLANNER_SYSTEM_PROMPT_TEMPLATE
+
+    def test_prompt_mentions_workspace_requirement(self):
+        from sentinel.planner.planner import _PLANNER_SYSTEM_PROMPT_TEMPLATE
+        assert "/workspace/" in _PLANNER_SYSTEM_PROMPT_TEMPLATE
+
+    def test_prompt_mentions_static_denylist(self):
+        from sentinel.planner.planner import _PLANNER_SYSTEM_PROMPT_TEMPLATE
+        assert "denylist" in _PLANNER_SYSTEM_PROMPT_TEMPLATE.lower()
+
+    def test_allowed_commands_shows_base_names_only(self):
+        """GOOD example should show base command names, not full command strings."""
+        from sentinel.planner.planner import _PLANNER_SYSTEM_PROMPT_TEMPLATE
+        constraints_section = _PLANNER_SYSTEM_PROMPT_TEMPLATE[
+            _PLANNER_SYSTEM_PROMPT_TEMPLATE.index("<constraints>"):
+            _PLANNER_SYSTEM_PROMPT_TEMPLATE.index("</constraints>")
+        ]
+        # GOOD example should be base command names like ["find", "wc"]
+        assert '["find", "wc"]' in constraints_section
+        # The old incorrect GOOD example with full command string must be gone
+        assert 'GOOD: ["rm -rf /workspace/build-cache/*"]' not in constraints_section
+
+    def test_bad_example_shows_full_command_line_rejected(self):
+        """BAD example should show that full command lines with metacharacters are rejected."""
+        from sentinel.planner.planner import _PLANNER_SYSTEM_PROMPT_TEMPLATE
+        constraints_section = _PLANNER_SYSTEM_PROMPT_TEMPLATE[
+            _PLANNER_SYSTEM_PROMPT_TEMPLATE.index("<constraints>"):
+            _PLANNER_SYSTEM_PROMPT_TEMPLATE.index("</constraints>")
+        ]
+        assert "metacharacters blocked" in constraints_section.lower()
+
+    def test_constraint_examples_include_file_write_step(self):
+        """Constraints section includes a concrete file_write step example."""
+        from sentinel.planner.planner import _PLANNER_SYSTEM_PROMPT_TEMPLATE
+        constraints_section = _PLANNER_SYSTEM_PROMPT_TEMPLATE[
+            _PLANNER_SYSTEM_PROMPT_TEMPLATE.index("<constraints>"):
+            _PLANNER_SYSTEM_PROMPT_TEMPLATE.index("</constraints>")
+        ]
+        assert '"tool": "file_write"' in constraints_section
+        assert '"allowed_paths": ["/workspace/app.py"]' in constraints_section
+
+    def test_constraint_examples_include_shell_exec_step(self):
+        """Constraints section includes a concrete shell_exec step example."""
+        from sentinel.planner.planner import _PLANNER_SYSTEM_PROMPT_TEMPLATE
+        constraints_section = _PLANNER_SYSTEM_PROMPT_TEMPLATE[
+            _PLANNER_SYSTEM_PROMPT_TEMPLATE.index("<constraints>"):
+            _PLANNER_SYSTEM_PROMPT_TEMPLATE.index("</constraints>")
+        ]
+        assert '"tool": "shell_exec"' in constraints_section
+        assert '"allowed_commands": ["find"]' in constraints_section
+
+    def test_constraint_clarification_note(self):
+        """Constraints section explains that allowed_commands lists BASE command names."""
+        from sentinel.planner.planner import _PLANNER_SYSTEM_PROMPT_TEMPLATE
+        constraints_section = _PLANNER_SYSTEM_PROMPT_TEMPLATE[
+            _PLANNER_SYSTEM_PROMPT_TEMPLATE.index("<constraints>"):
+            _PLANNER_SYSTEM_PROMPT_TEMPLATE.index("</constraints>")
+        ]
+        # Should explain the distinction between base names and full command strings
+        assert "BASE command name" in constraints_section or "base command name" in constraints_section
+
+    def test_constraint_examples_pass_validator(self):
+        """The example constraint values in the prompt should pass validate_constraint_definitions."""
+        from sentinel.security.constraint_validator import validate_constraint_definitions
+        # file_write example
+        errors = validate_constraint_definitions(None, ["/workspace/app.py"])
+        assert errors == []
+        # shell_exec example
+        errors = validate_constraint_definitions(["find"], ["/workspace/src/"])
+        assert errors == []
+        # multi-step example
+        errors = validate_constraint_definitions(["python3"], ["/workspace/tests/"])
+        assert errors == []
+
+    def test_old_bad_example_would_fail_validator(self):
+        """The old GOOD example with full command strings should fail validation (metacharacters)."""
+        from sentinel.security.constraint_validator import validate_constraint_definitions
+        # The old example: ["rm -rf /workspace/build-cache/*"]
+        # While * isn't in the metachar set, piped commands like the BAD example are
+        errors = validate_constraint_definitions(
+            ["find /workspace/ -type f -name '*.py' | wc -l"], None,
+        )
+        assert len(errors) > 0
+        assert "metacharacter" in errors[0].lower()
+
+
+class TestD5EnrichedHistory:
+    """D5: constraint_result appears in enriched history format."""
+
+    def test_constraint_validated_in_history(self):
+        """Successful turns are one-liners (tiered history) — constraint detail
+        only appears on failed/blocked turns. Verify the header is present and
+        step detail is suppressed for successful outcomes."""
+        from sentinel.planner.planner import ClaudePlanner
+        planner = ClaudePlanner.__new__(ClaudePlanner)
+        history = [{
+            "turn": 1,
+            "request": "clean cache",
+            "outcome": "success",
+            "step_outcomes": [{
+                "step_type": "tool_call",
+                "status": "success",
+                "constraint_result": "validated",
+            }],
+        }]
+        result = planner._format_enriched_history(history)
+        # Successful turn: header line only, no step detail
+        assert "clean cache" in result
+        assert "success" in result
+        assert "constraint=validated" not in result  # step detail suppressed
+
+    def test_constraint_violation_in_history(self):
+        from sentinel.planner.planner import ClaudePlanner
+        planner = ClaudePlanner.__new__(ClaudePlanner)
+        history = [{
+            "turn": 1,
+            "request": "bad command",
+            "outcome": "blocked",
+            "step_outcomes": [{
+                "step_type": "tool_call",
+                "status": "blocked",
+                "constraint_result": "violation",
+                "scanner_result": "blocked",
+                "error_detail": "constraint violation",
+            }],
+        }]
+        result = planner._format_enriched_history(history)
+        assert "constraint=violation" in result
+
+
+class TestPlannerPromptStructure:
+    """Verify prompt_upgrade_v1 structural requirements."""
+
+    def test_prompt_has_xml_sections(self, planner):
+        """Prompt uses XML section tags for structural parsing."""
+        prompt = planner._build_system_prompt()
+        for tag in ["<role>", "<security_rules>", "<output_schema>",
+                     "<worker_llm>", "<plan_rules>", "<tools>", "<constraints>"]:
+            assert tag in prompt, f"Missing XML section: {tag}"
+
+    def test_security_rules_before_output_schema(self, planner):
+        """Security rules in high-attention position (before schema)."""
+        prompt = planner._build_system_prompt()
+        assert prompt.index("<security_rules>") < prompt.index("<output_schema>")
+
+    def test_constraints_at_end(self, planner):
+        """Constraints at end of prompt for U-shaped attention."""
+        prompt = planner._build_system_prompt()
+        assert prompt.index("<constraints>") > prompt.index("<tools>")
+
+    def test_prompt_requires_constraints_at_tl4(self, planner):
+        """TL4 MUST language present in constraints section."""
+        prompt = planner._build_system_prompt()
+        assert "MUST" in prompt[prompt.index("<constraints>"):]
+
+    def test_prompt_reinforces_valid_step_types(self, planner):
+        """Step types explicitly listed (fixes file_write step type bug)."""
+        prompt = planner._build_system_prompt()
+        assert '"llm_task"' in prompt
+        assert '"tool_call"' in prompt
+
+    def test_prompt_variable_ordering_rule(self, planner):
+        """Explicit rule about only referencing prior step variables."""
+        prompt = planner._build_system_prompt()
+        assert "prior step" in prompt.lower() or "previous step" in prompt.lower()
+
+    def test_no_removed_content(self, planner):
+        """Key functional content preserved from current prompt."""
+        prompt = planner._build_system_prompt()
+        # Language safety rule (verbatim requirement from design)
+        assert "Chinese-trained" in prompt or "Qwen" in prompt
+        # Post-data reminder pattern
+        assert "REMINDER:" in prompt
+        # Workspace constraint
+        assert "/workspace/" in prompt
+        # Tool descriptions placeholder was filled
+        assert "{tool_descriptions}" not in prompt

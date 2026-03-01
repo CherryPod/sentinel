@@ -6,12 +6,12 @@ the event bus.
 """
 
 import asyncio
-import hmac
 import json
 import logging
 from collections.abc import AsyncIterator
 from datetime import datetime, timezone
 
+from sentinel.api.auth import PinVerifier
 from sentinel.channels.base import Channel, IncomingMessage, OutgoingMessage
 from sentinel.core.bus import EventBus
 
@@ -22,9 +22,9 @@ class WebSocketChannel(Channel):
     """Wraps a FastAPI WebSocket connection with PIN-based authentication."""
     channel_type = "websocket"
 
-    def __init__(self, websocket, pin_getter, failure_tracker):
+    def __init__(self, websocket, pin_verifier_getter, failure_tracker):
         self._ws = websocket
-        self._pin_getter = pin_getter
+        self._pin_verifier_getter = pin_verifier_getter
         self._failure_tracker = failure_tracker
         self._remote = "unknown"
         if websocket.client:
@@ -45,10 +45,10 @@ class WebSocketChannel(Channel):
         Expects: {"type": "auth", "pin": "1234"}
         Responds: {"type": "auth_ok"} or closes with 4001
         """
-        pin = self._pin_getter()
+        verifier = self._pin_verifier_getter()
 
         # No PIN configured — auto-authenticate
-        if pin is None:
+        if verifier is None:
             await self._ws.send_json({"type": "auth_ok"})
             return True
 
@@ -72,7 +72,7 @@ class WebSocketChannel(Channel):
             await self._ws.close(code=4001, reason="Expected auth message")
             return False
 
-        if not hmac.compare_digest(msg["pin"].encode(), pin.encode()):
+        if not verifier.verify(msg["pin"]):
             self._failure_tracker.record_failure(self._remote)
             logger.warning(
                 "WebSocket PIN auth failed",

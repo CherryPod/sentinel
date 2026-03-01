@@ -53,6 +53,9 @@ class EmbeddingClient(EmbeddingBase):
             "input": texts,
         }
 
+        # K-002: Creates a new httpx.AsyncClient per request. This is intentional —
+        # the Ollama server is on an internal network with sub-1ms latency, and
+        # a persistent client would need lifecycle management across async contexts.
         last_error: Exception | None = None
         for attempt in range(2):  # initial + 1 retry
             try:

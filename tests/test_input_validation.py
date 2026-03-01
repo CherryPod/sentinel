@@ -246,6 +246,7 @@ class TestPipelinePromptLengthGate:
     async def test_within_limit_passes(self, mock_settings, pipeline):
         """Combined length under 100K should not be blocked by the length gate."""
         mock_settings.prompt_guard_enabled = False
+        mock_settings.baseline_mode = False
         mock_settings.spotlighting_enabled = True
         mock_settings.ollama_model = "qwen3:14b"
 
@@ -261,6 +262,7 @@ class TestPipelinePromptLengthGate:
     async def test_exactly_at_limit_passes(self, mock_settings, pipeline):
         """Exactly 100,000 chars combined should pass (limit is >100K, not >=)."""
         mock_settings.prompt_guard_enabled = False
+        mock_settings.baseline_mode = False
         mock_settings.spotlighting_enabled = False
         mock_settings.ollama_model = "qwen3:14b"
 

@@ -1,0 +1,16 @@
+rules:
+- id: path-traversal-file
+  patterns:
+      - pattern: new File($X)
+      - pattern-not: new File("...")
+  message: >-
+    File object created with non-literal path. Validate and canonicalize
+    the path to prevent directory traversal attacks.
+  metadata:
+    cwe:
+    - 'CWE-22: Improper Limitation of a Pathname to a Restricted Directory (Path Traversal)'
+    cwe_id: CWE-22
+    prescan_regex: new File\(
+  severity: WARNING
+  languages:
+  - java

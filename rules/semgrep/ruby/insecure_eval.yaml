@@ -1,0 +1,16 @@
+rules:
+- id: insecure-eval
+  patterns:
+      - pattern: eval($X)
+      - pattern-not: eval("...")
+  message: >-
+    eval() executes arbitrary Ruby code. Avoid using eval with
+    user-controlled input.
+  metadata:
+    cwe:
+    - 'CWE-94: Improper Control of Generation of Code (Code Injection)'
+    cwe_id: CWE-94
+    prescan_regex: eval\(
+  severity: WARNING
+  languages:
+  - ruby

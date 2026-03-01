@@ -41,7 +41,7 @@ def create_mcp_server(orchestrator, memory_store, embedding_client, event_bus) -
         # Clamp k to prevent unbounded result sets
         k = min(k, 100)
 
-        if memory_store is None or memory_store._db is None:
+        if memory_store is None or memory_store.db is None:
             return json.dumps({"status": "error", "reason": "Memory system not initialized"})
 
         # Import here to avoid circular imports at module level
@@ -55,7 +55,7 @@ def create_mcp_server(orchestrator, memory_store, embedding_client, event_bus) -
                 pass  # graceful degradation to FTS5-only
 
         results = hybrid_search(
-            db=memory_store._db,
+            db=memory_store.db,
             query=query,
             embedding=query_embedding,
             k=k,

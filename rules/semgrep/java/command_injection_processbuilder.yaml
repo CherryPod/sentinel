@@ -1,0 +1,17 @@
+rules:
+- id: command-injection-processbuilder
+  patterns:
+      - pattern: new ProcessBuilder($X)
+      - pattern-not: new ProcessBuilder("...")
+      - pattern-not: new ProcessBuilder(java.util.Arrays.asList("...", ...))
+  message: >-
+    ProcessBuilder with non-literal command argument. Ensure command
+    arguments are not user-controlled to prevent command injection.
+  metadata:
+    cwe:
+    - 'CWE-78: Improper Neutralization of Special Elements used in an OS Command (OS Command Injection)'
+    cwe_id: CWE-78
+    prescan_regex: ProcessBuilder
+  severity: WARNING
+  languages:
+  - java

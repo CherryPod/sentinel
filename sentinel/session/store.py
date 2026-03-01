@@ -22,6 +22,9 @@ class ConversationTurn:
     risk_score: float = 0.0
     timestamp: str = field(default_factory=_now_iso)
     plan_summary: str = ""           # What this turn did (for conversation history)
+    auto_approved: bool = False      # True if plan was auto-approved at TL1+
+    elapsed_s: float | None = None   # Task processing time in seconds
+    step_outcomes: list[dict] | None = None  # F1: per-step metadata
 
 
 @dataclass
@@ -32,6 +35,7 @@ class Session:
     cumulative_risk: float = 0.0
     violation_count: int = 0
     is_locked: bool = False
+    task_in_progress: bool = False      # F2: interrupted task detection
     created_at: str = field(default_factory=_now_iso)
     last_active: str = field(default_factory=_now_iso)
     _db: sqlite3.Connection | None = field(default=None, repr=False)
@@ -45,8 +49,9 @@ class Session:
         if self._db is not None:
             self._db.execute(
                 "INSERT INTO conversation_turns "
-                "(session_id, request_text, result_status, blocked_by, risk_score, plan_summary) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
+                "(session_id, request_text, result_status, blocked_by, risk_score, "
+                "plan_summary, auto_approved, elapsed_s, step_outcomes) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     self.session_id,
                     turn.request_text,
@@ -54,6 +59,9 @@ class Session:
                     json.dumps(turn.blocked_by),
                     turn.risk_score,
                     turn.plan_summary,
+                    int(turn.auto_approved),
+                    turn.elapsed_s,
+                    json.dumps(turn.step_outcomes) if turn.step_outcomes is not None else None,
                 ),
             )
             self._db.execute(
@@ -81,6 +89,16 @@ class Session:
             )
             self._db.commit()
 
+    def set_task_in_progress(self, value: bool) -> None:
+        """Set the task-in-progress flag (persisted to DB)."""
+        self.task_in_progress = value
+        if self._db is not None:
+            self._db.execute(
+                "UPDATE sessions SET task_in_progress = ? WHERE session_id = ?",
+                (int(value), self.session_id),
+            )
+            self._db.commit()
+
 
 class SessionStore:
     """SQLite-backed session store with TTL eviction.
@@ -97,9 +115,26 @@ class SessionStore:
         self._db = db
         self._ttl = ttl if ttl is not None else settings.session_ttl
         self._max_count = max_count if max_count is not None else settings.session_max_count
+        self._settings = settings  # F2: for per-channel TTL lookup
 
         # In-memory fallback for tests that don't pass a db
         self._sessions: dict[str, Session] | None = None if db is not None else {}
+
+    def _get_channel_ttl(self, source: str) -> int:
+        """Get the TTL for a given channel/source type.
+
+        Maps source strings to per-channel timeout settings.
+        Falls back to the default session_ttl for unknown channels.
+        """
+        channel_map = {
+            "signal": self._settings.session_ttl_signal,
+            "websocket": self._settings.session_ttl_websocket,
+            "ws": self._settings.session_ttl_websocket,
+            "api": self._settings.session_ttl_api,
+            "mcp": self._settings.session_ttl_mcp,
+            "routine": self._settings.session_ttl_routine,
+        }
+        return channel_map.get(source, self._ttl)
 
     def get_or_create(self, session_id: str | None, source: str = "") -> Session:
         """Get an existing session or create a new one."""
@@ -130,7 +165,7 @@ class SessionStore:
 
         row = self._db.execute(
             "SELECT session_id, source, cumulative_risk, violation_count, is_locked, "
-            "created_at, last_active FROM sessions WHERE session_id = ?",
+            "created_at, last_active, task_in_progress FROM sessions WHERE session_id = ?",
             (session_id,),
         ).fetchone()
 
@@ -164,39 +199,45 @@ class SessionStore:
     def _get_sql(self, session_id: str) -> Session | None:
         row = self._db.execute(
             "SELECT session_id, source, cumulative_risk, violation_count, is_locked, "
-            "created_at, last_active FROM sessions WHERE session_id = ?",
+            "created_at, last_active, task_in_progress FROM sessions WHERE session_id = ?",
             (session_id,),
         ).fetchone()
         if row is None:
             return None
 
-        # Check TTL
-        is_expired = self._db.execute(
-            "SELECT ? < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?)",
-            (row[6], f"-{self._ttl} seconds"),
-        ).fetchone()[0]
-        if is_expired:
-            self._db.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
-            self._db.commit()
-            return None
+        # Per-channel TTL check (Python-side for channel-specific TTLs)
+        source = row[1]
+        ttl = self._get_channel_ttl(source)
+        if ttl > 0:
+            is_expired = self._db.execute(
+                "SELECT ? < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?)",
+                (row[6], f"-{ttl} seconds"),
+            ).fetchone()[0]
+            if is_expired:
+                self._db.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
+                self._db.commit()
+                return None
 
         return self._row_to_session(row)
 
     def _row_to_session(self, row, last_active_override: str | None = None) -> Session:
-        sid, source, cum_risk, viol_count, is_locked, created_at, last_active = row
+        sid, source, cum_risk, viol_count, is_locked, created_at, last_active, task_in_prog = row
         session = Session(
             session_id=sid,
             source=source,
             cumulative_risk=cum_risk,
             violation_count=viol_count,
             is_locked=bool(is_locked),
+            task_in_progress=bool(task_in_prog),
             created_at=created_at,
             last_active=last_active_override or last_active,
             _db=self._db,
         )
-        # Load turns from db
+        # J-003: Loads all turns — needed for ConversationAnalyzer which checks
+        # the full session history (retry detection, escalation, violation count).
+        # Pagination would break multi-turn attack detection.
         turn_rows = self._db.execute(
-            "SELECT request_text, result_status, blocked_by, risk_score, plan_summary, created_at "
+            "SELECT request_text, result_status, blocked_by, risk_score, plan_summary, created_at, step_outcomes "
             "FROM conversation_turns WHERE session_id = ? ORDER BY id",
             (sid,),
         ).fetchall()
@@ -208,6 +249,7 @@ class SessionStore:
                 risk_score=tr[3],
                 plan_summary=tr[4],
                 timestamp=tr[5],
+                step_outcomes=json.loads(tr[6]) if tr[6] else None,
             ))
         return session
 
@@ -260,11 +302,15 @@ class SessionStore:
         session = self._sessions.get(session_id)
         if session is None:
             return None
-        # TTL check using ISO timestamps
+        # Per-channel TTL check using ISO timestamps
+        ttl = self._get_channel_ttl(session.source)
+        if ttl == 0:
+            # TTL=0 means never expires (e.g. routine sessions)
+            return session
         now = datetime.now(timezone.utc)
         try:
             last = datetime.fromisoformat(session.last_active.replace("Z", "+00:00"))
-            if (now - last).total_seconds() > self._ttl:
+            if (now - last).total_seconds() > ttl:
                 del self._sessions[session_id]
                 return None
         except (ValueError, AttributeError):
@@ -275,9 +321,13 @@ class SessionStore:
         now = datetime.now(timezone.utc)
         expired = []
         for sid, s in self._sessions.items():
+            ttl = self._get_channel_ttl(s.source)
+            if ttl == 0:
+                # TTL=0 means never expires (e.g. routine sessions)
+                continue
             try:
                 last = datetime.fromisoformat(s.last_active.replace("Z", "+00:00"))
-                if (now - last).total_seconds() > self._ttl:
+                if (now - last).total_seconds() > ttl:
                     expired.append(sid)
             except (ValueError, AttributeError):
                 continue

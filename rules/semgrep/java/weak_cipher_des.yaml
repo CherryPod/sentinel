@@ -1,0 +1,18 @@
+rules:
+- id: weak-cipher-des
+  pattern-either:
+      - pattern: Cipher.getInstance("DES")
+      - pattern: Cipher.getInstance("DES/...")
+      - pattern: Cipher.getInstance("DESede")
+      - pattern: Cipher.getInstance("DESede/...")
+  message: >-
+    DES and 3DES are cryptographically weak. Use AES with at least
+    128-bit keys instead.
+  metadata:
+    cwe:
+    - 'CWE-327: Use of a Broken or Risky Cryptographic Algorithm'
+    cwe_id: CWE-327
+    prescan_regex: Cipher\.getInstance
+  severity: WARNING
+  languages:
+  - java
