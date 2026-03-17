@@ -2,9 +2,25 @@
   <img src="ui/social-preview.png" alt="Sentinel — Defence-in-depth AI assistant" width="800">
 </p>
 
+<p align="center">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache_2.0-blue.svg" alt="License"></a>
+  <a href="https://python.org"><img src="https://img.shields.io/badge/Python-3.12-green.svg" alt="Python"></a>
+  <a href="#running-tests"><img src="https://img.shields.io/badge/Tests-4%2C197%2B_passing-brightgreen.svg" alt="Tests"></a>
+  <a href="https://fastapi.tiangolo.com"><img src="https://img.shields.io/badge/FastAPI-0.115-009688.svg" alt="FastAPI"></a>
+  <a href="#security-model"><img src="https://img.shields.io/badge/Red_Team-0_breaches-critical.svg" alt="Red Team"></a>
+</p>
+
 # Sentinel
 
 A defence-in-depth AI assistant built on the [CaMeL architecture](https://arxiv.org/abs/2503.18813). A frontier model (Claude) plans tasks, an air-gapped local LLM (Qwen) executes them, and a Python security gateway enforces 10 layers of scanning between every step. The worker LLM is assumed compromised at all times — it only receives text and returns text, and every output is scanned before the system acts on it.
+
+## Why This Exists
+
+The AI assistant space is growing fast — but security hasn't kept pace. Most agent frameworks give their LLM full tool access and hope for the best. One prompt injection, one manipulated API response, and your agent is exfiltrating data, deleting files, or running malicious code.
+
+Sentinel takes a different approach: **assume the worker LLM is already compromised**. Inspired by the [CaMeL paper](https://arxiv.org/abs/2503.18813) from Google DeepMind, it separates planning from execution, air-gaps the worker, and enforces 10 layers of security scanning between every step. The result is an AI assistant that's useful *and* resistant to the attacks that make most agent frameworks dangerous.
+
+Read the build story at [cherrypod-sentinel.duckdns.org](https://cherrypod-sentinel.duckdns.org/) — from physical security to AI security, one layer at a time.
 
 ## What Makes This Different
 
@@ -217,7 +233,7 @@ bash scripts/smoke_test.sh
 
 <details>
 <summary>Chat interface</summary>
-<img src="screenshots/chat_empty.png" alt="Chat" width="800">
+<img src="screenshots/chat.png" alt="Chat" width="800">
 </details>
 
 <details>
