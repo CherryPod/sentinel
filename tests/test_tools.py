@@ -245,7 +245,8 @@ class TestFileRead:
                 )
                 tagged, exec_meta = await executor.execute("file_read", {"path": path})
                 assert tagged.content == "file contents"
-                assert tagged.trust_level == TrustLevel.TRUSTED
+                # Files without provenance default to UNTRUSTED (trust laundering fix)
+                assert tagged.trust_level == TrustLevel.UNTRUSTED
         finally:
             os.unlink(path)
 

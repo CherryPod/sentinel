@@ -1,9 +1,10 @@
 """Template dataclass and registry for the fast-path router.
 
 Templates define single-tool (or chained-tool) operations that can bypass
-the Claude planner when the classifier determines the user request is simple
-enough. The TemplateRegistry holds all available templates and generates
-the classifier prompt used by Qwen to match user input to a template.
+the Claude planner. Each template is an execution contract: which tool(s)
+to call, what params are required, and whether confirmation is needed.
+The keyword classifier handles intent recognition; templates handle
+execution constraints.
 """
 
 from __future__ import annotations
@@ -13,25 +14,25 @@ from dataclasses import dataclass, field
 
 @dataclass(frozen=True)
 class Template:
-    """A fast-path template mapping a user intent to one or more tool calls.
+    """A fast-path execution contract mapping a template name to tool call(s).
 
     Attributes:
         name: Unique identifier for this template (e.g. "calendar_add").
-        description: Human-readable description used in classifier prompts.
+        description: Human-readable label for logs and debugging.
         tool: Tool name, or "+" delimited chain (e.g. "email_search+email_read").
         required_params: Params that must be present for the template to match.
         optional_params: Params that may be extracted but are not required.
         param_aliases: Maps alternative param names to canonical names
             (e.g. {"title": "summary"}).
         side_effect: True if the tool mutates state (send, create, delete).
-        requires_confirmation: Stub for future confirmation gate.
+        requires_confirmation: True if user must confirm before execution.
         source_is_user: True if the content originates from the user (not
             external data). Affects trust classification.
     """
 
     name: str
-    description: str
     tool: str
+    description: str = ""
     required_params: list[str] = field(default_factory=list)
     optional_params: list[str] = field(default_factory=list)
     param_aliases: dict[str, str] = field(default_factory=dict)
@@ -119,8 +120,7 @@ class Template:
 class TemplateRegistry:
     """Registry of available fast-path templates.
 
-    Provides lookup by name and generates classifier prompts from
-    the registered template set.
+    Provides lookup by name for the fast-path executor.
     """
 
     def __init__(self) -> None:
@@ -139,10 +139,10 @@ class TemplateRegistry:
         return list(self._templates.keys())
 
     def build_classifier_prompt(self) -> str:
-        """Generate a prompt listing all templates for the classifier.
+        """Generate a prompt listing templates for the Qwen classifier.
 
-        The classifier (Qwen) uses this prompt to decide whether a user
-        message matches a known template and to extract its parameters.
+        Legacy — retained for the Qwen Classifier (sentinel/router/classifier.py)
+        which is kept as a fallback. The active keyword classifier does not use this.
         """
         if not self._templates:
             return ""
@@ -162,7 +162,7 @@ class TemplateRegistry:
 
     @classmethod
     def default(cls) -> TemplateRegistry:
-        """Return a registry pre-loaded with the 9 day-one templates."""
+        """Return a registry pre-loaded with the 9 active fast-path templates."""
         registry = cls()
 
         templates = [
@@ -211,6 +211,16 @@ class TemplateRegistry:
                 optional_params=["count"],
             ),
             Template(
+                name="email_send",
+                description="Send or draft an email",
+                tool="email_send",
+                required_params=["recipient", "subject", "body"],
+                param_aliases={"to": "recipient"},
+                side_effect=True,
+                requires_confirmation=True,
+                source_is_user=True,
+            ),
+            Template(
                 name="signal_send",
                 description="Send a message via Signal",
                 tool="signal_send",
@@ -232,12 +242,16 @@ class TemplateRegistry:
                 requires_confirmation=True,
                 source_is_user=True,
             ),
-            Template(
-                name="memory_search",
-                description="Search stored memories",
-                tool="memory_search",
-                required_params=["query"],
-            ),
+            # memory_search: tool exists in planner safe_tools but is not
+            # wired into the ToolExecutor for fast-path use. Commented out
+            # to prevent fast-path "Unknown tool" errors. Re-enable when
+            # the tool is available on the fast path.
+            # Template(
+            #     name="memory_search",
+            #     description="Search stored memories",
+            #     tool="memory_search",
+            #     required_params=["query"],
+            # ),
         ]
 
         for t in templates:

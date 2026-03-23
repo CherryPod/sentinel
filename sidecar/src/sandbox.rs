@@ -184,12 +184,13 @@ fn execute_wasm_sync(
     timeout_ms: u64,
     active_children: Arc<std::sync::Mutex<HashSet<u32>>>,
 ) -> Result<(String, u64)> {
-    // Create WASI context with stdin (args) and captured stdout
-    let stdin_data = args_json.as_bytes().to_vec();
+    // Create WASI context with args as env var SENTINEL_TOOL_ARGS.
+    // Stdin is NOT used — MemoryInputPipe (p2) doesn't signal EOF in p1
+    // compat mode, causing read_to_string/read to block indefinitely.
     let stdout_buf = MemoryOutputPipe::new(config.stdout_max_bytes);
 
     let wasi_ctx = WasiCtxBuilder::new()
-        .stdin(MemoryInputPipe::new(stdin_data))
+        .env("SENTINEL_TOOL_ARGS", args_json)
         .stdout(stdout_buf.clone())
         // 64 KiB stderr buffer — intentionally small; stderr is diagnostic only
         .stderr(MemoryOutputPipe::new(64 * 1024))
@@ -251,12 +252,19 @@ fn execute_wasm_sync(
 
     // Start epoch ticker thread for timeout enforcement.
     // 500ms epoch tick — fast enough for responsive timeouts, low enough overhead.
+    // Uses an atomic flag so the ticker stops when WASM execution completes,
+    // rather than blocking on join() for the full timeout duration.
     let engine_clone = engine.clone();
     let epoch_interval_ms = 500u64;
     let total_epochs = (timeout_ms + epoch_interval_ms - 1) / epoch_interval_ms;
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let done_clone = done.clone();
     let ticker = std::thread::spawn(move || {
         for _ in 0..total_epochs {
             std::thread::sleep(std::time::Duration::from_millis(epoch_interval_ms));
+            if done_clone.load(std::sync::atomic::Ordering::Relaxed) {
+                return; // WASM finished, stop ticking
+            }
             engine_clone.increment_epoch();
         }
     });
@@ -272,23 +280,36 @@ fn execute_wasm_sync(
 
     let exec_result = start.call(&mut store, ());
 
+    // Signal the ticker thread to stop
+    done.store(true, std::sync::atomic::Ordering::Relaxed);
+
     // O-006: Log if ticker thread panicked instead of silently ignoring
     if let Err(e) = ticker.join() {
         eprintln!("epoch ticker thread panicked: {:?}", e);
     }
 
-    // Check execution result
+    // Check execution result. In WASI preview 1, proc_exit() always causes
+    // a trap — exit code 0 is normal completion, non-zero is an error.
     match exec_result {
         Ok(()) => {}
         Err(e) => {
-            // Check if it was a fuel exhaustion or epoch interrupt
-            let msg = e.to_string();
-            if msg.contains("fuel") {
-                bail!("fuel exhausted: tool exceeded instruction budget ({max_fuel} fuel units)");
-            } else if msg.contains("epoch") {
-                bail!("timeout: tool exceeded {timeout_ms}ms deadline");
+            // Check for WASI proc_exit (normal termination in WASI p1)
+            if let Some(exit) = e.downcast_ref::<wasmtime_wasi::I32Exit>() {
+                if exit.0 == 0 {
+                    // Clean exit — treat as success
+                } else {
+                    bail!("tool exited with code {}", exit.0);
+                }
             } else {
-                bail!("WASM trap: {e}");
+                // Check if it was a fuel exhaustion or epoch interrupt
+                let msg = e.to_string();
+                if msg.contains("fuel") {
+                    bail!("fuel exhausted: tool exceeded instruction budget ({max_fuel} fuel units)");
+                } else if msg.contains("epoch") {
+                    bail!("timeout: tool exceeded {timeout_ms}ms deadline");
+                } else {
+                    bail!("WASM trap: {e}");
+                }
             }
         }
     }

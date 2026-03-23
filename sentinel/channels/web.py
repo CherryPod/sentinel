@@ -22,7 +22,7 @@ class WebSocketChannel(Channel):
     """Wraps a FastAPI WebSocket connection with PIN-based authentication."""
     channel_type = "websocket"
     _MAX_MESSAGE_LENGTH = 10_000  # matches MCP input limit
-    _IDLE_TIMEOUT = 300.0  # BH3-017: 5 min idle timeout for receive
+    _IDLE_TIMEOUT = 600.0  # BH3-017: 10 min idle timeout (raised for Opus planner latency)
 
     def __init__(self, websocket, pin_verifier_getter, failure_tracker):
         self._ws = websocket

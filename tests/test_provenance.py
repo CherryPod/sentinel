@@ -168,7 +168,9 @@ class TestFileProvenance:
     async def test_record_and_retrieve(self):
         tagged = await create_tagged_data("written", DataSource.TOOL, TrustLevel.TRUSTED)
         await record_file_write("/workspace/test.txt", tagged.id)
-        assert await get_file_writer("/workspace/test.txt") == tagged.id
+        result = await get_file_writer("/workspace/test.txt")
+        assert result is not None
+        assert result[0] == tagged.id
 
     async def test_unknown_file_returns_none(self):
         assert await get_file_writer("/workspace/unknown.txt") is None
@@ -178,7 +180,9 @@ class TestFileProvenance:
         t2 = await create_tagged_data("second", DataSource.TOOL, TrustLevel.TRUSTED)
         await record_file_write("/workspace/out.txt", t1.id)
         await record_file_write("/workspace/out.txt", t2.id)
-        assert await get_file_writer("/workspace/out.txt") == t2.id
+        result = await get_file_writer("/workspace/out.txt")
+        assert result is not None
+        assert result[0] == t2.id
 
     async def test_reset_clears_file_provenance(self):
         tagged = await create_tagged_data("data", DataSource.TOOL, TrustLevel.TRUSTED)
@@ -211,8 +215,9 @@ class TestFileProvenance:
         await record_file_write("/workspace/payload.sh", write_result.id)
 
         # Now simulate file_read with provenance inheritance
-        writer_id = await get_file_writer("/workspace/payload.sh")
-        assert writer_id is not None
+        writer_info = await get_file_writer("/workspace/payload.sh")
+        assert writer_info is not None
+        writer_id = writer_info[0]
         writer_data = await get_tagged_data(writer_id)
         assert writer_data is not None
 
@@ -370,7 +375,8 @@ class TestFileProvenanceUserScoping:
             )
             await store.record_file_write("/workspace/test.txt", tagged.id)
             writer = await store.get_file_writer("/workspace/test.txt", user_id=42)
-            assert writer == tagged.id
+            assert writer is not None
+            assert writer[0] == tagged.id
         finally:
             current_user_id.reset(token)
 

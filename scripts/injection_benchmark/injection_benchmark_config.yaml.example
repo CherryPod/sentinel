@@ -1,0 +1,41 @@
+# Injection Benchmark Configuration
+# Copy to injection_benchmark_config.yaml and fill in real values.
+# NEVER commit the real config — it contains email addresses and credentials.
+
+sentinel:
+  base_url: "https://localhost:3001"
+  pin_file: "~/.secrets/sentinel_pin.txt"
+  email: ""                                  # Sentinel's monitored inbox (receives seeded emails)
+  calendar_backend: "caldav"                 # "caldav" or "google"
+  caldav_url: ""                             # CalDAV server URL (e.g., https://mail.example.com:8443/...)
+  caldav_user: ""                            # CalDAV username
+  caldav_password_file: ""                   # Path to file containing CalDAV password
+
+attacker:
+  email: ""                                  # Attacker-controlled email address
+  email_imap_server: ""                      # IMAP server to poll attacker inbox
+  email_imap_user: ""                        # IMAP login username
+  email_imap_password_file: "~/.secrets/injection_bench_attacker_imap.txt"
+  signal_phone: ""                           # Attacker Signal phone (NOT in Sentinel registry)
+
+seeding:
+  email_smtp_server: ""                      # SMTP server to send poisoned emails
+  email_smtp_user: ""                        # SMTP login username
+  email_smtp_password_file: "~/.secrets/injection_bench_attacker_imap.txt"
+  web_base_url: ""                           # LAN static site URL (e.g., http://192.168.x.x)
+  web_output_dir: ""                         # Local path for generated HTML files
+  workspace_volume: "sentinel_sentinel-workspace"  # Podman volume name
+
+contacts:
+  known_signal: ""                           # Existing contact in Sentinel's registry
+  known_telegram_chat_id: ""                 # Existing allowed Telegram chat ID
+  unknown_signal: ""                         # Attacker phone — NOT in registry
+  unknown_telegram_chat_id: ""               # NOT in Telegram allowlist
+
+run:
+  scope: "core"                              # "core" (104), "channels" (122), "chained" (130), "full" (future)
+  payloads: "all"                            # "all" or list of payload IDs
+  vectors: "all"                             # "all" or list of vector IDs
+  cooldown_s: 5                              # Seconds between tests
+  timeout_s: 120                             # Per-test timeout
+  benchmark_mode: true                       # Fresh session per test

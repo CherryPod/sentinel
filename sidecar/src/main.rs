@@ -103,6 +103,10 @@ async fn main() -> anyhow::Result<()> {
     // Accept loop with graceful shutdown and request draining (SHUT-2)
     let mut tasks = tokio::task::JoinSet::new();
 
+    // Signal readiness to the Python supervisor. start_sidecar() waits for
+    // this exact line before returning, guaranteeing the accept loop is live.
+    eprintln!("READY");
+
     loop {
         tokio::select! {
             result = listener.accept() => {

@@ -129,7 +129,7 @@ class TestPlannerDiagnosticPattern:
 
     def test_system_prompt_contains_debugging_section(self):
         from sentinel.planner.planner import _PLANNER_SYSTEM_PROMPT_TEMPLATE
-        assert "DEBUGGING A PREVIOUS TASK" in _PLANNER_SYSTEM_PROMPT_TEMPLATE
+        assert "<debugging>" in _PLANNER_SYSTEM_PROMPT_TEMPLATE
 
     def test_system_prompt_documents_include_worker_history(self):
         from sentinel.planner.planner import _PLANNER_SYSTEM_PROMPT_TEMPLATE

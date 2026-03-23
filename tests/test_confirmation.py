@@ -26,9 +26,9 @@ class TestConfirmationGateCreate:
             channel="signal",
             source_key="signal:abc-123",
             tool_name="signal_send",
-            tool_params={"message": "hello", "recipient": "alice"},
-            preview_text="Send via Signal to Alice: hello",
-            original_request="tell alice hello on signal",
+            tool_params={"message": "hello", "recipient": "keith"},
+            preview_text="Send via Signal to Keith: hello",
+            original_request="tell keith hello on signal",
             task_id="task-001",
         )
         assert isinstance(cid, str)
@@ -103,7 +103,7 @@ class TestConfirmationGateConfirm:
         cid = await gate.create(
             user_id=1, channel="signal", source_key="signal:abc",
             tool_name="signal_send",
-            tool_params={"message": "hello", "recipient": "alice"},
+            tool_params={"message": "hello", "recipient": "keith"},
             preview_text="preview", original_request="request",
             task_id="task-006",
         )
@@ -111,7 +111,7 @@ class TestConfirmationGateConfirm:
         assert entry is not None
         assert entry.status == "confirmed"
         assert entry.tool_name == "signal_send"
-        assert entry.tool_params == {"message": "hello", "recipient": "alice"}
+        assert entry.tool_params == {"message": "hello", "recipient": "keith"}
 
     async def test_confirm_clears_pending(self):
         gate = ConfirmationGate(pool=None, timeout=600)

@@ -1,78 +1,138 @@
-<p align="center">
-  <img src="ui/social-preview.png" alt="Sentinel — Defence-in-depth AI assistant" width="800">
-</p>
-
-<p align="center">
-  <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache_2.0-blue.svg" alt="License"></a>
-  <a href="https://python.org"><img src="https://img.shields.io/badge/Python-3.12-green.svg" alt="Python"></a>
-  <a href="#running-tests"><img src="https://img.shields.io/badge/Tests-4%2C197%2B_passing-brightgreen.svg" alt="Tests"></a>
-  <a href="https://fastapi.tiangolo.com"><img src="https://img.shields.io/badge/FastAPI-0.115-009688.svg" alt="FastAPI"></a>
-  <a href="#security-model"><img src="https://img.shields.io/badge/Red_Team-0_breaches-critical.svg" alt="Red Team"></a>
-</p>
-
 # Sentinel
 
-A defence-in-depth AI assistant built on the [CaMeL architecture](https://arxiv.org/abs/2503.18813). A frontier model (Claude) plans tasks, an air-gapped local LLM (Qwen) executes them, and a Python security gateway enforces 10 layers of scanning between every step. The worker LLM is assumed compromised at all times — it only receives text and returns text, and every output is scanned before the system acts on it.
+A defence-in-depth AI assistant built on the [CaMeL architecture](https://arxiv.org/abs/2503.18813). A frontier model (Claude) plans tasks, an air-gapped local LLM (Qwen 3) executes them, and a Python/FastAPI controller enforces 10 layers of security scanning between every step. The worker LLM is assumed compromised at all times.
 
-## Why This Exists
+Built with [Claude](https://claude.ai) (Anthropic) as the trusted planner and [Qwen 3](https://huggingface.co/Qwen) (Alibaba) as the air-gapped worker. Security scanning by [Prompt Guard 2](https://huggingface.co/meta-llama/Prompt-Guard-2-86M) (Meta) and [CodeShield](https://github.com/meta-llama/PurpleLlama/tree/main/CodeShield) (Meta/Semgrep).
 
-The AI assistant space is growing fast — but security hasn't kept pace. Most agent frameworks give their LLM full tool access and hope for the best. One prompt injection, one manipulated API response, and your agent is exfiltrating data, deleting files, or running malicious code.
+![Sentinel](ui/social-preview.png)
 
-Sentinel takes a different approach: **assume the worker LLM is already compromised**. Inspired by the [CaMeL paper](https://arxiv.org/abs/2503.18813) from Google DeepMind, it separates planning from execution, air-gaps the worker, and enforces 10 layers of security scanning between every step. The result is an AI assistant that's useful *and* resistant to the attacks that make most agent frameworks dangerous.
+---
 
-Read the build story at [cherrypod-sentinel.duckdns.org](https://cherrypod-sentinel.duckdns.org/) — from physical security to AI security, one layer at a time.
+## Tested and Verified
 
-## What Makes This Different
+Sentinel has been through continuous adversarial testing since day one. These are the results from the most recent comprehensive validation — a 38-hour unattended run covering every layer of the system.
+
+### Unit Tests
+
+| Metric | Value |
+|--------|-------|
+| Python tests | 4,550 |
+| Rust tests (WASM sidecar) | 50 |
+| **Total unit tests** | **4,600** |
+| Test-to-source ratio | **1.55:1** (64K test LOC / 41K source LOC) |
+
+### Adversarial Benchmark (1,136 prompts)
+
+801 adversarial prompts across 20 attack categories — direct injection, encoding obfuscation, social engineering, path traversal, credential exfiltration, multi-turn escalation, OWASP LLM top 10, and more. Plus 335 genuine capability prompts to measure false positives.
+
+| Metric | Value |
+|--------|-------|
+| Scanner defence rate | **93.6%** (750/801 adversarial prompts caught) |
+| Zero-escape categories | **13 of 20** (including direct injection: 116 prompts, 100% blocked) |
+| False positive rate | **5.7%** (19/335 genuine prompts incorrectly blocked) |
+| Genuine completion rate | 88.7% (297/335) |
+| Privacy boundary violations | **0** |
+
+The 6.4% of adversarial prompts that passed the scanners were all contained by defence-in-depth: sandbox isolation (no network, read-only filesystem, no secrets) prevented any actual harm. Multi-turn session attacks accounted for 67% of scanner bypasses — a known limitation of single-turn scanning that is being actively addressed.
+
+### Red Team (392 probes, 6 threat models)
+
+| Threat Model | Probes | What It Tests | Exploits |
+|--------------|--------|---------------|----------|
+| Adversarial user | 81 | AI attacker (Claude Sonnet 4.5) runs adaptive campaigns | **0** |
+| Data channel injection | 32 | Payloads via search results, messaging, email | **0** |
+| Compromised planner | 64 | Malicious plans submitted directly, bypassing Claude | **0** |
+| Container perimeter | 41 | Air gap, DNS side-channels, GPU isolation, container escape | **0** |
+| Sandbox escape | 90 | 90 exploit techniques against the WASM sandbox | **0** |
+| Database security | 84 | SQL injection, RLS bypass, privilege escalation, audit integrity | **0** |
+| **Total** | **392** | | **0 exploits** |
+
+The compromised planner test is the most critical — it simulates the worst case where the trusted planning model is fully hijacked. The scanning pipeline caught 73% of malicious plans outright. The remaining 27% were all contained by sandbox isolation and network air gap. This validates the CaMeL architecture's core claim: even when the planner is compromised, the system remains secure.
+
+### Injection Benchmark (AgentDojo-inspired)
+
+Inspired by [AgentDojo](https://agentdojo.spylab.ai/) — an evaluation framework for testing whether adversarial payloads embedded in tool outputs can hijack an AI agent into performing unintended actions. Sentinel's benchmark adapts this methodology to test injection resistance across all supported tool channels on the live system (not a simulation).
+
+| Metric | Value |
+|--------|-------|
+| Test cases | 105 |
+| Attack vectors | 6 (file, email, calendar, Signal, Telegram, web) |
+| Payloads | 13 unique injection patterns |
+| **Exploits** | **0** |
+| **Pass rate** | **100%** |
+
+The benchmark scripts are included in [`scripts/injection_benchmark/`](scripts/injection_benchmark/) for reproducibility.
+
+### Functionality Tests (60 scenarios)
+
+Real-world capability verification across code generation, debugging, end-to-end workflows, plan decomposition, and dependency management.
+
+| Suite | What It Tests | Pass Rate |
+|-------|--------------|-----------|
+| Build | Code generation across languages and complexity tiers | 61.5% |
+| Debug | Error diagnosis and fix-cycle convergence | 88.9% |
+| End-to-end | File ops, web search, container builds | 87.5% |
+| Plan quality | Decomposition accuracy and step calibration | 61.5% |
+| Dependencies | Missing package detection and graceful degradation | 100% |
+| **Overall** | | **82%** |
+
+Build and plan quality scores are lower due to worker LLM non-determinism on complex tasks and over-decomposition of plans — areas of active improvement. Debug and E2E scores improved significantly from earlier runs (debug: 72% → 89%, E2E: 62% → 88%) thanks to episodic learning and dynamic replanning. Subsequent targeted re-testing after pipeline fixes showed further improvement (E2E reaching 100% on the subset tested), though a full re-run has not been completed since these scores were recorded.
+
+### Validation Summary
+
+| Metric | Value |
+|--------|-------|
+| Total adversarial + capability prompts | **~1,600** |
+| Total unit tests | **4,600** |
+| Validation run duration | **38 hours** (unattended) |
+| Successful exploits | **0** |
+| Privacy boundary violations | **0** |
+| Real-world false positive rate | **5.7%** |
+
+---
+
+## Why This Architecture
+
+Most AI agent deployments trust their LLM implicitly — the model's output is the product. Sentinel inverts this. The worker LLM is treated as an adversarial component whose every output is scanned, constrained, and verified before any action is taken. This defence-in-depth approach means that even if an attacker successfully prompt-injects the worker, the scanning pipeline, sandbox isolation, and provenance tracking prevent the compromised output from causing harm.
+
+The privacy boundary is equally strict: the planner (Claude) never sees user data, file contents, or worker output. It receives only sanitised summaries and opaque identifiers. Sensitive data never leaves the local machine, even when using a cloud API for planning.
+
+**Key principles:**
 
 - **Air-gapped worker** — the local LLM has zero network access. It cannot phone home, exfiltrate data, or fetch remote payloads
-- **10-layer security pipeline** — deterministic policy engine, spotlighting, Prompt Guard, Semgrep static analysis, command pattern scanner, encoding scanner, conversation analysis, vulnerability echo detection, ASCII prompt gate, and CaMeL provenance tracking
-- **Tiered trust model** — the worker starts with zero trust (text in/out only). Capabilities unlock incrementally after red team passes at each level
+- **10-layer security pipeline** — no single scanner carries the load. Defence is distributed across deterministic rules, ML classifiers, static analysis, and provenance tracking
+- **Tiered trust model** — capabilities unlock incrementally after red team validation at each level
 - **Human approval gates** — every plan is shown to the user before execution. No autonomous action without consent
 - **CaMeL provenance** — every data item is tagged with its source and trust level. Untrusted data cannot reach dangerous operations without scanning and approval
-
-## Recent Additions
-
-- **PostgreSQL migration** — full SQLite removal, 17 tables with row-level security and pgvector embeddings ([details](docs/features/postgresql-migration.md))
-- **Contact registry & PII boundary** — opaque user IDs for planner, real identifiers only at edges ([details](docs/features/contact-registry.md))
-- **Router & fast path** — local LLM classifies requests, 9 templates skip planner for simple tasks ([details](docs/features/router-fast-path.md))
-- **Orchestrator refactor** — monolith split from 2,662 to 1,390 lines across 5 focused modules ([details](docs/features/orchestrator-refactor.md))
-- **Episodic learning** — embedding-based long-term memory with hybrid retrieval and diversity filtering ([details](docs/features/episodic-learning.md))
-- **Code fixer v2.5** — deterministic multi-language code fixer for worker output, 13 languages, 270+ tests ([details](docs/features/code-fixer.md))
-- **Dynamic replanning** — discovery and failure-based replanning with independent budgets ([details](docs/features/dynamic-replanning.md))
-- **Sandboxed execution** — disposable Podman containers, network-isolated, capability-dropped ([details](docs/features/sandboxed-execution.md))
-- **Multi-channel access** — WebSocket, SSE, Signal, Telegram, Email, Calendar, MCP ([details](docs/features/multi-channel.md))
-- **Routine scheduling** — cron, event, and interval triggers for autonomous tasks ([details](docs/features/routine-scheduling.md))
 
 ## Architecture
 
 ```
-+-------------------------------------------------------------------+
-|                    sentinel (Python/FastAPI)                       |
-|                   HTTPS :8443 / HTTP :8080                        |
-|                                                                   |
-|  Static UI (/)  |  REST API (/api/*)  |  WebSocket (/ws)         |
-|  SSE (/api/events)  |  MCP server (/mcp/)                        |
-|                                                                   |
-|  POST /task  -->  Router (classify)  -->  Fast path (9 templates) |
-|              -->  OR: Claude plans    -->  Human approval          |
-|              -->  Per-step execution:                              |
-|                                                                   |
-|     llm_task:  prompt gate -> Qwen -> Semgrep -> scan             |
-|     tool_call: policy check -> execute -> tag provenance          |
-|     shell:     sandbox container (disposable, air-gapped)         |
-|                                                                   |
-|  10 security layers  |  Policy engine    |  Provenance store      |
-|  PostgreSQL 17       |  pgvector + RLS   |  Episodic memory       |
-|  Contact registry    |  Event bus        |  Channel router        |
-+-----------------------------+-------------------------------------+
++-----------------------------------------------------------------+
+|                    sentinel (Python/FastAPI)                     |
+|                  HTTPS :8443 / HTTP :8080                       |
+|                                                                 |
+|  Static UI (/)  |  REST API (/api/*)  |  WebSocket (/ws)       |
+|  SSE (/api/events)  |  MCP server (/mcp/)                      |
+|                                                                 |
+|  POST /task  -->  Input validation  -->  Conversation analysis  |
+|              -->  Prompt Guard scan -->  Claude plans            |
+|              -->  Human approval    -->  Per-step execution:     |
+|                                                                 |
+|     llm_task:  prompt gate -> Qwen -> CodeShield -> scan        |
+|     tool_call: policy check -> execute -> tag provenance        |
+|                                                                 |
+|  10 security layers  |  Policy engine  |  Provenance store      |
+|  PostgreSQL (RLS)    |  Event bus      |  Channel router        |
++-----------------------------+-----------------------------------+
                               | sentinel_internal (air-gapped)
-+-----------------------------v-------------------------------------+
-|              sentinel-ollama (Ollama, GPU)                         |
-|                                                                   |
-|     Qwen 3 14B Q4_K_M -- text in, text out (GPU)                 |
-|     nomic-embed-text -- embeddings for memory search (CPU)        |
-|     No internet  |  No tools  |  No file access                   |
-+-------------------------------------------------------------------+
++-----------------------------v-----------------------------------+
+|              sentinel-ollama (Ollama, GPU)                       |
+|                                                                 |
+|     Qwen 3 14B Q4_K_M -- text in, text out (GPU)               |
+|     nomic-embed-text -- embeddings for memory search (CPU)      |
+|     No internet  |  No tools  |  No file access                 |
++-----------------------------------------------------------------+
 ```
 
 | Component | Role | Trust Level | Network |
@@ -91,37 +151,26 @@ Sentinel assumes the worker LLM is adversarial. Every output passes through a 10
 | 2 | Policy Engine | Deterministic YAML | File paths, commands, credentials, network |
 | 3 | Spotlighting | String manipulation | Prompt injection (dynamic markers, sandwich defence) |
 | 4 | Prompt Guard 2 | 86M BERT classifier | Injection detection |
-| 5 | Semgrep | Direct static analysis (101 rules) | Malicious code patterns, hardcoded secrets |
+| 5 | CodeShield | Semgrep static analysis | Malicious code patterns |
 | 6 | CommandPatternScanner | Regex patterns | Dangerous shell patterns in prose |
 | 7 | ConversationAnalyzer | Multi-turn heuristics | Memory poisoning, escalation, context building |
 | 8 | VulnerabilityEchoScanner | Input/output fingerprinting | Code injection via "review this" framing |
 | 9 | ASCII Prompt Gate | Regex allowlist | Cross-model bilingual injection |
 | 10 | CaMeL Provenance | Data tagging | Untrusted data reaching dangerous operations |
 
-## Test Results
+## Features
 
-### Functional (G-suite at Trust Level 4)
-
-| Suite | Score | Notes |
-|-------|-------|-------|
-| G1: Build Capability | 11/13 (85%) | 2 failures = Qwen output quality (model ceiling) |
-| G2: Debug & Dev | 14/18 (78%) | Category A: 12/12, B+C limited by multi-turn complexity |
-| G3: E2E Workflows | 5/8 (63%) | 2 harness issues, 1 needs fixture |
-| G4: Plan Quality | 14/15 (93%) | Complex 16-step plans completing in 500-940s |
-| G5: Dependencies | 6/6 (100%) | Stable across all runs |
-
-### Red Team (adversarial — zero breaches)
-
-| Scenario | Result |
-|----------|--------|
-| B1: Adversarial User (12 campaigns) | **0 exploits** |
-| B1.5: Adversarial Data (9 campaigns) | **0 exploits** |
-| B2: Compromised Planner (16 categories) | **0 exploits** |
-| B3: Perimeter (7 categories) | **0 failures** |
-| B4: Sandbox Isolation (17 categories) | **90/90 blocked** |
-| B5: Database (7 categories) | **0 exploits** |
-
-Zero S0 (breach) or S1 (exploitable leak) across all scenarios and runs.
+- **Dynamic replanning** — when a step fails, the planner re-evaluates and adjusts the remaining plan rather than aborting
+- **Episodic learning** — the system remembers outcomes from previous tasks and applies those lessons to future ones
+- **File patching** — incremental file modifications using CSS-selector-style anchors for deterministic targeting (no LLM-generated diffs)
+- **Multi-channel access** — WebSocket, SSE, MCP server, Signal, Telegram, email, CalDAV
+- **Routine scheduling** — cron, event, and interval triggers for automated tasks
+- **Contact registry** — opaque identifiers for messaging, so the planner never sees phone numbers or email addresses
+- **WASM tool sandbox** — Rust sidecar with Wasmtime, capability model, and leak detection. Network disabled, read-only filesystem, no secrets
+- **PostgreSQL with RLS** — row-level security, role separation, full audit logging
+- **Router fast path** — simple single-tool requests bypass the planner entirely for lower latency and cost
+- **Multi-user support** — role-based access, per-user session isolation, and channel identity mapping
+- **Keyword classifier** — routes requests to the right handler before planning, reducing unnecessary API calls
 
 ## Quick Start
 
@@ -149,8 +198,6 @@ chmod 600 secrets/claude_api_key.txt
 
 ### 2. Optional: Set a PIN
 
-PIN authentication is optional. Without a PIN file, the UI works with no authentication — fine for local development.
-
 ```bash
 # Optional: set a 4-digit PIN to protect the UI
 echo "1234" > secrets/sentinel_pin.txt
@@ -158,8 +205,6 @@ chmod 600 secrets/sentinel_pin.txt
 ```
 
 ### 3. Build the sentinel image
-
-The build downloads the Prompt Guard model from HuggingFace, which requires an access token passed as a build secret.
 
 ```bash
 # Store your HuggingFace token somewhere outside the repo
@@ -190,143 +235,82 @@ This starts two containers:
 
 ### 5. Download the Qwen model
 
-On first run, the Ollama container has no models loaded. Pull Qwen 3 14B:
-
 ```bash
 podman exec sentinel-ollama ollama pull qwen3:14b
 ```
 
-This downloads ~8GB and takes a few minutes. The model is stored in a persistent volume, so you only need to do this once.
+This downloads ~8GB. The model is stored in a persistent volume — you only need to do this once.
 
 ### 6. Open the UI
 
 Go to **https://localhost:3001** in your browser.
 
-- Accept the self-signed certificate warning (Advanced → Accept the Risk)
-- If you set a PIN in step 2, you'll see a PIN prompt — enter it
-- If you skipped the PIN, the UI loads directly
+- Accept the self-signed certificate warning
+- Enter the PIN if you set one
 - Type a task and hit Send — Claude will plan it, you approve, Qwen executes
 
 ### Verify the stack
 
 ```bash
-# Health check (should return JSON with all subsystems loaded)
+# Health check
 curl -sk https://localhost:3001/health | python3 -m json.tool
 
-# Full smoke test
+# Smoke test
 bash scripts/smoke_test.sh
-```
-
-## Using the UI
-
-- **Send a task** — type in the input box and press Enter or click Send
-- **Approve/deny plans** — Claude's plan is shown with expandable step details. Click a step to see the full prompt that Qwen will receive. Approve or deny the plan
-- **Clear history** — **Shift+click** the "Sentinel" title in the header to clear conversation history. History is stored in your browser's localStorage only — it never leaves your machine
-- **Transport** — the UI automatically connects via WebSocket for real-time updates, falling back to HTTP polling if WebSocket isn't available
-
-## Screenshots
-
-<details>
-<summary>Dashboard — system health, session info, metrics</summary>
-<img src="screenshots/dashboard.png" alt="Dashboard" width="800">
-</details>
-
-<details>
-<summary>Chat interface</summary>
-<img src="screenshots/chat.png" alt="Chat" width="800">
-</details>
-
-<details>
-<summary>Episodic memory browser</summary>
-<img src="screenshots/memory.png" alt="Memory" width="800">
-</details>
-
-<details>
-<summary>Routine scheduler</summary>
-<img src="screenshots/routines.png" alt="Routines" width="800">
-</details>
-
-<details>
-<summary>Log viewer</summary>
-<img src="screenshots/logs.png" alt="Logs" width="800">
-</details>
-
-## Project Structure
-
-```
-sentinel/
-├── README.md                   This file
-├── LICENSE                     Apache-2.0
-├── CONTRIBUTING.md             Contributor guide
-├── SECURITY.md                 Vulnerability reporting
-├── pyproject.toml              Python package config
-├── podman-compose.yaml         2-container deployment
-│
-├── sentinel/                   Python package (security gateway + orchestrator)
-│   ├── core/                   Config, database (PostgreSQL), event bus, models
-│   ├── security/               Scanners, policy engine, pipeline, code fixer
-│   ├── planner/                Claude planner, orchestrator, builders, intake, dispatch
-│   ├── router/                 Fast-path classifier, templates, executor
-│   ├── contacts/               Contact registry, PII boundary, resolver
-│   ├── worker/                 Ollama/Qwen client, provider ABCs
-│   ├── tools/                  Policy-checked tool executor, sandbox
-│   ├── session/                Session + conversation tracking
-│   ├── api/                    FastAPI app, auth, middleware
-│   ├── audit/                  Structured JSON logging
-│   ├── memory/                 Embeddings, episodic records, hybrid search
-│   ├── channels/               WebSocket, SSE, MCP, Signal, Telegram, Email
-│   └── routines/               Scheduled task engine (cron, event, interval)
-│
-├── tests/                      4,147+ Python tests
-├── ui/                         Static chat UI (HTML/JS/CSS)
-├── docs/features/              Feature documentation
-│
-├── container/                  Containerfile for builds
-├── sidecar/                    Rust WASM tool sandbox (50 tests)
-├── policies/                   Deterministic security rules (YAML)
-└── rules/                      Semgrep rule definitions (101 rules)
 ```
 
 ## Running Tests
 
 ```bash
-# Python tests (requires a virtualenv with dependencies)
+# Python tests
 python -m venv .venv
 source .venv/bin/activate
 pip install -e ".[dev,mcp]"
 pytest tests/
 
-# Or run inside the container (no local setup needed)
+# Or run inside the container
 podman exec sentinel pytest /app/tests/
 
 # Rust sidecar tests
 cargo test --manifest-path sidecar/Cargo.toml
 ```
 
+## Project Structure
+
+```
+sentinel/
+├── sentinel/                   Python package (security gateway + orchestrator)
+│   ├── core/                   Config, database, event bus, models
+│   ├── security/               Scanners, policy engine, pipeline
+│   ├── planner/                Claude planner, orchestrator, trust router
+│   ├── worker/                 Ollama/Qwen client, provider ABCs
+│   ├── tools/                  Policy-checked tool executor + file_patch
+│   ├── session/                Session + conversation tracking
+│   ├── api/                    FastAPI app, auth, middleware
+│   ├── audit/                  Structured JSON logging
+│   ├── memory/                 Embeddings, chunks, RRF search
+│   ├── channels/               WebSocket, SSE, MCP, Signal, Telegram, email
+│   ├── contacts/               Contact registry (opaque ID resolution)
+│   ├── integrations/           CalDAV, IMAP, email services
+│   ├── analysis/               Metadata extraction
+│   ├── router/                 Keyword classifier, fast path, templates
+│   └── routines/               Scheduled task engine (cron, event, interval)
+│
+├── tests/                      4,550 unit tests
+├── sidecar/                    Rust WASM tool sandbox (50 tests)
+├── ui/                         Static chat UI (HTML/JS/CSS)
+├── container/                  Containerfiles
+├── policies/                   Deterministic security rules (YAML)
+├── scripts/                    Test runners + injection benchmark
+└── docs/                       Documentation + feature guides
+```
+
 ## Current Status
 
-**v0.3.0** — Trust Level 4 active. Full defence-in-depth with zero red team breaches.
+**v0.4.0** — The north star is full autonomous operation — routines and triggers initiate tasks, the planner decides, the controller enforces, and trust levels gate autonomy. Getting closer with every release.
 
-- 4,147+ Python tests + 50 Rust tests passing (4,197+ total)
-- Zero red team breaches across 6 adversarial scenarios (B1–B5)
-- PostgreSQL 17 with row-level security and pgvector embeddings
-- Sandboxed shell execution via Podman API proxy (disposable containers, network-isolated)
-- Multi-channel access: WebSocket, SSE, Signal, Telegram, Email, Calendar, MCP
-- Router with 9 fast-path templates for simple tasks (skips planner, keeps security)
-- Episodic learning with hybrid retrieval (FTS + vector + reranker + MMR)
-- Code fixer v2.5 — deterministic output repair for 13 languages
-- Dynamic replanning — discovery and failure-based, with independent budgets
-- Plan-policy enforcement with allowed-command/allowed-path constraints per step
-- Contact registry with opaque IDs (planner never sees PII)
-- WASM tool sandbox (Rust sidecar with Wasmtime, capability model, leak detection)
-- Routine scheduling engine (cron, event, interval triggers)
-- Infrastructure hardened (TLS, CSP, CSRF, resource limits, read-only FS, pinned images, health checks)
-- Direct Semgrep integration with 101 rules
+See [CHANGELOG](docs/CHANGELOG.md) for version history.
 
 ## License
 
 [Apache License 2.0](LICENSE)
-
-## Credits
-
-Built with [Claude](https://claude.ai) (Anthropic) as the trusted planner and [Qwen 3](https://huggingface.co/Qwen) (Alibaba) as the air-gapped worker. Security scanning by [Prompt Guard 2](https://huggingface.co/meta-llama/Prompt-Guard-2-86M) (Meta) and [Semgrep](https://semgrep.dev/) (r2c).

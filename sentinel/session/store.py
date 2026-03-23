@@ -69,6 +69,7 @@ class Session:
     violation_count: int = 0
     is_locked: bool = False
     task_in_progress: bool = False      # F2: crash-recovery flag (not a concurrency lock — see SYS-4/RACE-2)
+    success_forgives_used: int = 0     # Fix-cycle decay: how many security blocks have been forgiven by subsequent successes
     created_at: str = field(default_factory=_now_iso)
     last_active: str = field(default_factory=_now_iso)
 
@@ -126,6 +127,7 @@ class Session:
             self.is_locked = False
             self.cumulative_risk = 0.0
             self.violation_count = 0
+            self.success_forgives_used = 0
             self.turns.clear()
             changed = True
             logger.info(
@@ -146,6 +148,7 @@ class Session:
                 # Reset violations when risk fully decays
                 if self.cumulative_risk == 0.0 and self.violation_count > 0:
                     self.violation_count = 0
+                    self.success_forgives_used = 0
 
         return changed
 

@@ -48,7 +48,7 @@ def test_hybrid_search_accepts_task_domain():
     ("debug this error in the parser", "code_debugging"),
     ("the API is not working", "code_debugging"),
     ("there's a bug in the email handler", "code_debugging"),
-    ("send a message to Alice", "messaging"),
+    ("send a message to Keith", "messaging"),
     ("email the report to the team", "messaging"),
     ("forward this on signal", "messaging"),
     ("notify via telegram", "messaging"),
@@ -59,7 +59,7 @@ def test_hybrid_search_accepts_task_domain():
     ("add a calendar event for Monday", "calendar"),
     ("schedule a meeting at 3pm", "calendar"),
     ("what events do I have today", "calendar"),
-    ("create a website for my project", None),
+    ("create a website for my project", "file_ops"),
     ("hello world", None),
     ("write a poem about cats", None),
 ])

@@ -1,4 +1,5 @@
 import asyncio
+import html as html_module
 import json
 import logging
 import re
@@ -124,6 +125,17 @@ class ExecutionContext:
 
     def set(self, var_name: str, data: TaggedData) -> None:
         self._vars[var_name] = data
+        logger.debug(
+            "Variable stored in execution context",
+            extra={
+                "event": "var_store",
+                "var_name": var_name,
+                "data_id": data.id,
+                "content_length": len(data.content) if data.content else 0,
+                "content_preview": (data.content[:300] if data.content else ""),
+                "has_entities": ("&lt;" in (data.content or "") or "&gt;" in (data.content or "")),
+            },
+        )
 
     def get(self, var_name: str) -> TaggedData | None:
         return self._vars.get(var_name)
@@ -137,6 +149,17 @@ class ExecutionContext:
             var_name = match.group(0)
             data = self._vars.get(var_name)
             if data is not None:
+                logger.debug(
+                    "Variable resolved",
+                    extra={
+                        "event": "var_resolve",
+                        "var_name": var_name,
+                        "data_id": data.id,
+                        "content_length": len(data.content) if data.content else 0,
+                        "content_preview": (data.content[:300] if data.content else ""),
+                        "has_entities": ("&lt;" in (data.content or "") or "&gt;" in (data.content or "")),
+                    },
+                )
                 return data.content
             return var_name  # leave unresolved refs as-is
 
@@ -1211,7 +1234,12 @@ class Orchestrator:
         ])
 
         for step, result, outcome in zip(executed_steps, step_results, step_outcomes):
-            lines.append(f"  {step.id} [{step.type}]: {outcome.get('status', 'unknown')}")
+            # Include output_var so the continuation plan references the correct
+            # variable names. Without this, the planner guesses variable names
+            # (e.g. $step_1_result) instead of using the actual names from the
+            # initial plan (e.g. $weather_search, $current_html).
+            var_suffix = f" → {step.output_var}" if step.output_var else ""
+            lines.append(f"  {step.id} [{step.type}]{var_suffix}: {outcome.get('status', 'unknown')}")
 
             # F1 metadata (always included — privacy-safe)
             meta_parts = []
@@ -1287,10 +1315,20 @@ class Orchestrator:
             failure_trigger=failure_trigger,
         )
 
+        # Collect output_var names from executed steps so the continuation
+        # plan validator accepts references to them. Without this, the validator
+        # rejects $weather_search etc. as "undefined variable" because it only
+        # sees the continuation plan's steps, not the initial plan's.
+        prior_vars = {
+            s.output_var for s in executed_steps
+            if s.output_var
+        }
+
         continuation = await asyncio.wait_for(
             self._planner.create_plan(
                 user_request=replan_context,
                 available_tools=available_tools,
+                prior_vars=prior_vars,
             ),
             timeout=settings.planner_timeout,
         )
@@ -1743,6 +1781,18 @@ class Orchestrator:
             worker_usage = worker_stats if isinstance(worker_stats, dict) else None
 
             # Capture Qwen's raw response before any post-processing
+            logger.debug(
+                "Raw Qwen output received (before any processing)",
+                extra={
+                    "event": "qwen_raw_output",
+                    "step_id": step.id,
+                    "content_length": len(tagged.content) if tagged.content else 0,
+                    "content_full": tagged.content,
+                    "has_entities": ("&lt;" in (tagged.content or "") or "&gt;" in (tagged.content or "")),
+                    "has_response_tags": ("<RESPONSE>" in (tagged.content or "")),
+                    "data_id": tagged.id,
+                },
+            )
             if verbose:
                 _v["worker_response"] = tagged.content
 
@@ -1765,7 +1815,17 @@ class Orchestrator:
             # D-005: Strip emoji BEFORE scanning — prevents emoji injection bypass
             # where emoji causes Semgrep parse failure, then stripping produces
             # clean malicious code that was never successfully scanned.
+            pre_emoji = tagged.content
             tagged.content = strip_emoji_from_code_blocks(tagged.content)
+            if tagged.content != pre_emoji:
+                logger.debug(
+                    "Emoji stripped from code blocks",
+                    extra={
+                        "event": "emoji_strip",
+                        "step_id": step.id,
+                        "chars_removed": len(pre_emoji) - len(tagged.content),
+                    },
+                )
 
             # Qwen3 thinking mode produces <think>...</think> blocks even in
             # non-thinking prompts (architecture leakage). <RESPONSE> tags are
@@ -1780,7 +1840,34 @@ class Orchestrator:
             if "<RESPONSE>" in stripped and "</RESPONSE>" in stripped:
                 start = stripped.index("<RESPONSE>") + len("<RESPONSE>")
                 end = stripped.index("</RESPONSE>")
-                tagged.content = stripped[start:end].strip()
+                extracted = stripped[start:end].strip()
+                logger.debug(
+                    "RESPONSE tag extraction",
+                    extra={
+                        "event": "response_tag_extract",
+                        "step_id": step.id,
+                        "pre_extract_length": len(stripped),
+                        "post_extract_length": len(extracted),
+                        "pre_extract_preview": stripped[:500],
+                        "post_extract_preview": extracted[:500],
+                        "has_entities_before": ("&lt;" in stripped),
+                        "has_entities_after": ("&lt;" in extracted),
+                    },
+                )
+                # Qwen sometimes entity-encodes HTML content inside
+                # RESPONSE tags (treating them as XML). Unescape to
+                # restore raw HTML. Safe: html.unescape on non-encoded
+                # content is a no-op.
+                if "&lt;" in extracted or "&gt;" in extracted or "&amp;" in extracted:
+                    extracted = html_module.unescape(extracted)
+                    logger.info(
+                        "Unescaped HTML entities from RESPONSE tag content",
+                        extra={
+                            "event": "response_entity_unescape",
+                            "step_id": step.id,
+                        },
+                    )
+                tagged.content = extracted
                 if step.output_format != "tagged":
                     logger.info(
                         "Defensive strip — removed unsolicited RESPONSE tags "
@@ -1792,9 +1879,6 @@ class Orchestrator:
                         },
                     )
             elif "<RESPONSE>" in stripped:
-                # Truncated response — Qwen hit the output token cap mid-
-                # response, producing an opening tag with no closing tag.
-                # Strip the opening tag and keep everything after it.
                 start = stripped.index("<RESPONSE>") + len("<RESPONSE>")
                 tagged.content = stripped[start:].strip()
                 logger.info(
@@ -1807,17 +1891,38 @@ class Orchestrator:
                 )
             else:
                 tagged.content = stripped
+                logger.debug(
+                    "No RESPONSE tags found — content used as-is",
+                    extra={
+                        "event": "no_response_tags",
+                        "step_id": step.id,
+                        "content_preview": stripped[:500],
+                        "has_entities": ("&lt;" in stripped),
+                    },
+                )
 
-            # R9: Close unclosed code fences. When Qwen hits the num_predict
-            # token cap mid-code-block, the markdown has an unclosed fence.
-            # Append a closing ``` so downstream rendering and scanning work
-            # correctly. Cosmetic only — does not affect security scanning.
+            # R9: Close unclosed code fences.
+            pre_fence = tagged.content
             tagged.content = close_unclosed_fences(tagged.content)
+            if tagged.content != pre_fence:
+                logger.debug(
+                    "Closed unclosed code fences",
+                    extra={"event": "fence_close", "step_id": step.id},
+                )
 
-            # Extract code blocks once — used by both quality gate and Semgrep.
-            # Hoisted out of the Semgrep conditional so quality checking runs
-            # regardless of whether Semgrep is loaded.
+            # Extract code blocks once
             code_blocks = extract_code_blocks(tagged.content)
+            logger.debug(
+                "Code blocks extracted",
+                extra={
+                    "event": "code_blocks_extracted",
+                    "step_id": step.id,
+                    "block_count": len(code_blocks),
+                    "block_languages": [b.language for b in code_blocks],
+                    "block_previews": [b.code[:300] for b in code_blocks],
+                    "blocks_have_entities": [("&lt;" in b.code) for b in code_blocks],
+                },
+            )
 
             # R7: Post-generation quality gate — warns, never blocks.
             # Runs BEFORE Semgrep so warnings are available even on blocked
@@ -1886,13 +1991,36 @@ class Orchestrator:
                         "event": "execution_fence_unwrap",
                         "step_id": step.id,
                         "language": code_blocks[0].language,
+                        "content_preview": content[:500],
+                        "has_entities": ("&lt;" in content),
+                    },
+                )
+            else:
+                logger.debug(
+                    "No fence unwrap (multi-block or display destination)",
+                    extra={
+                        "event": "no_fence_unwrap",
+                        "step_id": step.id,
+                        "destination": str(destination),
+                        "block_count": len(code_blocks),
+                        "content_preview": content[:500],
+                        "has_entities": ("&lt;" in content),
                     },
                 )
 
             tagged.content = content
-            # Persist the cleaned content back to the provenance store so
-            # downstream consumers (execution variable resolution) get the
-            # stripped version, not the raw Qwen output with tags.
+            # Persist the cleaned content back to the provenance store
+            logger.debug(
+                "Final content before provenance store",
+                extra={
+                    "event": "pre_provenance_store",
+                    "step_id": step.id,
+                    "data_id": tagged.id,
+                    "content_length": len(content),
+                    "content_full": content,
+                    "has_entities": ("&lt;" in content),
+                },
+            )
             await update_provenance_content(tagged.id, content)
 
             return StepResult(
@@ -1976,6 +2104,38 @@ class Orchestrator:
             return provenance_block, None
 
         resolved_args = context.resolve_args(step.args)
+
+        # Log resolved args for debugging — shows what content the tool receives
+        _resolved_preview = {}
+        for k, v in resolved_args.items():
+            if isinstance(v, str):
+                _resolved_preview[k] = {
+                    "length": len(v),
+                    "preview": v[:300],
+                    "has_entities": ("&lt;" in v or "&gt;" in v),
+                }
+            elif isinstance(v, dict):
+                _resolved_preview[k] = {}
+                for dk, dv in v.items():
+                    if isinstance(dv, str):
+                        _resolved_preview[k][dk] = {
+                            "length": len(dv),
+                            "preview": dv[:300],
+                            "has_entities": ("&lt;" in dv or "&gt;" in dv),
+                        }
+                    else:
+                        _resolved_preview[k][dk] = str(dv)
+            else:
+                _resolved_preview[k] = str(v)
+        logger.debug(
+            "Tool step — resolved args",
+            extra={
+                "event": "tool_resolved_args",
+                "step_id": step.id,
+                "tool": step.tool,
+                "resolved_args_detail": _resolved_preview,
+            },
+        )
 
         # S4: Constraint validation on resolved args (TL4+)
         constraint_block = await validate_constraints(step, resolved_args, effective_tl)

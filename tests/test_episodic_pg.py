@@ -1261,22 +1261,25 @@ class TestRenderEpisodicText:
         assert "FAILED" in text   # step 3
         assert "AssertionError" in text
 
-    def test_file_metadata_in_files_line(self):
-        """File size and diff stats appear in the Files line."""
+    def test_file_types_in_files_line(self):
+        """File extensions (not full names) appear in the File types line."""
         text = render_episodic_text(
             user_request="Write a script",
             task_status="success",
             step_count=1,
             success_count=1,
-            file_paths=["/workspace/app.py"],
+            file_paths=["/workspace/app.py", "/workspace/style.css"],
             step_outcomes=[
                 {"step_type": "tool_call", "tool": "file_write", "status": "success",
                  "file_path": "/workspace/app.py", "file_size_after": 1024,
                  "diff_stats": "+40/-0 lines"},
             ],
         )
-        assert "1024B" in text
-        assert "+40/-0 lines" in text
+        # Extensions only — no full filenames (prevents planner over-fitting)
+        assert "File types:" in text
+        assert ".py" in text
+        assert ".css" in text
+        assert "app.py" not in text
 
     def test_blocked_step_hides_scanner_details(self):
         """Blocked steps say 'blocked by security policy', no internals."""

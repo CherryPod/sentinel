@@ -1,5 +1,5 @@
 """
-Sentinel Code Fixer — v2.5
+Sentinel Code Fixer — v2.6
 
 Deterministic, multi-language code fixer for LLM output. Runs inside the
 sentinel container between security scanning and file write.
@@ -29,6 +29,12 @@ INTEGRATION POINT:
 
 DEPENDENCIES: Python stdlib + PyYAML + parso (error-recovering Python parser) +
   json-repair (robust JSON fixer). All pure Python, MIT licensed, ~26KB total.
+
+v2.6 ADDITIONS:
+  JavaScript: Multi-pass fixer — object literal semicolons → commas, double
+  semicolon removal, Python-style comment conversion, unclosed string literal
+  repair, innerHTML → textContent defence-in-depth. Semicolon insertion
+  retained from v2.
 
 v2.5 ADDITIONS:
   Python: Missing stdlib import auto-add (allowlist), hallucinated import
@@ -1430,13 +1436,32 @@ def fix_html(content: str, _depth: int = 0) -> FixResult:
             return f'{attr_name}="{value}"'
 
         def _fix_tag_attrs(tag_match):
-            """Find unquoted attribute values within a single tag."""
+            """Find unquoted attribute values within a single tag.
+
+            Splits the tag into quoted and unquoted segments first,
+            then only applies the quoting fix to unquoted segments.
+            This prevents corrupting values inside already-quoted
+            attributes (e.g. content="width=device-width, ...").
+            """
             tag_content = tag_match.group(0)
-            return re.sub(
-                r'(\w+)=([^\s"\'<>=]+)(?=[\s>/>])',
-                _quote_attr,
-                tag_content,
-            )
+            # Split into segments: quoted strings vs everything else
+            # This preserves content="width=device-width" as-is
+            segments = re.split(r'''("[^"]*"|'[^']*')''', tag_content)
+            result_parts = []
+            for i, seg in enumerate(segments):
+                if i % 2 == 1:
+                    # Quoted segment — leave untouched
+                    result_parts.append(seg)
+                else:
+                    # Unquoted segment — fix bare attribute values
+                    result_parts.append(
+                        re.sub(
+                            r'(\w+)=([^\s"\'<>=]+)(?=[\s>/>])',
+                            _quote_attr,
+                            seg,
+                        )
+                    )
+            return "".join(result_parts)
 
         content = re.sub(r'<[a-zA-Z][^>]*>', _fix_tag_attrs, content)
 
@@ -1664,7 +1689,11 @@ def fix_dockerfile(content: str) -> FixResult:
 
 
 # ---------------------------------------------------------------------------
-# Layer 3: JavaScript/TypeScript semicolon insertion (v2)
+# Layer 3: JavaScript/TypeScript fixes (v2.6)
+#
+# Multi-pass fixer for common LLM-generated JS errors. Each sub-function
+# handles one error class. All fixes are HIGH confidence — they correct
+# patterns that are always wrong in valid JavaScript.
 # ---------------------------------------------------------------------------
 
 # Tokens that indicate a line is a complete statement needing a semicolon
@@ -1689,20 +1718,257 @@ _JS_NO_SEMI = re.compile(
     r")$"
 )
 
+# Object property line: key (with optional quotes) followed by colon and value
+_JS_OBJ_PROP = re.compile(
+    r'^(\s*)'                           # leading whitespace (group 1)
+    r'(?:["\'][^"\']+["\']'            # quoted key (any chars inside quotes)
+    r'|[\w$]+)'                         # or bare identifier key
+    r'\s*:\s*'                          # colon separator
+    r'.+?'                              # value (non-greedy)
+    r';'                                # trailing semicolon (the error)
+    r'\s*$'                             # optional trailing whitespace
+)
+
+# Python-style comment: line starting with # (not #! shebang)
+_JS_PYTHON_COMMENT = re.compile(r'^(\s*)#(?!!)\s*(.*)')
+
+
+def _js_fix_object_semicolons(content: str, fixes: list[str]) -> str:
+    """Fix semicolons used instead of commas between object properties.
+
+    Detects lines like `name: "test";` inside object literals and replaces
+    the trailing semicolon with a comma. Only fixes when the context clearly
+    indicates an object literal (next non-blank line is another property or
+    a closing brace).
+    """
+    lines = content.split("\n")
+    fixed_count = 0
+
+    # Track brace depth to identify object literal contexts
+    brace_depth = 0
+    in_string = False
+    in_block_comment = False
+
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+
+        # Track block comments
+        if not in_block_comment and "/*" in stripped:
+            if "*/" not in stripped.split("/*", 1)[1]:
+                in_block_comment = True
+                continue
+        if in_block_comment:
+            if "*/" in stripped:
+                in_block_comment = False
+            continue
+
+        # Skip single-line comments
+        if stripped.startswith("//"):
+            continue
+
+        # Count braces (rough — doesn't handle braces in strings perfectly,
+        # but we only use depth > 0 as a signal, not exact scoping)
+        brace_depth += stripped.count("{") - stripped.count("}")
+
+        # Only look for the pattern when we're inside braces (object context)
+        if brace_depth <= 0:
+            continue
+
+        m = _JS_OBJ_PROP.match(line)
+        if not m:
+            continue
+
+        # Confirm context: next non-blank line should be another property or }
+        next_meaningful = ""
+        for j in range(i + 1, min(i + 5, len(lines))):
+            candidate = lines[j].strip()
+            if candidate:
+                next_meaningful = candidate
+                break
+
+        if not next_meaningful:
+            continue
+
+        # Next line is another property or closing brace — safe to fix
+        looks_like_obj_context = (
+            _JS_OBJ_PROP.match(lines[j] if next_meaningful else "")
+            or next_meaningful.startswith("}")
+            or re.match(r'^(?:["\'][^"\']+["\']|[\w$]+)\s*:', next_meaningful)
+        )
+
+        if looks_like_obj_context:
+            # Replace the last semicolon with a comma
+            line_rstripped = line.rstrip()
+            if line_rstripped.endswith(";"):
+                lines[i] = line_rstripped[:-1] + ","
+                fixed_count += 1
+
+    if fixed_count:
+        content = "\n".join(lines)
+        fixes.append(
+            f"Replaced {fixed_count} semicolon(s) with commas in object "
+            f"literal(s)"
+        )
+
+    return content
+
+
+def _js_fix_double_semicolons(content: str, fixes: list[str]) -> str:
+    """Replace `;;` with `;` — always unintentional in LLM output."""
+    # Avoid touching `for (;;)` loops — only fix ;; at end of statements
+    pattern = re.compile(r'(?<!\()(;;)(?!\s*\))')
+    new_content = pattern.sub(";", content)
+    if new_content != content:
+        count = content.count(";;") - new_content.count(";;")
+        fixes.append(f"Removed {count} double semicolon(s)")
+    return new_content
+
+
+def _js_fix_python_comments(content: str, fixes: list[str]) -> str:
+    """Convert Python-style `# comment` to JS-style `// comment`.
+
+    Skips shebangs (#!) and lines inside strings/template literals.
+    Only converts lines where # is the first non-whitespace character —
+    never touches # inside code (e.g. hex colours, URL fragments).
+    """
+    lines = content.split("\n")
+    fixed_count = 0
+    in_template = False
+
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+
+        # Track template literals
+        backtick_count = stripped.count("`")
+        if backtick_count % 2 != 0:
+            in_template = not in_template
+        if in_template:
+            continue
+
+        m = _JS_PYTHON_COMMENT.match(line)
+        if m:
+            indent = m.group(1)
+            comment_text = m.group(2)
+            lines[i] = f"{indent}// {comment_text}"
+            fixed_count += 1
+
+    if fixed_count:
+        content = "\n".join(lines)
+        fixes.append(
+            f"Converted {fixed_count} Python-style comment(s) to JS-style"
+        )
+
+    return content
+
+
+def _js_fix_unclosed_strings(content: str, fixes: list[str]) -> str:
+    """Fix unclosed string literals on single lines.
+
+    Detects lines with an odd number of unescaped quotes (same type) that
+    end with a semicolon, and adds the closing quote before the semicolon.
+    Only fixes simple cases — single-line strings that are clearly missing
+    their closing delimiter.
+    """
+    lines = content.split("\n")
+    fixed_count = 0
+
+    for i, line in enumerate(lines):
+        stripped = line.rstrip()
+        if not stripped or stripped.startswith("//"):
+            continue
+
+        for quote in ('"', "'"):
+            # Count unescaped quotes of this type
+            count = 0
+            for j, ch in enumerate(stripped):
+                if ch == quote and (j == 0 or stripped[j - 1] != "\\"):
+                    count += 1
+
+            # Odd count means unclosed — but only fix if the line ends with ;
+            if count % 2 != 0 and count >= 1:
+                if stripped.endswith(";"):
+                    lines[i] = stripped[:-1] + quote + ";"
+                    fixed_count += 1
+                    break  # Only fix one quote type per line
+                elif not stripped.endswith(quote):
+                    # Line doesn't end with ; or the quote — add closing quote
+                    # Only if the line looks like a statement (has = or ()
+                    if "=" in stripped or "(" in stripped:
+                        lines[i] = stripped + quote
+                        fixed_count += 1
+                        break
+
+    if fixed_count:
+        content = "\n".join(lines)
+        fixes.append(f"Closed {fixed_count} unclosed string literal(s)")
+
+    return content
+
+
+def _js_fix_innerhtml(content: str, fixes: list[str]) -> str:
+    """Replace .innerHTML with .textContent when RHS has no HTML tags.
+
+    Defence-in-depth: Semgrep blocks innerHTML with dynamic content, but
+    if code reaches the fixer it means Semgrep was bypassed or disabled.
+    Only replaces when the RHS is clearly not HTML (no < or > characters).
+    """
+    # Match: something.innerHTML = <value without HTML tags>
+    pattern = re.compile(
+        r'(\.innerHTML)(\s*=\s*)([^;]+;?)',
+        re.MULTILINE,
+    )
+
+    fixed_count = 0
+
+    def replace_if_safe(m: re.Match) -> str:
+        nonlocal fixed_count
+        rhs = m.group(3)
+        # Only replace if the RHS contains no HTML tag characters
+        if "<" not in rhs and ">" not in rhs:
+            fixed_count += 1
+            return ".textContent" + m.group(2) + m.group(3)
+        return m.group(0)
+
+    new_content = pattern.sub(replace_if_safe, content)
+
+    if fixed_count:
+        fixes.append(
+            f"Replaced {fixed_count} innerHTML assignment(s) with textContent"
+        )
+
+    return new_content
+
 
 def fix_javascript(content: str) -> FixResult:
-    """JavaScript/TypeScript semicolon insertion.
+    """JavaScript/TypeScript multi-pass fixer.
 
-    Conservative: only add semicolons to lines that clearly end a statement.
-    Skips template literals, comments, and block structures.
+    Applies fixes in order from most structural to most local:
+    1. Python-style comments → JS-style (must run before semicolon logic)
+    2. Object literal semicolons → commas
+    3. Double semicolons
+    4. Missing semicolons (original v2 logic)
+    5. Unclosed string literals
+    6. innerHTML → textContent (defence-in-depth)
     """
     result = FixResult(content=content)
     original = content
 
+    # --- Pass 1: Python comments → JS comments ---
+    content = _js_fix_python_comments(content, result.fixes_applied)
+
+    # --- Pass 2: Object literal semicolons → commas ---
+    # Must run BEFORE semicolon insertion so we don't add semicolons to
+    # object properties that should have commas
+    content = _js_fix_object_semicolons(content, result.fixes_applied)
+
+    # --- Pass 3: Double semicolons ---
+    content = _js_fix_double_semicolons(content, result.fixes_applied)
+
+    # --- Pass 4: Missing semicolons (original v2 logic) ---
     lines = content.split("\n")
     in_template = False
     in_block_comment = False
-    fixed_count = 0
+    semi_count = 0
 
     for i, line in enumerate(lines):
         stripped = line.strip()
@@ -1745,13 +2011,19 @@ def fix_javascript(content: str) -> FixResult:
         # Add semicolon if line ends with a statement-like token
         if _JS_SEMI_ENDINGS.search(stripped):
             lines[i] = line.rstrip() + ";"
-            fixed_count += 1
+            semi_count += 1
 
-    if fixed_count:
+    if semi_count:
         content = "\n".join(lines)
         result.fixes_applied.append(
-            f"Added {fixed_count} missing semicolon(s)"
+            f"Added {semi_count} missing semicolon(s)"
         )
+
+    # --- Pass 5: Unclosed string literals ---
+    content = _js_fix_unclosed_strings(content, result.fixes_applied)
+
+    # --- Pass 6: innerHTML → textContent ---
+    content = _js_fix_innerhtml(content, result.fixes_applied)
 
     result.content = content
     result.changed = content != original
@@ -2049,12 +2321,27 @@ def fix_code(filename: str, content: str) -> FixResult:
     # Select fixer chain: match by exact filename first (Dockerfile),
     # then by extension, then fallback to universal-only
     chain = FIXER_CHAINS.get(name) or FIXER_CHAINS.get(ext) or [fix_universal]
+    chain_names = [f.__name__ for f in chain]
+
+    logger.debug(
+        "Code fixer starting",
+        extra={
+            "event": "code_fixer_start",
+            "filename": filename,
+            "ext": ext,
+            "chain": chain_names,
+            "content_length": len(content),
+            "content_preview": content[:500],
+            "has_entities": ("&lt;" in content or "&gt;" in content),
+        },
+    )
 
     # Run chain with error isolation — if any fixer crashes, skip it
     # and continue with the remaining fixers
     combined = FixResult(content=content)
     for fixer in chain:
         try:
+            pre_fixer = combined.content
             if fixer == strip_prose:
                 lang = ext.lstrip(".") or name.lower()
                 r = fixer(combined.content, lang)
@@ -2067,6 +2354,31 @@ def fix_code(filename: str, content: str) -> FixResult:
             combined.fixes_applied.extend(r.fixes_applied)
             combined.errors_found.extend(r.errors_found)
             combined.warnings.extend(r.warnings)
+
+            if r.changed:
+                logger.debug(
+                    "Code fixer layer applied changes",
+                    extra={
+                        "event": "code_fixer_layer",
+                        "filename": filename,
+                        "fixer": fixer.__name__,
+                        "fixes": r.fixes_applied,
+                        "content_length_before": len(pre_fixer),
+                        "content_length_after": len(r.content),
+                        "content_preview_after": r.content[:500],
+                        "had_entities_before": ("&lt;" in pre_fixer),
+                        "has_entities_after": ("&lt;" in r.content),
+                    },
+                )
+            else:
+                logger.debug(
+                    "Code fixer layer — no changes",
+                    extra={
+                        "event": "code_fixer_layer_noop",
+                        "filename": filename,
+                        "fixer": fixer.__name__,
+                    },
+                )
         except Exception as exc:
             # Fail-safe: log the error but don't block the file write
             fixer_name = fixer.__name__

@@ -406,6 +406,66 @@
         appendToHistory({ role: 'plan', planSummary: planSummary, steps: steps, approvalId: approvalId });
     }
 
+    function renderConfirmation(preview, confirmationId, taskId, resolver) {
+        // Confirmation gate UI — same pattern as plan approval.
+        // Calls POST /api/confirm/{id} instead of sending "go" via WebSocket.
+        var safeId = escapeHtml(confirmationId);
+        var html = '<div class="label">Sentinel <span class="msg-time">' + formatTimestamp() + '</span></div>';
+        html += '<div class="plan-summary">' + escapeHtml(preview) + '</div>';
+        html += '<div class="approval-buttons" id="confirm-' + safeId + '">';
+        html += '<button class="btn btn-approve" data-action="confirm">Confirm</button>';
+        html += '<button class="btn btn-deny" data-action="cancel">Cancel</button>';
+        html += '</div>';
+
+        addMessage('system', html);
+
+        var container = document.getElementById('confirm-' + safeId);
+        if (container) {
+            container.querySelectorAll('button').forEach(function (btn) {
+                btn.addEventListener('click', function () {
+                    container.querySelectorAll('button').forEach(function (b) { b.disabled = true; });
+                    var granted = btn.getAttribute('data-action') === 'confirm';
+                    container.innerHTML = '<span style="color:var(--text-muted)">' + (granted ? 'Confirmed' : 'Cancelled') + '</span>';
+
+                    if (granted) {
+                        var statusId = 'exec-' + Date.now();
+                        addStatusMessage('Executing confirmed action...', statusId);
+                        apiPost('confirm/' + confirmationId, { granted: true, reason: 'Confirmed via WebUI' }).then(function (data) {
+                            removeElement(statusId);
+                            if (data.status === 'success') {
+                                addSystemMessage(data.response || 'Action completed.');
+                                showToast('Action completed', 'success');
+                            } else if (data.status === 'blocked') {
+                                addErrorMessage('Blocked: ' + (data.reason || 'Policy violation'));
+                            } else if (data.status === 'error') {
+                                addErrorMessage('Error: ' + (data.reason || 'Action failed'));
+                            } else {
+                                addSystemMessage(data.response || 'Action completed.');
+                            }
+                            isProcessing = false;
+                            setInputEnabled(true);
+                        }).catch(function (err) {
+                            removeElement(statusId);
+                            addErrorMessage('Failed to confirm: ' + err.message);
+                            isProcessing = false;
+                            setInputEnabled(true);
+                        });
+                    } else {
+                        apiPost('confirm/' + confirmationId, { granted: false, reason: 'Cancelled via WebUI' }).then(function () {
+                            addSystemMessage('Action cancelled.');
+                            isProcessing = false;
+                            setInputEnabled(true);
+                        }).catch(function (err) {
+                            addErrorMessage('Failed to cancel: ' + err.message);
+                            isProcessing = false;
+                            setInputEnabled(true);
+                        });
+                    }
+                });
+            });
+        }
+    }
+
     function renderStepResults(stepResults) {
         if (!stepResults || stepResults.length === 0) return;
         var html = '<div class="label">Sentinel</div><div class="step-results">';
@@ -596,6 +656,9 @@
             } else if (eventName === 'approval_requested' && resolver) {
                 removeElement(resolver.statusId);
                 renderPlan(data.plan_summary || 'Plan ready', data.steps || [], data.approval_id || '');
+            } else if (eventName === 'awaiting_confirmation' && resolver) {
+                removeElement(resolver.statusId);
+                renderConfirmation(data.preview || 'Confirm action?', data.confirmation_id || '', taskId, resolver);
             } else if (eventName === 'step_completed' && resolver) {
                 var stepStatus = data.status === 'success' ? 'completed' : data.status;
                 updateStatusMessage(resolver.statusId, 'Step ' + (data.step_id || '?') + ' ' + stepStatus);

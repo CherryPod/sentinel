@@ -99,7 +99,7 @@ def _make_router(
 async def test_fast_route_dispatches_to_fast_path():
     """Fast classification dispatches to fast_path.execute, not orchestrator."""
     result_cls = ClassificationResult(
-        route=Route.FAST, template_name="send_signal", params={"to": "alice"},
+        route=Route.FAST, template_name="send_signal", params={"to": "keith"},
     )
     router, classifier, fast_path, orchestrator, *_ = _make_router(
         classifier_result=result_cls,
@@ -194,7 +194,7 @@ async def test_user_id_threaded_through():
     With no contact_store, resolve_contacts defaults to user_id=1.
     """
     result_cls = ClassificationResult(
-        route=Route.FAST, template_name="send_signal", params={"to": "alice"},
+        route=Route.FAST, template_name="send_signal", params={"to": "keith"},
     )
     router, _, fast_path, *_ = _make_router(classifier_result=result_cls)
 
@@ -244,9 +244,9 @@ async def test_go_confirms_and_executes():
     cid = await gate.create(
         user_id=1, channel="signal", source_key="signal:abc",
         tool_name="signal_send",
-        tool_params={"message": "hello", "recipient": "alice"},
-        preview_text="Send via Signal to Alice: hello",
-        original_request="tell alice hello",
+        tool_params={"message": "hello", "recipient": "keith"},
+        preview_text="Send via Signal to Keith: hello",
+        original_request="tell keith hello",
         task_id="task-001",
     )
 
@@ -275,7 +275,7 @@ async def test_go_case_insensitive():
     await gate.create(
         user_id=1, channel="signal", source_key="signal:abc",
         tool_name="signal_send",
-        tool_params={"message": "hi", "recipient": "alice"},
+        tool_params={"message": "hi", "recipient": "keith"},
         preview_text="preview", original_request="request",
         task_id="task-002",
     )
@@ -300,7 +300,7 @@ async def test_non_go_cancels_and_routes_normally():
     cid = await gate.create(
         user_id=1, channel="signal", source_key="signal:abc",
         tool_name="signal_send",
-        tool_params={"message": "hi", "recipient": "alice"},
+        tool_params={"message": "hi", "recipient": "keith"},
         preview_text="preview", original_request="request",
         task_id="task-003",
     )

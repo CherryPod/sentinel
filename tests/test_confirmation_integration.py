@@ -63,7 +63,7 @@ class TestConfirmationE2E:
         classifier.classify.return_value = ClassificationResult(
             route=Route.FAST,
             template_name="signal_send",
-            params={"message": "hello", "recipient": "alice"},
+            params={"message": "hello", "recipient": "keith"},
             reason="matched",
         )
 
@@ -89,7 +89,7 @@ class TestConfirmationE2E:
 
         # Step 1: Send the original message — should pause
         result1 = await router.route(
-            user_request="tell alice hello on signal",
+            user_request="tell keith hello on signal",
             source="signal",
             source_key="signal:abc",
         )
@@ -147,7 +147,7 @@ class TestConfirmationE2E:
             ClassificationResult(
                 route=Route.FAST,
                 template_name="signal_send",
-                params={"message": "hello", "recipient": "alice"},
+                params={"message": "hello", "recipient": "keith"},
                 reason="matched",
             ),
             ClassificationResult(
@@ -179,7 +179,7 @@ class TestConfirmationE2E:
 
         # Step 1: Trigger confirmation
         result1 = await router.route(
-            user_request="tell alice hello",
+            user_request="tell keith hello",
             source="signal",
             source_key="signal:abc",
         )

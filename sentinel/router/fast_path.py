@@ -101,8 +101,29 @@ class FastPathExecutor:
             "template": template_name,
         })
 
+        # Default recipient for messaging tools — when no recipient was
+        # extracted from the user message, fall back to the requesting user's
+        # own channel identifier (e.g., send back to the Signal sender).
+        from sentinel.contacts.resolver import (
+            resolve_default_recipient,
+            resolve_tool_recipient,
+        )
+        if (
+            template_name in ("signal_send", "telegram_send")
+            and not params.get("recipient")
+            and self._contact_store is not None
+        ):
+            default = await resolve_default_recipient(
+                self._contact_store, template.tool, user_id,
+            )
+            if default:
+                params["recipient"] = default
+                logger.info(
+                    "Fast-path defaulted recipient to self for %s",
+                    template_name,
+                )
+
         # Resolve opaque recipient IDs before execution
-        from sentinel.contacts.resolver import resolve_tool_recipient
         try:
             params = await resolve_tool_recipient(
                 self._contact_store, template.tool, params,

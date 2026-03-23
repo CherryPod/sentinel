@@ -263,7 +263,7 @@ class Reranker:
         # Pre-fix: all scores were 0.999x (uniform). Post-fix: expect spread.
         all_scores = [r.rerank_score for r in scored_results]
         selected_scores = [r.rerank_score for r in results]
-        logger.info(
+        logger.debug(
             "Re-ranking completed (with MMR)",
             extra={
                 "event": "rerank_complete",

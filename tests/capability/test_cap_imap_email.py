@@ -5,9 +5,10 @@ config, tag results as UNTRUSTED, enforce credential isolation, and handle
 Proton Bridge specifics (self-signed certs, connection failures).
 All tests mock imaplib/aiosmtplib — no live IMAP/SMTP servers.
 
-49 tests total.
+50 tests total.
 """
 
+import base64
 import email
 import imaplib
 import ssl
@@ -937,3 +938,42 @@ async def test_smtp_host_not_configured():
                 "subject": "Test",
                 "body": "Hello",
             })
+
+
+# -- Base64 snippet decoding ------------------------------------------------
+
+@pytest.mark.capability
+@pytest.mark.asyncio
+async def test_imap_search_decodes_base64_snippet():
+    """Base64-encoded body → snippet shows decoded text, not raw base64."""
+    plain_text = "Hello team, here is the decoded content."
+    b64_body = base64.b64encode(plain_text.encode("utf-8"))
+
+    # Header includes Content-Transfer-Encoding: base64
+    header = (
+        "Subject: Base64 Email\r\n"
+        "From: sender@example.com\r\n"
+        "Date: Mon, 17 Feb 2026 10:00:00 +0000\r\n"
+        "Content-Transfer-Encoding: base64\r\n"
+    ).encode()
+
+    fetch_responses = {
+        b"200": ("OK", [
+            (b"1 (BODY[HEADER.FIELDS (SUBJECT FROM DATE CONTENT-TRANSFER-ENCODING)]", header),
+            (b"1 (BODY[TEXT]", b64_body),
+        ]),
+    }
+    conn = _mock_imap_conn(search_uids=[b"200"], fetch_responses=fetch_responses)
+
+    mock_settings = _imap_settings()
+    with patch("sentinel.core.config.settings", mock_settings):
+        with patch("sentinel.integrations.imap_email._imap_connect", return_value=conn):
+            executor = ToolExecutor(policy_engine=_mock_engine())
+            result, _ = await executor.execute("email_search", {"query": "from:sender"})
+
+    assert isinstance(result, TaggedData)
+    # Snippet should contain decoded text, not the base64 string
+    assert "Hello team" in result.content
+    assert "decoded content" in result.content
+    # Raw base64 should NOT appear in the snippet
+    assert "SGVsbG8" not in result.content

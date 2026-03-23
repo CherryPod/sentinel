@@ -131,21 +131,21 @@ class TestContactEndpoints:
     def test_create_contact(self, client):
         # Contact is created under current_user_id (=1), not a passed user_id
         resp = client.post("/api/contacts", json={
-            "display_name": "Alice",
+            "display_name": "Keith",
         })
         assert resp.status_code == 201
         data = resp.json()
-        assert data["display_name"] == "Alice"
+        assert data["display_name"] == "Keith"
         assert data["user_id"] == 1  # current_user_id from fixture
 
     def test_get_contact_includes_channels(self, client, contact_store):
-        contact = _run(contact_store.create_contact(1, "Alice"))
+        contact = _run(contact_store.create_contact(1, "Keith"))
         _run(contact_store.create_channel(contact["contact_id"], "signal", "uuid-123"))
 
         resp = client.get(f"/api/contacts/{contact['contact_id']}")
         assert resp.status_code == 200
         data = resp.json()
-        assert data["display_name"] == "Alice"
+        assert data["display_name"] == "Keith"
         assert len(data["channels"]) == 1
         assert data["channels"][0]["channel"] == "signal"
 
@@ -190,9 +190,9 @@ class TestContactEndpoints:
         assert resp.status_code == 404
 
     def test_delete_contact_with_routine_refs(self, client, contact_store, routine_store):
-        contact = _run(contact_store.create_contact(1, "Alice"))
+        contact = _run(contact_store.create_contact(1, "Keith"))
 
-        # Create a routine that references "Alice" in its prompt
+        # Create a routine that references "Keith" in its prompt
         _run(routine_store.create(
             name="morning-signal",
             trigger_type="cron",
@@ -214,7 +214,7 @@ class TestContactEndpoints:
         assert resp.status_code == 200
 
     def test_delete_contact_with_confirm(self, client, contact_store, routine_store):
-        contact = _run(contact_store.create_contact(1, "Alice"))
+        contact = _run(contact_store.create_contact(1, "Keith"))
 
         _run(routine_store.create(
             name="morning-signal",
@@ -243,7 +243,7 @@ class TestContactEndpoints:
 class TestChannelEndpoints:
 
     def test_add_channel(self, client, contact_store):
-        contact = _run(contact_store.create_contact(1, "Alice"))
+        contact = _run(contact_store.create_contact(1, "Keith"))
 
         resp = client.post(
             f"/api/contacts/{contact['contact_id']}/channels",
@@ -256,7 +256,7 @@ class TestChannelEndpoints:
         assert data["is_default"] is True
 
     def test_list_channels(self, client, contact_store):
-        contact = _run(contact_store.create_contact(1, "Alice"))
+        contact = _run(contact_store.create_contact(1, "Keith"))
         _run(contact_store.create_channel(contact["contact_id"], "signal", "uuid-1"))
         _run(contact_store.create_channel(contact["contact_id"], "email", "k@example.com"))
 
@@ -268,7 +268,7 @@ class TestChannelEndpoints:
         assert types == {"signal", "email"}
 
     def test_duplicate_channel_identifier(self, client, contact_store):
-        contact = _run(contact_store.create_contact(1, "Alice"))
+        contact = _run(contact_store.create_contact(1, "Keith"))
 
         client.post(
             f"/api/contacts/{contact['contact_id']}/channels",
@@ -282,7 +282,7 @@ class TestChannelEndpoints:
         assert resp.status_code == 409
 
     def test_invalid_channel_type(self, client, contact_store):
-        contact = _run(contact_store.create_contact(1, "Alice"))
+        contact = _run(contact_store.create_contact(1, "Keith"))
 
         resp = client.post(
             f"/api/contacts/{contact['contact_id']}/channels",
@@ -291,7 +291,7 @@ class TestChannelEndpoints:
         assert resp.status_code == 422
 
     def test_delete_channel(self, client, contact_store):
-        contact = _run(contact_store.create_contact(1, "Alice"))
+        contact = _run(contact_store.create_contact(1, "Keith"))
         ch = _run(contact_store.create_channel(contact["contact_id"], "email", "k@example.com"))
 
         resp = client.delete(
@@ -305,7 +305,7 @@ class TestChannelEndpoints:
         assert resp.json() == []
 
     def test_update_channel(self, client, contact_store):
-        contact = _run(contact_store.create_contact(1, "Alice"))
+        contact = _run(contact_store.create_contact(1, "Keith"))
         ch = _run(contact_store.create_channel(contact["contact_id"], "email", "old@example.com"))
 
         resp = client.put(

@@ -199,11 +199,12 @@ class TestRegistryDefault:
             "calendar_add",
             "email_search",
             "email_read",
+            "email_send",
             "web_search",
             "x_search",
             "signal_send",
             "telegram_send",
-            "memory_search",
+            # memory_search commented out — not wired into ToolExecutor
         }
         assert set(registry.names()) == expected
 
@@ -267,12 +268,19 @@ class TestRegistryDefault:
         assert t.side_effect is True
         assert t.source_is_user is True
 
-    def test_memory_search(self, registry):
-        t = registry.get("memory_search")
+    def test_email_send(self, registry):
+        t = registry.get("email_send")
         assert t is not None
-        assert t.tool == "memory_search"
-        assert t.required_params == ["query"]
-        assert t.side_effect is False
+        assert t.tool == "email_send"
+        assert t.required_params == ["recipient", "subject", "body"]
+        assert t.side_effect is True
+        assert t.requires_confirmation is True
+        assert t.source_is_user is True
+        assert t.param_aliases == {"to": "recipient"}
+
+    def test_memory_search_not_registered(self, registry):
+        # memory_search commented out — not wired into ToolExecutor
+        assert registry.get("memory_search") is None
 
 
 class TestRegistryOperations:
@@ -354,23 +362,34 @@ class TestTemplateFormatPreview:
     def test_signal_send_preview(self):
         registry = TemplateRegistry.default()
         t = registry.get("signal_send")
-        preview = t.format_preview({"message": "Hello Alice", "recipient": "Alice"})
+        preview = t.format_preview({"message": "Hello Keith", "recipient": "Keith"})
         assert "Signal" in preview
-        assert "Alice" in preview
-        assert "Hello Alice" in preview
+        assert "Keith" in preview
+        assert "Hello Keith" in preview
 
     def test_telegram_send_preview(self):
         registry = TemplateRegistry.default()
         t = registry.get("telegram_send")
-        preview = t.format_preview({"message": "Hi there", "recipient": "Alice"})
+        preview = t.format_preview({"message": "Hi there", "recipient": "Keith"})
         assert "Telegram" in preview
         assert "Hi there" in preview
+
+    def test_email_send_preview(self):
+        registry = TemplateRegistry.default()
+        t = registry.get("email_send")
+        preview = t.format_preview({
+            "recipient": "john@example.com",
+            "subject": "Meeting notes",
+            "body": "Here are the notes from today.",
+        })
+        assert "john@example.com" in preview
+        assert "Meeting notes" in preview
 
     def test_preview_truncates_long_message(self):
         registry = TemplateRegistry.default()
         t = registry.get("signal_send")
         long_msg = "x" * 500
-        preview = t.format_preview({"message": long_msg, "recipient": "Alice"})
+        preview = t.format_preview({"message": long_msg, "recipient": "Keith"})
         # Preview should not contain the full 500 chars
         assert len(preview) < 300
 
@@ -392,16 +411,67 @@ class TestTemplateFormatPreview:
         assert "custom_tool" in preview
 
 
+class TestKeywordClassifierSync:
+    """Every template name in the keyword classifier must exist in the registry.
+
+    This prevents drift where a pattern routes to a template that doesn't
+    exist, causing silent fallback to planner.
+    """
+
+    def test_all_classifier_templates_exist_in_registry(self):
+        from sentinel.router.keyword_classifier import KeywordClassifier
+
+        registry = TemplateRegistry.default()
+        kc = KeywordClassifier(registry=registry)
+
+        # Extract all unique template names from the classifier's patterns
+        classifier_templates = {entry.template_name for entry in kc._patterns}
+
+        missing = []
+        for name in classifier_templates:
+            if registry.get(name) is None:
+                missing.append(name)
+
+        assert not missing, (
+            f"Keyword classifier references templates not in registry: {missing}. "
+            f"Add them to TemplateRegistry.default() or remove the patterns."
+        )
+
+    def test_all_registry_templates_have_classifier_patterns(self):
+        """Every registry template should have at least one keyword pattern.
+
+        This is advisory — not every template needs fast-path patterns
+        (some may only be accessible via planner). But it catches templates
+        that were intended to be fast-pathed but have no route in.
+        """
+        from sentinel.router.keyword_classifier import KeywordClassifier
+
+        registry = TemplateRegistry.default()
+        kc = KeywordClassifier(registry=registry)
+
+        classifier_templates = {entry.template_name for entry in kc._patterns}
+        registry_templates = set(registry.names())
+
+        uncovered = registry_templates - classifier_templates
+        # This is a soft check — some templates might intentionally only
+        # be reachable via planner or confirmation flows
+        assert not uncovered, (
+            f"Registry templates with no keyword classifier patterns: {uncovered}. "
+            f"These are only reachable via the planner. If intentional, add to "
+            f"the allow-list in this test."
+        )
+
+
 class TestTemplateRequiresConfirmation:
     def test_side_effect_templates_require_confirmation(self):
         registry = TemplateRegistry.default()
-        for name in ["calendar_add", "signal_send", "telegram_send"]:
+        for name in ["calendar_add", "email_send", "signal_send", "telegram_send"]:
             t = registry.get(name)
             assert t.requires_confirmation is True, f"{name} should require confirmation"
 
     def test_read_only_templates_do_not_require_confirmation(self):
         registry = TemplateRegistry.default()
         for name in ["calendar_read", "email_search", "email_read",
-                      "web_search", "x_search", "memory_search"]:
+                      "web_search", "x_search"]:
             t = registry.get(name)
             assert t.requires_confirmation is False, f"{name} should not require confirmation"

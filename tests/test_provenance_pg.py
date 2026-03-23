@@ -222,20 +222,24 @@ class TestFileProvenance:
         sql = conn.execute.call_args[0][0]
         assert "ON CONFLICT" in sql
         assert "DO UPDATE SET" in sql
+        assert "content_sha256" in sql
 
     @pytest.mark.asyncio
     async def test_get_file_writer(self, store, mock_pool):
         _, conn = mock_pool
-        conn.fetchval.return_value = "d-123"
+        conn.fetchrow.return_value = {
+            "writer_data_id": "d-123",
+            "content_sha256": "abc123hash",
+        }
 
         result = await store.get_file_writer("/workspace/test.py")
 
-        assert result == "d-123"
+        assert result == ("d-123", "abc123hash")
 
     @pytest.mark.asyncio
     async def test_get_file_writer_not_found(self, store, mock_pool):
         _, conn = mock_pool
-        conn.fetchval.return_value = None
+        conn.fetchrow.return_value = None
 
         result = await store.get_file_writer("/nonexistent")
 
@@ -417,26 +421,32 @@ class TestGetFileWriterUserIsolation:
     async def test_get_file_writer_filters_by_user_id(self, store, mock_pool):
         """get_file_writer with user_id should add AND user_id = $2."""
         _, conn = mock_pool
-        conn.fetchval.return_value = "d-user1"
+        conn.fetchrow.return_value = {
+            "writer_data_id": "d-user1",
+            "content_sha256": "hash-user1",
+        }
 
         result = await store.get_file_writer("/workspace/test.py", user_id=1)
 
-        assert result == "d-user1"
-        sql = conn.fetchval.call_args[0][0]
+        assert result == ("d-user1", "hash-user1")
+        sql = conn.fetchrow.call_args[0][0]
         assert "user_id = $2" in sql
         # Verify user_id parameter was passed
-        assert conn.fetchval.call_args[0][2] == 1
+        assert conn.fetchrow.call_args[0][2] == 1
 
     @pytest.mark.asyncio
     async def test_get_file_writer_no_user_id_omits_filter(self, store, mock_pool):
         """get_file_writer without user_id should not filter by user."""
         _, conn = mock_pool
-        conn.fetchval.return_value = "d-any"
+        conn.fetchrow.return_value = {
+            "writer_data_id": "d-any",
+            "content_sha256": "hash-any",
+        }
 
         result = await store.get_file_writer("/workspace/test.py")
 
-        assert result == "d-any"
-        sql = conn.fetchval.call_args[0][0]
+        assert result == ("d-any", "hash-any")
+        sql = conn.fetchrow.call_args[0][0]
         assert "user_id" not in sql
 
 

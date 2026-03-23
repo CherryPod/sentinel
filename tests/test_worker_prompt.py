@@ -22,7 +22,7 @@ class TestWorkerPromptStructure:
         """Security rules positioned early (before environment section)."""
         from sentinel.worker.ollama import QWEN_SYSTEM_PROMPT_TEMPLATE
         prompt = QWEN_SYSTEM_PROMPT_TEMPLATE
-        assert prompt.index("SECURITY") < prompt.index("ENVIRONMENT")
+        assert prompt.index("<security_rules>") < prompt.index("<environment>")
 
     def test_positive_framing_system_prompt_rule(self):
         """System prompt confidentiality uses positive framing."""
@@ -35,7 +35,7 @@ class TestWorkerPromptStructure:
         """ASCII/emoji rule in output or code section, not security section."""
         from sentinel.worker.ollama import QWEN_SYSTEM_PROMPT_TEMPLATE
         prompt = QWEN_SYSTEM_PROMPT_TEMPLATE
-        security_end = prompt.index("ENVIRONMENT") if "ENVIRONMENT" in prompt else prompt.index("OUTPUT")
+        security_end = prompt.index("</security_rules>")
         security_section = prompt[:security_end]
         # ASCII rule should NOT be in the security section
         assert "emoji" not in security_section.lower()

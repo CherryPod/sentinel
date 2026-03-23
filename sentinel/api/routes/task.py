@@ -7,6 +7,7 @@ Endpoints:
   POST /api/task                    — submit a new task (main CaMeL pipeline entry)
   GET  /api/approval/{approval_id}  — check approval status
   POST /api/approve/{approval_id}   — approve or deny a pending approval
+  POST /api/confirm/{confirmation_id} — confirm or cancel a fast-path confirmation gate action
   GET  /api/session/{session_id}    — debug endpoint for session state
 
 Compatibility note: the safety-net test CI-2 patches app_module._shutting_down
@@ -180,6 +181,40 @@ async def submit_approval(approval_id: str, decision: ApprovalDecision):
         return result.model_dump()
 
     return {"status": "denied", "reason": decision.reason}
+
+
+@router.post("/confirm/{confirmation_id}")
+async def submit_confirmation(confirmation_id: str, decision: ApprovalDecision):
+    """Confirm or cancel a pending fast-path confirmation gate action.
+
+    Same contract as /approve — returns the tool execution result on confirm,
+    or a denied/error status dict.
+    """
+    from sentinel.core.context import current_user_id
+
+    if _message_router is None:
+        return {"status": "error", "reason": "Router not available"}
+
+    gate = getattr(_message_router, "_confirmation_gate", None)
+    fast_path = getattr(_message_router, "_fast_path", None)
+    if gate is None or fast_path is None:
+        return {"status": "error", "reason": "Confirmation gate not available"}
+
+    ctx_token = current_user_id.set(1)
+    try:
+        if decision.granted:
+            entry = await gate.confirm(confirmation_id)
+            if entry is None:
+                return {"status": "error", "reason": "Invalid, expired, or duplicate confirmation"}
+            result = await fast_path.execute_confirmed(
+                entry.tool_name, entry.tool_params, entry.task_id,
+            )
+            return result
+        else:
+            await gate.cancel(confirmation_id)
+            return {"status": "denied", "reason": decision.reason or "Cancelled via WebUI"}
+    finally:
+        current_user_id.reset(ctx_token)
 
 
 # ── Session debug endpoint ────────────────────────────────────────

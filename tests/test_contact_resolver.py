@@ -42,14 +42,14 @@ async def populated_store(store):
     User 2 (Jane):  has contact "Sarah" (contact_id=4) — different from user 1's Sarah.
     """
     # Users
-    await store.create_user("Alice")      # user_id=1
+    await store.create_user("Keith")      # user_id=1
     await store.create_user("Jane")       # user_id=2
 
     # User 1's contacts
     sarah = await store.create_contact(1, "Sarah")                        # contact_id=1
     sam = await store.create_contact(1, "Sam")                            # contact_id=2
     keith_self = await store.create_contact(                              # contact_id=3
-        1, "Alice", linked_user_id=1, is_user=True,
+        1, "Keith", linked_user_id=1, is_user=True,
     )
 
     # User 2's contacts

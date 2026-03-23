@@ -358,7 +358,7 @@ class TestFastPathConfirmation:
         executor = _make_executor(confirmation_gate=gate)
         result = await executor.execute(
             "signal_send",
-            {"message": "hello", "recipient": "alice"},
+            {"message": "hello", "recipient": "keith"},
             _make_session(),
             "task-001",
             user_id=1,
@@ -390,7 +390,7 @@ class TestFastPathConfirmation:
         executor = _make_executor(confirmation_gate=gate)
         result = await executor.execute_confirmed(
             "signal_send",
-            {"message": "hello", "recipient": "alice"},
+            {"message": "hello", "recipient": "keith"},
             "task-003",
         )
         assert result["status"] == "success"
@@ -401,7 +401,7 @@ class TestFastPathConfirmation:
         executor = _make_executor(confirmation_gate=None)
         result = await executor.execute(
             "signal_send",
-            {"message": "hello", "recipient": "alice"},
+            {"message": "hello", "recipient": "keith"},
             _make_session(),
             "task-004",
             user_id=1,

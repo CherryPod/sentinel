@@ -203,6 +203,7 @@ _TABLES_FK = [
         file_path       TEXT PRIMARY KEY,
         user_id         INTEGER NOT NULL REFERENCES users(user_id),
         writer_data_id  TEXT NOT NULL REFERENCES provenance(data_id),
+        content_sha256  TEXT NOT NULL DEFAULT '',
         created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
     """,
@@ -380,6 +381,8 @@ _OTHER_INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_er_domain ON episodic_records(task_domain) WHERE task_domain IS NOT NULL;",
     # Strategy patterns — domain + user lookup
     "CREATE INDEX IF NOT EXISTS idx_sp_domain_user ON strategy_patterns(domain, user_id);",
+    # File provenance content hash (trust laundering fix) — migration for existing databases
+    "ALTER TABLE file_provenance ADD COLUMN IF NOT EXISTS content_sha256 TEXT NOT NULL DEFAULT '';",
 ]
 
 
@@ -439,6 +442,9 @@ _ROLE_SETUP = [
     "REVOKE UPDATE, DELETE ON audit_log FROM sentinel_app;",
     # Revoke SELECT on audit_log from app role — admin-read-only (S1 hardening)
     "REVOKE SELECT ON audit_log FROM sentinel_app;",
+    # Prevent sentinel_app from delegating its own privileges (B5-5.2.4)
+    "REVOKE GRANT OPTION FOR SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public FROM sentinel_app;",
+    "REVOKE GRANT OPTION FOR USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public FROM sentinel_app;",
     # Default privileges for future tables (so new tables auto-grant)
     "ALTER DEFAULT PRIVILEGES FOR ROLE sentinel_owner IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO sentinel_app;",
     "ALTER DEFAULT PRIVILEGES FOR ROLE sentinel_owner IN SCHEMA public GRANT USAGE, SELECT ON SEQUENCES TO sentinel_app;",
@@ -536,6 +542,11 @@ _RLS_POLICIES.extend([
     END
     $$;
     """,
+    # Ensure sentinel_app can only INSERT audit entries for their own user_id (B5-5.1.2)
+    "DROP POLICY IF EXISTS app_insert_user_isolation ON audit_log;",
+    """CREATE POLICY app_insert_user_isolation ON audit_log
+   FOR INSERT TO sentinel_app
+   WITH CHECK (user_id = current_setting('app.current_user_id', true)::INTEGER);""",
     # Owner policies for audit_log — SELECT + INSERT only (no UPDATE/DELETE).
     # Replaces the old owner_full_access policy that allowed destructive ops.
     "DROP POLICY IF EXISTS owner_full_access ON audit_log;",

@@ -253,7 +253,7 @@ def _imap_search_sync(config, query: str, max_results: int) -> list[EmailSearchR
         results = []
         for uid in uids:
             status, msg_data = conn.uid(
-                "fetch", uid, "(BODY.PEEK[HEADER.FIELDS (SUBJECT FROM DATE)] BODY.PEEK[TEXT])"
+                "fetch", uid, "(BODY.PEEK[HEADER.FIELDS (SUBJECT FROM DATE CONTENT-TRANSFER-ENCODING)] BODY.PEEK[TEXT])"
             )
             if status != "OK" or not msg_data or not msg_data[0]:
                 continue
@@ -274,6 +274,20 @@ def _imap_search_sync(config, query: str, max_results: int) -> list[EmailSearchR
             if len(msg_data) > 1 and isinstance(msg_data[1], tuple):
                 body_preview = msg_data[1][1]
                 if isinstance(body_preview, bytes):
+                    # Decode Content-Transfer-Encoding (base64, quoted-printable)
+                    encoding = header_msg.get("Content-Transfer-Encoding", "").lower().strip()
+                    if "base64" in encoding:
+                        import base64
+                        try:
+                            body_preview = base64.b64decode(body_preview)
+                        except Exception:
+                            pass  # Keep raw bytes if decode fails
+                    elif "quoted-printable" in encoding:
+                        import quopri
+                        try:
+                            body_preview = quopri.decodestring(body_preview)
+                        except Exception:
+                            pass
                     snippet = body_preview.decode("utf-8", errors="replace")[:200].strip()
                     snippet = re.sub(r"\s+", " ", snippet)
 

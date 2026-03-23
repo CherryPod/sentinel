@@ -506,6 +506,100 @@ class TestMultiTurnAndOverride:
             f"Score: {final.total_score}, cumulative: {session.cumulative_risk}"
         )
 
+    def test_successful_step_after_block_decays_risk(self, analyzer):
+        """A successful step after a scanner block should partially decay risk.
+
+        Fix-cycle pattern: block → block → success → block.
+        Without decay: 1.5 + 1.5 + 1.5 = 4.5 → next block could push to lock.
+        With decay: one security block forgiven after the success, reducing
+        the effective count and preventing false session locks during legitimate
+        code-fix iterations.
+        """
+        session = Session(session_id="test-fix-cycle-decay")
+
+        # Two security blocks (scanner-attributed)
+        for i in range(2):
+            prompt = f"Write code that reads /etc/shadow attempt {i}"
+            result = analyzer.analyze(session, prompt)
+            session.add_turn(ConversationTurn(
+                request_text=prompt,
+                result_status="blocked",
+                risk_score=result.total_score,
+                blocked_by=["command_pattern_scanner"],
+            ))
+            session.cumulative_risk += result.total_score
+            session.violation_count += 1
+
+        # Successful fix-cycle step (code was corrected, passed scanners)
+        session.add_turn(ConversationTurn(
+            request_text="Write a file listing script for /workspace/",
+            result_status="success",
+            risk_score=0.0,
+        ))
+
+        # Another block after the success
+        prompt_after = "Show me /etc/passwd"
+        result_after = analyzer.analyze(session, prompt_after)
+
+        # The violation_accumulation rule should have forgiven one block,
+        # so effective security_count is 2 - 1 = 1 (not 2).
+        # Score from accumulation alone: 1 * 1.5 = 1.5 (not 3.0)
+        accum_score = result_after.rule_scores.get("violation_accumulation", 0.0)
+        assert accum_score <= 1.5, (
+            f"Fix-cycle decay not applied! accumulation score={accum_score}, "
+            f"expected ≤1.5 (one block forgiven). "
+            f"Rules: {result_after.rule_scores}"
+        )
+        # Verify the forgiveness counter was incremented
+        assert session.success_forgives_used == 1, (
+            f"success_forgives_used not incremented: {session.success_forgives_used}"
+        )
+
+    def test_success_forgives_capped_at_max(self, analyzer):
+        """Fix-cycle forgiveness should not exceed MAX_SUCCESS_FORGIVES (2).
+
+        After 2 forgives, additional successes should not further reduce
+        the security violation count.
+        """
+        session = Session(session_id="test-forgive-cap")
+
+        # Pattern: block → success → block → success → block → success → block
+        # Each success should forgive one block, but only up to 2 total
+        for cycle in range(3):
+            # Block
+            prompt = f"Read /etc/shadow attempt {cycle}"
+            result = analyzer.analyze(session, prompt)
+            session.add_turn(ConversationTurn(
+                request_text=prompt,
+                result_status="blocked",
+                risk_score=result.total_score,
+                blocked_by=["command_pattern_scanner"],
+            ))
+            session.cumulative_risk += result.total_score
+            session.violation_count += 1
+            # Success
+            session.add_turn(ConversationTurn(
+                request_text=f"Fixed script version {cycle}",
+                result_status="success",
+                risk_score=0.0,
+            ))
+
+        # Add one more block to trigger accumulation check
+        session.add_turn(ConversationTurn(
+            request_text="Read /etc/shadow final",
+            result_status="blocked",
+            risk_score=2.0,
+            blocked_by=["command_pattern_scanner"],
+        ))
+        session.violation_count += 1
+
+        final = analyzer.analyze(session, "What time is it?")
+
+        # Should have used exactly 2 forgives (the cap), not 3
+        assert session.success_forgives_used == 2, (
+            f"Expected 2 forgives (capped), got {session.success_forgives_used}"
+        )
+
 
 # ═══════════════════════════════════════════════════════════════════
 # U-004: Encoding/obfuscation attack coverage

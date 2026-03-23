@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -121,6 +122,7 @@ class ToolExecutor:
         self._signal_channel = None
         self._telegram_channel = None
         self._credential_store = None
+        self._session_file_reads: set[str] = set()
 
     def set_channels(self, signal_channel=None, telegram_channel=None):
         """Wire messaging channels for signal_send / telegram_send tools."""
@@ -213,13 +215,30 @@ class ToolExecutor:
         return [
             {
                 "name": "file_write",
-                "description": "Write content to a file at the given path",
-                "args": {"path": "string", "content": "string"},
+                "description": "Write content to a file. All paths must be absolute and under /workspace/ (e.g. /workspace/scripts/app.py). Files written here are NOT automatically viewable in a browser. For browser-viewable web pages, use the 'website' tool instead.",
+                "args": {"path": "string (absolute path under /workspace/)", "content": "string"},
             },
             {
                 "name": "file_read",
-                "description": "Read the contents of a file",
-                "args": {"path": "string"},
+                "description": "Read the contents of a file. All paths must be absolute and under /workspace/ (e.g. /workspace/sites/my-site/index.html, /workspace/scripts/app.py).",
+                "args": {"path": "string (absolute path under /workspace/)"},
+            },
+            {
+                "name": "file_patch",
+                "description": (
+                    "Apply an incremental modification to an existing file. "
+                    "Use instead of file_write when modifying part of a file — "
+                    "avoids regenerating unchanged content. "
+                    "For HTML files, use a css: prefix for deterministic element "
+                    "targeting (e.g. css:#panel-weather). For other files, copy "
+                    "a unique anchor string verbatim from the file."
+                ),
+                "args": {
+                    "path": "string (absolute path under /workspace/)",
+                    "operation": "string (insert_after | insert_before | replace | delete)",
+                    "anchor": "string (for HTML: 'css:#element-id' or 'css:.class'; for other files: unique text copied verbatim from file_read output)",
+                    "content": "string (new content — not needed for delete)",
+                },
             },
             {
                 "name": "mkdir",
@@ -280,7 +299,7 @@ class ToolExecutor:
             },
             {
                 "name": "website",
-                "description": "Manage temporary websites served at /sites/{site_id}/. Actions: create (write HTML/CSS/JS files and return viewable URL), remove (delete a site), list (show active sites). Sites are viewable in a browser at https://localhost:3001/sites/{site_id}/.",
+                "description": "Manage temporary websites at /workspace/sites/{site_id}/. Actions: create (write HTML/CSS/JS files — overwrites if site_id already exists, so use the same site_id to update a site), remove (delete a site), list (show active sites and their URLs). Sites are viewable in a browser at https://localhost:3001/sites/{site_id}/ and stored on disk at /workspace/sites/{site_id}/. Use file_read with /workspace/sites/{site_id}/index.html to inspect existing content before updating. IMPORTANT: Inline <script> tags are blocked by CSP — JavaScript must be in separate .js files with descriptive names (e.g. dashboard.js, gallery.js) referenced via <script src='feature-name.js'></script>.",
                 "args": {
                     "action": "string (create|remove|list)",
                     "site_id": "string (URL-safe identifier, e.g. 'weather-dashboard'. Required for create/remove)",
@@ -465,6 +484,7 @@ class ToolExecutor:
         handler = {
             "file_write": self._file_write,
             "file_read": self._file_read,
+            "file_patch": self._file_patch,
             "mkdir": self._mkdir,
             "shell": self._shell,
             "shell_exec": self._shell,  # Alias: planner uses shell_exec at TL4
@@ -573,10 +593,17 @@ class ToolExecutor:
             # credential propagation through the provenance chain.
             content = f"[REDACTED — credential leak detected in {tool_name} output]"
         else:
-            # Convert SidecarResponse to TaggedData
+            # Convert SidecarResponse to TaggedData.
+            # For file_read: the sidecar returns {"bytes": N, "content": "..."}
+            # as structured data. Extract just the file content so downstream
+            # consumers (Qwen via $var substitution) receive raw file content,
+            # not a JSON wrapper they'd have to parse.
             content = response.result
             if response.data is not None:
-                content = json.dumps(response.data)
+                if tool_name == "file_read" and isinstance(response.data, dict) and "content" in response.data:
+                    content = response.data["content"]
+                else:
+                    content = json.dumps(response.data)
 
         # Trust override for external data tools
         source, trust_level = _EXTERNAL_DATA_TOOLS.get(
@@ -1588,8 +1615,9 @@ class ToolExecutor:
             trust_level=TrustLevel.TRUSTED,
             originated_from=f"file_write:{path}",
         )
-        # Record file provenance so file_read can inherit trust from the writer
-        await record_file_write(path, tagged.id)
+        # Record file provenance so file_read can inherit trust from the writer.
+        # Pass the post-transform content so the hash matches what's on disk.
+        await record_file_write(path, tagged.id, content=content)
         exec_meta = {
             "file_size_before": _before_size,
             "file_size_after": len(content),
@@ -1599,6 +1627,430 @@ class ToolExecutor:
             "code_fixer_errors": fix_result.errors_found if fix_result else [],
             "code_fixer_warnings": fix_result.warnings if fix_result else [],
         }
+        if path in self._session_file_reads:
+            exec_meta["file_write_after_read_warning"] = (
+                "file_write used on a previously-read file — "
+                "consider file_patch for partial modifications"
+            )
+            logger.info(
+                "file_write on previously-read file",
+                extra={
+                    "event": "file_write_after_read",
+                    "path": path,
+                    "hint": "consider file_patch",
+                },
+            )
+        return tagged, exec_meta
+
+    async def _file_patch(self, args: dict) -> tuple:
+        """Apply an incremental modification to an existing file.
+
+        Deterministic string operation — no LLM involved. The anchor and
+        operation come from the planner (trusted), the content comes from
+        the worker (already scanned by the security pipeline).
+        """
+        path = args.get("path", "")
+        operation = args.get("operation", "")
+        anchor = args.get("anchor", "")
+        content = args.get("content")
+        exec_meta: dict = {}
+
+        valid_ops = {"insert_after", "insert_before", "replace", "delete"}
+        if operation not in valid_ops:
+            raise ToolError(f"Invalid operation: {operation!r}. Must be one of {valid_ops}")
+
+        if not anchor:
+            raise ToolError("anchor is required")
+
+        if operation != "delete" and not content:
+            raise ToolError(f"Operation {operation!r} requires content")
+
+        # ── Policy gate ──────────────────────────────────────────────
+        result = self._engine.check_file_write(path)
+        if result.status != PolicyResult.ALLOWED:
+            logger.warning(
+                "file_patch blocked by policy",
+                extra={"event": "file_patch_blocked", "path": path, "reason": result.reason},
+            )
+            raise ToolBlockedError(f"file_patch blocked: {result.reason}")
+        logger.debug(
+            "file_patch policy passed",
+            extra={"event": "file_patch_policy_allowed", "path": path, "operation": operation},
+        )
+
+        # ── Read current file ────────────────────────────────────────
+        try:
+            with open(path, encoding="utf-8") as fh:
+                current = fh.read()
+        except FileNotFoundError:
+            raise ToolError(f"File not found: {path}")
+        except OSError as exc:
+            raise ToolError(f"Cannot read {path}: {exc}")
+
+        _, ext = os.path.splitext(path)
+        exec_meta["file_size_before"] = len(current.encode("utf-8"))
+        exec_meta["file_content_before"] = current[:1_048_576]  # 1MB cap for diff
+        logger.debug(
+            "file_patch read base file",
+            extra={
+                "event": "file_patch_read_base",
+                "path": path,
+                "size": exec_meta["file_size_before"],
+                "operation": operation,
+                "anchor_length": len(anchor),
+            },
+        )
+
+        # ── Backup before modification ───────────────────────────────
+        backup_dir = os.path.join(os.path.dirname(path), ".patch_backups")
+        os.makedirs(backup_dir, exist_ok=True)
+        backup_name = f"{os.path.basename(path)}.{time.time_ns()}"
+        backup_path = os.path.join(backup_dir, backup_name)
+        shutil.copy2(path, backup_path)
+        exec_meta["backup_path"] = backup_path
+        logger.debug(
+            "file_patch backup created",
+            extra={"event": "file_patch_backup", "path": path, "backup": backup_path},
+        )
+
+        # Cleanup: keep only 5 most recent backups for this filename
+        prefix = os.path.basename(path) + "."
+        backups = sorted(
+            [os.path.join(backup_dir, b) for b in os.listdir(backup_dir) if b.startswith(prefix)],
+            key=lambda b: os.path.getmtime(b),
+        )
+        for old_backup in backups[:-5]:
+            os.unlink(old_backup)
+            logger.debug(
+                "file_patch old backup removed",
+                extra={"event": "file_patch_backup_cleanup", "removed": old_backup},
+            )
+
+        # ── CSS selector anchors (HTML files only) ─────────────────
+        # The css: prefix triggers BeautifulSoup-based selector resolution.
+        # The selector is resolved to the element's outer HTML, which then
+        # becomes the text anchor for the standard string operations below.
+        # This is deterministic — no LLM involved in anchor resolution.
+        # Design: docs/design/incremental-update-tool-20260322.md §4.4
+        _html_extensions = {".html", ".htm"}
+        if anchor.startswith("css:"):
+            selector = anchor[4:].strip()
+            if not selector:
+                raise ToolError("css: prefix requires a CSS selector (e.g. css:#panel-weather)")
+
+            if ext.lower() not in _html_extensions:
+                # Non-HTML file: css: prefix is meaningless, treat as literal text.
+                # This preserves backwards compatibility — if someone stores a file
+                # that literally contains "css:something", it works as a text anchor.
+                logger.debug(
+                    "file_patch css: prefix on non-HTML file, treating as literal",
+                    extra={
+                        "event": "file_patch_css_literal_fallback",
+                        "path": path,
+                        "ext": ext,
+                    },
+                )
+            else:
+                from bs4 import BeautifulSoup
+
+                soup = BeautifulSoup(current, "html.parser")
+                matches = soup.select(selector)
+
+                if len(matches) == 0:
+                    logger.debug(
+                        "file_patch css selector not found",
+                        extra={
+                            "event": "file_patch_css_miss",
+                            "path": path,
+                            "selector": selector,
+                        },
+                    )
+                    raise ToolError(
+                        f"CSS selector '{selector}' matched no elements in {path}."
+                    )
+                if len(matches) > 1:
+                    logger.debug(
+                        "file_patch css selector ambiguous",
+                        extra={
+                            "event": "file_patch_css_ambiguous",
+                            "path": path,
+                            "selector": selector,
+                            "match_count": len(matches),
+                        },
+                    )
+                    raise ToolError(
+                        f"CSS selector '{selector}' matched {len(matches)} elements in "
+                        f"{path}. Use a more specific selector (e.g. add an ID)."
+                    )
+
+                # Resolve selector to source position using BeautifulSoup's
+                # sourceline/sourcepos tracking. This avoids the round-trip
+                # fidelity problem where str(element) doesn't exactly match
+                # the source HTML (whitespace normalisation, attribute order).
+                #
+                # We find the element's start position in the raw source, then
+                # find the corresponding closing tag to get the full span.
+                element = matches[0]
+
+                if element.sourceline is None or element.sourcepos is None:
+                    raise ToolError(
+                        f"CSS selector '{selector}' matched but element has no "
+                        "source position. Try a text anchor instead."
+                    )
+
+                # Calculate byte offset from sourceline + sourcepos
+                lines = current.split("\n")
+                css_start = (
+                    sum(len(l) + 1 for l in lines[:element.sourceline - 1])
+                    + element.sourcepos
+                )
+
+                # Find the end of this element in the raw source.
+                # The source from css_start begins with the opening tag.
+                # We need the full element including closing tag.
+                # Use str(element) length as a guide, then scan for the
+                # actual closing tag in the source.
+                serialised = str(element)
+                tag_name = element.name
+
+                # For self-closing or void elements, the span is just the tag
+                if element.is_empty_element:
+                    # Find end of opening tag
+                    css_end = current.index(">", css_start) + 1
+                else:
+                    # Find the matching closing tag. Since we know the element
+                    # is unique via CSS selector, we can search for </tag>
+                    # starting from after the opening tag, counting nesting.
+                    depth = 0
+                    i = css_start
+                    while i < len(current):
+                        open_tag = current.find(f"<{tag_name}", i)
+                        close_tag = current.find(f"</{tag_name}>", i)
+                        if close_tag == -1:
+                            # No closing tag found — use serialised length
+                            css_end = css_start + len(serialised)
+                            break
+                        if open_tag != -1 and open_tag < close_tag:
+                            depth += 1
+                            i = open_tag + 1
+                        else:
+                            if depth == 0:
+                                css_end = close_tag + len(f"</{tag_name}>")
+                                break
+                            depth -= 1
+                            i = close_tag + 1
+                    else:
+                        css_end = css_start + len(serialised)
+
+                # Extract the actual source text for this element
+                anchor = current[css_start:css_end]
+                exec_meta["css_position"] = css_start
+
+                logger.debug(
+                    "file_patch css selector resolved",
+                    extra={
+                        "event": "file_patch_css_resolved",
+                        "path": path,
+                        "selector": selector,
+                        "resolved_length": len(anchor),
+                        "position": css_start,
+                    },
+                )
+                exec_meta["css_selector"] = selector
+                exec_meta["css_resolved_length"] = len(anchor)
+
+        # ── Find text anchor ─────────────────────────────────────────
+        # If CSS selector already resolved the position, skip text matching.
+        # The CSS path guarantees a unique element match via BeautifulSoup;
+        # the text representation may not be unique but the position is.
+        if "css_position" not in exec_meta:
+            count = current.count(anchor)
+            if count == 0:
+                logger.debug(
+                    "file_patch anchor not found",
+                    extra={
+                        "event": "file_patch_anchor_miss",
+                        "path": path,
+                        "anchor_length": len(anchor),
+                        "anchor_preview": anchor[:100],
+                    },
+                )
+                raise ToolError(
+                    f"Anchor not found in {path}. Re-read the file and copy an exact string."
+                )
+            if count > 1:
+                logger.debug(
+                    "file_patch anchor ambiguous",
+                    extra={
+                        "event": "file_patch_anchor_ambiguous",
+                        "path": path,
+                        "match_count": count,
+                        "anchor_preview": anchor[:100],
+                    },
+                )
+                raise ToolError(
+                    f"Anchor matches {count} locations in {path}. "
+                    "Use a longer or more specific anchor string."
+                )
+
+        # ── Replace anchor size sanity check ─────────────────────────
+        if operation == "replace":
+            anchor_len = len(anchor)
+            if anchor_len > 2000:
+                logger.warning(
+                    "file_patch replace anchor too large",
+                    extra={
+                        "event": "file_patch_anchor_too_large",
+                        "path": path,
+                        "anchor_length": anchor_len,
+                    },
+                )
+                raise ToolError(
+                    f"Replace anchor is {anchor_len} chars — too large for safe "
+                    "replacement. Use a smaller anchor targeting a specific section, "
+                    "or use file_write for large-scale rewrites."
+                )
+            if anchor_len > 500:
+                exec_meta["anchor_size_warning"] = (
+                    f"Replace anchor is {anchor_len} chars — "
+                    "verify this targets the intended section"
+                )
+                logger.debug(
+                    "file_patch replace anchor large",
+                    extra={
+                        "event": "file_patch_anchor_large_warning",
+                        "path": path,
+                        "anchor_length": anchor_len,
+                    },
+                )
+
+        exec_meta["patch_anchor_length"] = len(anchor)
+
+        # ── Apply content through code fixer ─────────────────────────
+        if content:
+            # Defence-in-depth: strip RESPONSE tags, FILE tags, fences
+            if ext.lower() in _CODE_EXTENSIONS:
+                # Strip <RESPONSE> tags
+                if "<RESPONSE>" in content:
+                    if "</RESPONSE>" in content:
+                        match = re.search(r"<RESPONSE>(.*?)</RESPONSE>", content, re.DOTALL)
+                        if match:
+                            content = match.group(1).strip()
+                    else:
+                        start = content.index("<RESPONSE>") + len("<RESPONSE>")
+                        content = content[start:].strip()
+
+                # Strip markdown fences
+                if "```" in content:
+                    lines = content.split("\n")
+                    if (
+                        len(lines) >= 3
+                        and re.match(r"^```\w*\s*$", lines[0])
+                        and lines[-1].strip() == "```"
+                    ):
+                        content = "\n".join(lines[1:-1])
+                    else:
+                        blocks = extract_code_blocks(content)
+                        if len(blocks) == 1 and blocks[0].code.strip():
+                            content = blocks[0].code
+
+                # Code fixer
+                fix_result = code_fixer_fix(path, content)
+                if fix_result and not fix_result.skipped:
+                    content = fix_result.content
+                    exec_meta["code_fixer_changed"] = fix_result.changed
+                    exec_meta["code_fixer_fixes"] = fix_result.fixes_applied
+                    exec_meta["code_fixer_errors"] = fix_result.errors_found
+                    exec_meta["code_fixer_warnings"] = fix_result.warnings
+                    if fix_result.changed:
+                        logger.debug(
+                            "file_patch code fixer applied",
+                            extra={
+                                "event": "file_patch_code_fixer",
+                                "path": path,
+                                "fixes": fix_result.fixes_applied,
+                            },
+                        )
+                else:
+                    exec_meta["code_fixer_changed"] = False
+                    exec_meta["code_fixer_fixes"] = []
+                    exec_meta["code_fixer_errors"] = []
+                    exec_meta["code_fixer_warnings"] = []
+            else:
+                exec_meta["code_fixer_changed"] = False
+                exec_meta["code_fixer_fixes"] = []
+                exec_meta["code_fixer_errors"] = []
+                exec_meta["code_fixer_warnings"] = []
+
+        # ── Apply operation ──────────────────────────────────────────
+        # Use CSS-resolved position if available, otherwise find by text.
+        idx = exec_meta.get("css_position", current.index(anchor))
+        logger.debug(
+            "file_patch applying operation",
+            extra={
+                "event": "file_patch_apply",
+                "path": path,
+                "operation": operation,
+                "anchor_position": idx,
+                "content_length": len(content) if content else 0,
+            },
+        )
+
+        if operation == "insert_after":
+            end = idx + len(anchor)
+            # Ensure newline separation — the worker often omits the leading
+            # newline on fragments, causing content to join the anchor line.
+            if content and not anchor.endswith("\n") and not content.startswith("\n"):
+                content = "\n" + content
+            patched = current[:end] + content + current[end:]
+        elif operation == "insert_before":
+            # Same for insert_before — ensure trailing newline on content
+            if content and not content.endswith("\n") and not anchor.startswith("\n"):
+                content = content + "\n"
+            patched = current[:idx] + content + current[idx:]
+        elif operation == "replace":
+            patched = current[:idx] + content + current[idx + len(anchor):]
+        elif operation == "delete":
+            patched = current[:idx] + current[idx + len(anchor):]
+
+        # ── Write result ─────────────────────────────────────────────
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(patched)
+        except OSError as exc:
+            # Restore from backup on write failure
+            shutil.copy2(backup_path, path)
+            logger.error(
+                "file_patch write failed, restored backup",
+                extra={"event": "file_patch_write_error", "path": path, "error": str(exc)},
+            )
+            raise ToolError(f"file_patch write failed: {exc}")
+
+        exec_meta["file_size_after"] = len(patched.encode("utf-8"))
+        exec_meta["patch_operation"] = operation
+
+        # ── Provenance ───────────────────────────────────────────────
+        tagged = await create_tagged_data(
+            content=f"File patched: {path} ({operation})",
+            source=DataSource.TOOL,
+            trust_level=TrustLevel.TRUSTED,
+            originated_from=f"file_patch:{path}",
+        )
+        await record_file_write(path, tagged.id, content=patched)
+
+        logger.info(
+            "file_patch complete",
+            extra={
+                "event": "file_patch_complete",
+                "path": path,
+                "operation": operation,
+                "size_before": exec_meta["file_size_before"],
+                "size_after": exec_meta["file_size_after"],
+                "anchor_length": exec_meta["patch_anchor_length"],
+                "backup": backup_path,
+            },
+        )
+
         return tagged, exec_meta
 
     async def _file_read(self, args: dict) -> tuple[TaggedData, dict | None]:
@@ -1647,17 +2099,34 @@ class ToolExecutor:
             "file_size": len(content),
         }
 
-        # Determine trust level: if this file was written by the pipeline,
-        # inherit trust from the writer's provenance chain to prevent trust laundering.
-        # Files not tracked (e.g. pre-existing workspace files) default to TRUSTED.
-        trust_level = TrustLevel.TRUSTED
+        # Determine trust level: files without a provenance record or with
+        # mismatched content hash are UNTRUSTED (prevents trust laundering).
+        # Only files with valid provenance AND matching hash inherit TRUSTED.
+        trust_level = TrustLevel.UNTRUSTED  # Fail-closed default
         parent_ids = []
-        writer_id = await get_file_writer(path)
-        if writer_id is not None:
-            parent_ids = [writer_id]
-            writer_data = await get_tagged_data(writer_id)
-            if writer_data and writer_data.trust_level == TrustLevel.UNTRUSTED:
-                trust_level = TrustLevel.UNTRUSTED
+        writer_info = await get_file_writer(path)
+        if writer_info is not None:
+            writer_id, recorded_hash = writer_info
+            # Verify content hasn't been tampered with since provenance was recorded
+            current_hash = hashlib.sha256(
+                content.encode() if isinstance(content, str) else content
+            ).hexdigest()
+            if recorded_hash and current_hash == recorded_hash:
+                parent_ids = [writer_id]
+                writer_data = await get_tagged_data(writer_id)
+                if writer_data and writer_data.trust_level == TrustLevel.TRUSTED:
+                    trust_level = TrustLevel.TRUSTED
+                # else: orphaned record or UNTRUSTED writer → stays UNTRUSTED
+            else:
+                # Hash mismatch (file overwritten) or empty hash (legacy record)
+                logger.warning(
+                    "File content hash mismatch — provenance stale",
+                    extra={
+                        "event": "provenance_hash_mismatch",
+                        "path": path,
+                        "recorded_hash": recorded_hash[:16] + "..." if recorded_hash else "<empty>",
+                    },
+                )
 
         logger.info(
             "File read",
@@ -1666,8 +2135,13 @@ class ToolExecutor:
                 "path": path,
                 "size": len(content),
                 "trust_level": trust_level.value,
-                "inherited_from": writer_id,
+                "inherited_from": writer_info[0] if writer_info else None,
             },
+        )
+        self._session_file_reads.add(path)
+        logger.debug(
+            "file_read tracked for file_write enforcement",
+            extra={"event": "file_read_tracked", "path": path},
         )
         return await create_tagged_data(
             content=content,
@@ -2075,6 +2549,18 @@ class ToolExecutor:
             os.makedirs(site_dir, exist_ok=True)
             for filename, content in files.items():
                 filepath = os.path.join(site_dir, filename)
+
+                logger.debug(
+                    "Website file pre-write (before code fixer)",
+                    extra={
+                        "event": "website_file_pre_write",
+                        "filepath": filepath,
+                        "content_length": len(content) if content else 0,
+                        "content_full": content,
+                        "has_entities": ("&lt;" in (content or "") or "&gt;" in (content or "")),
+                    },
+                )
+
                 # Code fixer: same logic as _file_write (line ~1384)
                 _, ext = os.path.splitext(filename)
                 fixer_names = {"Dockerfile", "Containerfile", "Makefile", "GNUmakefile", "makefile"}
@@ -2093,6 +2579,18 @@ class ToolExecutor:
                             )
                     except Exception:
                         pass  # fail-safe: fixer crash writes original content
+
+                logger.debug(
+                    "Website file final write",
+                    extra={
+                        "event": "website_file_write",
+                        "filepath": filepath,
+                        "content_length": len(content) if content else 0,
+                        "content_full": content,
+                        "has_entities": ("&lt;" in (content or "") or "&gt;" in (content or "")),
+                    },
+                )
+
                 with open(filepath, "w") as f:
                     f.write(content)
         except OSError as exc:
@@ -2115,7 +2613,7 @@ class ToolExecutor:
                 source=DataSource.TOOL,
                 trust_level=TrustLevel.TRUSTED,
                 originated_from=f"website:create:{site_id}",
-            ), {"site_id": site_id, "file_count": file_count, "url": url}
+            ), {"site_id": site_id, "file_count": file_count, "url": url, "filenames": list(files.keys())}
         except Exception:
             # Provenance tagging failed — clean up written files
             shutil.rmtree(site_dir, ignore_errors=True)

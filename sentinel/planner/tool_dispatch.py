@@ -29,6 +29,22 @@ CONTENT_CREATION_TOOLS = frozenset({
     "website", "signal_send", "telegram_send", "email_send",
 })
 
+# Paths where file_patch is treated as content creation (display-only, not
+# executed). file_patch on files outside these paths with untrusted provenance
+# is still blocked by the trust gate — patching a script or config with
+# untrusted web data is a different risk profile to updating a served webpage.
+#
+# Why file_patch isn't in CONTENT_CREATION_TOOLS:
+#   file_patch can target ANY file type (Python, shell, YAML, HTML). A blanket
+#   exemption would let untrusted web data flow into executable files. The
+#   website tool is safe to exempt because it only writes to /workspace/sites/.
+#   file_patch needs destination-aware exemption instead.
+#
+# Added 2026-03-22 during file_patch adoption testing. The trust gate was
+# blocking web_search → llm_task → file_patch on site HTML — the same flow
+# that website create handles without issue.
+FILE_PATCH_CONTENT_PATHS = ("/workspace/sites/",)
+
 
 async def check_provenance(
     step: PlanStep,
@@ -56,6 +72,15 @@ async def check_provenance(
         or step.allowed_paths is not None
     )
     is_content_creation = step.tool in CONTENT_CREATION_TOOLS
+
+    # file_patch: destination-aware exemption. Patching served web content
+    # (sites/) has the same risk profile as website create — the output is
+    # displayed, not executed. Patching scripts or configs is higher risk
+    # and stays gated.
+    if step.tool == "file_patch" and not is_content_creation:
+        patch_path = step.args.get("path", "")
+        if any(patch_path.startswith(p) for p in FILE_PATCH_CONTENT_PATHS):
+            is_content_creation = True
 
     if trust_level >= 4 and (has_constraints or is_content_creation):
         logger.info(

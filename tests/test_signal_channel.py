@@ -639,12 +639,12 @@ class TestSignalFormatConfirmation:
         from sentinel.channels.signal_channel import _format_response
 
         data = {
-            "preview": "Send via Signal to Alice: hello",
+            "preview": "Send via Signal to Keith: hello",
             "confirmation_id": "abc-123",
-            "original_request": "tell alice hello",
+            "original_request": "tell keith hello",
         }
         result = _format_response(data)
-        assert "Send via Signal to Alice: hello" in result
+        assert "Send via Signal to Keith: hello" in result
         assert "go" in result.lower()
 
     def test_format_plan_approval(self):

@@ -689,6 +689,11 @@ class CommandPatternScanner:
     # $(VAR) or $VAR (build artifact references), NOT absolute paths or ~/
     _BUILD_FILE_SAFE_RM_TARGET = re.compile(r"rm\s+(-[a-zA-Z]*[rf][a-zA-Z]*\s+)+\$")
 
+    # <RESPONSE>/<think> tags that Qwen wraps around output — strip before
+    # content-based detection so tags on the same line as FROM/RUN don't
+    # prevent the instruction regex from matching (e.g. "<RESPONSE>FROM ...").
+    _RESPONSE_TAG_RE = re.compile(r"</?(?:RESPONSE|think)>", re.IGNORECASE)
+
     @classmethod
     def _is_dockerfile_content(cls, text: str) -> bool:
         """Heuristic: does *text* look like Dockerfile/Containerfile content?
@@ -696,8 +701,14 @@ class CommandPatternScanner:
         Returns True if the text contains a ``FROM`` instruction AND at least
         one other Dockerfile instruction (RUN, COPY, etc.).  This avoids
         false positives on generic text that happens to contain "FROM".
+
+        Strips ``<RESPONSE>`` / ``<think>`` wrapper tags before checking,
+        because Qwen sometimes places them on the same line as the first
+        instruction (e.g. ``<RESPONSE>FROM python:3.12``), which prevents
+        the line-anchored instruction regex from matching.
         """
-        instructions = cls._DOCKERFILE_INSTRUCTION_RE.findall(text)
+        cleaned = cls._RESPONSE_TAG_RE.sub("", text)
+        instructions = cls._DOCKERFILE_INSTRUCTION_RE.findall(cleaned)
         if len(instructions) < 2:
             return False
         # Must have FROM — every valid Dockerfile starts with one
@@ -752,6 +763,15 @@ class CommandPatternScanner:
             # Content-based detection: run regardless of fence tag.
             # Same rationale as Dockerfile — Qwen may tag Makefiles as "bash".
             if self._is_build_file_content(content):
+                return True
+            # Variable-targeted rm in ANY code block is safe — the scanner
+            # can't evaluate what shell variables contain, and `rm -rf $DIR`
+            # is a standard cleanup pattern in bash/shell scripts, CI/CD
+            # runners, setup scripts, etc. The dangerous patterns are
+            # hardcoded paths (/etc, ~/) which are caught separately.
+            # Only applies inside a fenced code block (block_lang non-empty)
+            # to avoid exempting unfenced prose with variable-rm patterns.
+            if block_lang:
                 return True
 
         return False

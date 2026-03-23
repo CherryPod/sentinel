@@ -70,11 +70,11 @@ async def full_store(store):
     Contact "Dave" with email address.
     Contact "Mia" with Telegram chat ID.
     """
-    await store.create_user("Alice")  # user_id=1
+    await store.create_user("Keith")  # user_id=1
 
     # Self-contact — links Keith's Signal UUID to user_id=1
     keith = await store.create_contact(
-        1, "Alice", linked_user_id=1, is_user=True,
+        1, "Keith", linked_user_id=1, is_user=True,
     )
     await store.create_channel(
         keith["contact_id"], "signal",

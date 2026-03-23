@@ -1026,6 +1026,171 @@ class TestJavaScript:
         assert "Here's" not in result.content
         assert "const x = 42" in result.content
 
+    # --- Object literal semicolons → commas (v3) ---
+
+    def test_object_semicolons_to_commas(self):
+        """Semicolons between object properties should become commas."""
+        code = (
+            "const config = {\n"
+            '  name: "test";\n'
+            "  port: 3000;\n"
+            "  debug: true;\n"
+            "};\n"
+        )
+        result = fix_code("app.js", code)
+        assert result.changed
+        assert '"test",' in result.content
+        assert "3000," in result.content
+        assert "true," in result.content
+        assert any("semicolon" in f and "comma" in f for f in result.fixes_applied)
+
+    def test_object_semicolons_nested(self):
+        """Nested object properties should also be fixed."""
+        code = (
+            "const obj = {\n"
+            "  outer: {\n"
+            '    inner: "value";\n'
+            "    count: 5;\n"
+            "  },\n"
+            "};\n"
+        )
+        result = fix_code("app.js", code)
+        assert result.changed
+        assert '"value",' in result.content
+        assert "5," in result.content
+
+    def test_object_semicolons_not_in_statements(self):
+        """Semicolons at end of normal statements should NOT be changed."""
+        code = 'const x = 42;\nlet y = "hello";\nconsole.log(x);\n'
+        result = fix_code("app.js", code)
+        assert not result.changed
+
+    def test_object_semicolons_quoted_keys(self):
+        """Properties with quoted keys should also be fixed."""
+        code = (
+            "const styles = {\n"
+            '  "font-size": "14px";\n'
+            '  "color": "#333";\n'
+            "};\n"
+        )
+        result = fix_code("app.js", code)
+        assert result.changed
+        assert '"14px",' in result.content
+        assert '"#333",' in result.content
+
+    # --- Double semicolons (v3) ---
+
+    def test_double_semicolons_removed(self):
+        """Double semicolons should be collapsed to single."""
+        result = fix_code("app.js", "const x = 42;;\nreturn result;;\n")
+        assert result.changed
+        assert "42;" in result.content
+        assert "42;;" not in result.content
+        assert "result;" in result.content
+        assert "result;;" not in result.content
+
+    def test_double_semicolons_for_loop_preserved(self):
+        """for(;;) loops should NOT have their semicolons removed."""
+        code = "for (;;) {\n  break;\n}\n"
+        result = fix_code("app.js", code)
+        assert "(;;)" in result.content
+
+    # --- Python-style comments (v3) ---
+
+    def test_python_comments_converted(self):
+        """# comments should become // comments in JS files."""
+        code = "# This is a comment\nconst x = 1;\n# Another comment\n"
+        result = fix_code("app.js", code)
+        assert result.changed
+        assert "// This is a comment" in result.content
+        assert "// Another comment" in result.content
+        assert result.content.count("#") == 0
+
+    def test_shebang_preserved(self):
+        """#!/usr/bin/env node should NOT be converted."""
+        code = "#!/usr/bin/env node\nconst x = 1;\n"
+        result = fix_code("app.js", code)
+        assert "#!/usr/bin/env node" in result.content
+
+    def test_hash_inside_code_not_touched(self):
+        """# inside code lines (hex colours, URL fragments) not touched."""
+        code = 'const color = "#FF0000";\nconst url = "/page#section";\n'
+        result = fix_code("app.js", code)
+        # The # chars are inside strings, not at start of line
+        assert "#FF0000" in result.content
+        assert "#section" in result.content
+
+    # --- Unclosed string literals (v3) ---
+
+    def test_unclosed_double_quote(self):
+        """Missing closing double quote before semicolon."""
+        code = 'const msg = "hello world;\n'
+        result = fix_code("app.js", code)
+        assert result.changed
+        assert 'hello world";' in result.content
+
+    def test_unclosed_single_quote(self):
+        """Missing closing single quote before semicolon."""
+        code = "const msg = 'hello world;\n"
+        result = fix_code("app.js", code)
+        assert result.changed
+        assert "hello world';" in result.content
+
+    def test_properly_closed_strings_unchanged(self):
+        """Already-correct strings should not be modified."""
+        code = 'const a = "hello";\nconst b = \'world\';\n'
+        result = fix_code("app.js", code)
+        # Should only potentially have semicolon changes, not string changes
+        assert '"hello"' in result.content
+        assert "'world'" in result.content
+
+    # --- innerHTML → textContent (v3) ---
+
+    def test_innerhtml_to_textcontent(self):
+        """innerHTML with non-HTML RHS should become textContent."""
+        code = "element.innerHTML = data.name;\n"
+        result = fix_code("app.js", code)
+        assert result.changed
+        assert "element.textContent = data.name;" in result.content
+        assert "innerHTML" not in result.content
+
+    def test_innerhtml_with_html_preserved(self):
+        """innerHTML with HTML tags in RHS should NOT be changed."""
+        code = 'element.innerHTML = "<div>" + content + "</div>";\n'
+        result = fix_code("app.js", code)
+        assert "innerHTML" in result.content
+
+    def test_innerhtml_variable_assignment(self):
+        """innerHTML with a simple variable should become textContent."""
+        code = "el.innerHTML = username;\n"
+        result = fix_code("app.js", code)
+        assert result.changed
+        assert "el.textContent = username;" in result.content
+
+    def test_innerhtml_template_literal_no_html(self):
+        """innerHTML with template literal (no HTML) → textContent."""
+        code = "el.innerHTML = `${hours}:${minutes}:${seconds}`;\n"
+        result = fix_code("app.js", code)
+        assert result.changed
+        assert "textContent" in result.content
+
+    # --- Idempotency (v3) ---
+
+    def test_all_fixes_idempotent(self):
+        """Running the fixer twice should produce identical output."""
+        code = (
+            "# A comment\n"
+            "const config = {\n"
+            '  name: "test";\n'
+            "  port: 3000;\n"
+            "};\n"
+            "el.innerHTML = value;;\n"
+            'const msg = "hello;\n'
+        )
+        result1 = fix_code("app.js", code)
+        result2 = fix_code("app.js", result1.content)
+        assert result1.content == result2.content
+
 
 # ===================================================================
 # MARKDOWN (v2)
@@ -1532,6 +1697,25 @@ class TestHTMLV25:
         r = fix_code("test.html", code)
         assert 'type="text"' in r.content
         assert 'name="username"' in r.content
+
+    def test_viewport_meta_not_corrupted(self):
+        """Viewport meta content attribute must not be re-quoted internally."""
+        code = '<meta name="viewport" content="width=device-width, initial-scale=1.0">\n'
+        r = fix_code("test.html", code)
+        assert 'content="width=device-width, initial-scale=1.0"' in r.content
+        assert 'width="device-width' not in r.content
+
+    def test_meta_charset_not_corrupted(self):
+        """Meta charset attribute should not be double-quoted."""
+        code = '<meta charset="UTF-8">\n'
+        r = fix_code("test.html", code)
+        assert 'charset="UTF-8"' in r.content
+
+    def test_style_attribute_preserved(self):
+        """Inline style with colons/semicolons must not be mangled."""
+        code = '<div style="color: red; font-size: 14px;">\n</div>\n'
+        r = fix_code("test.html", code)
+        assert 'style="color: red; font-size: 14px;"' in r.content
 
     def test_bare_ampersand_in_text(self):
         code = '<p>Tom & Jerry</p>\n'

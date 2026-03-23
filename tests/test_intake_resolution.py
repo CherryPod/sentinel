@@ -36,11 +36,11 @@ async def populated_store(store):
                      Contact "Sarah" (contact_id=2) with Signal "sarah-uuid".
                      Contact "Sam" (contact_id=3) with email.
     """
-    await store.create_user("Alice")  # user_id=1
+    await store.create_user("Keith")  # user_id=1
 
     # Self-contact — links Signal UUID to user_id=1
     keith_self = await store.create_contact(
-        1, "Alice", linked_user_id=1, is_user=True,
+        1, "Keith", linked_user_id=1, is_user=True,
     )
     await store.create_channel(
         keith_self["contact_id"], "signal", "keith-uuid-123", is_default=True,

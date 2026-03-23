@@ -157,7 +157,9 @@ class SidecarClient:
     async def start_sidecar(self) -> None:
         """Start the sidecar binary as a subprocess.
 
-        Waits up to 5 seconds for the socket to appear.
+        Waits up to 5 seconds for the sidecar to signal readiness via
+        stderr ("READY"). This guarantees the accept loop is live before
+        any requests are sent, eliminating the startup race condition.
         """
         if not self._binary_path:
             raise RuntimeError("no sidecar binary path configured")
@@ -181,26 +183,48 @@ class SidecarClient:
 
         # BH3-037: Pipe stderr to Python logger instead of DEVNULL so
         # Rust sidecar logging (tracing/env_logger) is visible for debugging.
-        # A background task drains stderr lines without blocking the caller.
         self._process = subprocess.Popen(
             [self._binary_path],
             env=env,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
         )
+
+        # Wait for the sidecar's READY signal on stderr. The Rust binary
+        # prints "READY" after all initialisation is complete and the accept
+        # loop is live, eliminating the race between socket-file creation
+        # and actual readiness to process requests.
+        loop = asyncio.get_event_loop()
+        ready = False
+        for _ in range(50):  # 50 * 100ms = 5s
+            if self._process.poll() is not None:
+                raise RuntimeError(
+                    f"sidecar exited during startup (code={self._process.returncode})"
+                )
+            line = await asyncio.wait_for(
+                loop.run_in_executor(None, self._process.stderr.readline),
+                timeout=0.2,
+            )
+            if line:
+                text = line.decode("utf-8", errors="replace").rstrip()
+                if text:
+                    logger.debug(
+                        "sidecar: %s", text,
+                        extra={"event": "sidecar_stderr"},
+                    )
+                if text == "READY":
+                    ready = True
+                    break
+        if not ready:
+            raise RuntimeError(
+                "sidecar did not signal readiness within 5s"
+            )
+
+        logger.info("Sidecar started", extra={"event": "sidecar_ready"})
+
+        # Hand remaining stderr to the background drain task
         self._stderr_task = asyncio.create_task(
             self._drain_stderr(self._process)
-        )
-
-        # Wait for socket to appear
-        for _ in range(50):  # 50 * 100ms = 5s
-            if os.path.exists(self._socket_path):
-                logger.info("Sidecar started", extra={"event": "sidecar_ready"})
-                return
-            await asyncio.sleep(0.1)
-
-        raise RuntimeError(
-            f"sidecar failed to create socket at {self._socket_path} within 5s"
         )
 
     @staticmethod

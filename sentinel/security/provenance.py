@@ -10,6 +10,7 @@ When pool is provided, uses asyncpg with JSONB parent_ids.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import threading
@@ -253,42 +254,55 @@ class ProvenanceStore:
         return all(item.trust_level == TrustLevel.TRUSTED for item in chain)
 
     async def record_file_write(
-        self, path: str, data_id: str, user_id: int | None = None,
+        self, path: str, data_id: str, content: str | bytes = "",
+        user_id: int | None = None,
     ) -> None:
-        """Record that a file was written by a specific provenance chain entry."""
+        """Record that a file was written by a specific provenance chain entry.
+
+        Stores a SHA-256 hash of *content* so that ``get_file_writer`` can
+        later verify the file hasn't been overwritten outside the pipeline
+        (prevents trust laundering via the provenance-overwrite attack).
+        """
         resolved_user_id = user_id if user_id is not None else current_user_id.get()
+        content_bytes = content.encode() if isinstance(content, str) else content
+        content_hash = hashlib.sha256(content_bytes).hexdigest()
         if self._in_memory:
-            self._file_provenance[path] = data_id
+            self._file_provenance[path] = (data_id, content_hash)
             self._evict_oldest(self._file_provenance, MAX_FILE_PROVENANCE_ENTRIES)
             return
         async with self._pool.acquire() as conn:
             await conn.execute(
-                "INSERT INTO file_provenance (file_path, writer_data_id, user_id) "
-                "VALUES ($1, $2, $3) "
+                "INSERT INTO file_provenance (file_path, writer_data_id, user_id, content_sha256) "
+                "VALUES ($1, $2, $3, $4) "
                 "ON CONFLICT (file_path) DO UPDATE SET "
                 "writer_data_id = EXCLUDED.writer_data_id, user_id = EXCLUDED.user_id, "
-                "created_at = NOW()",
-                path, data_id, resolved_user_id,
+                "content_sha256 = EXCLUDED.content_sha256, created_at = NOW()",
+                path, data_id, resolved_user_id, content_hash,
             )
 
     async def get_file_writer(
         self, path: str, user_id: int | None = None,
-    ) -> str | None:
-        """Get the data_id of the provenance entry that last wrote to this file.
+    ) -> tuple[str, str] | None:
+        """Get the (data_id, content_sha256) of the last provenance write to this file.
 
+        Returns None if no provenance record exists.
         When user_id is provided, only matches writes by that user.
         """
         if self._in_memory:
             return self._file_provenance.get(path)
         if user_id is not None:
-            sql = ("SELECT writer_data_id FROM file_provenance "
+            sql = ("SELECT writer_data_id, content_sha256 FROM file_provenance "
                    "WHERE file_path = $1 AND user_id = $2")
             params: tuple = (path, user_id)
         else:
-            sql = "SELECT writer_data_id FROM file_provenance WHERE file_path = $1"
+            sql = ("SELECT writer_data_id, content_sha256 FROM file_provenance "
+                   "WHERE file_path = $1")
             params = (path,)
         async with self._pool.acquire() as conn:
-            return await conn.fetchval(sql, *params)
+            row = await conn.fetchrow(sql, *params)
+            if row is None:
+                return None
+            return (row["writer_data_id"], row["content_sha256"])
 
     async def cleanup_old(self, days: int = 7) -> int:
         """Delete provenance entries older than N days."""
@@ -396,11 +410,14 @@ async def is_trust_safe_for_execution(data_id: str) -> bool:
     return await _default_store.is_trust_safe_for_execution(data_id)
 
 
-async def record_file_write(path: str, data_id: str, user_id: int | None = None) -> None:
-    await _default_store.record_file_write(path, data_id, user_id=user_id)
+async def record_file_write(
+    path: str, data_id: str, content: str | bytes = "",
+    user_id: int | None = None,
+) -> None:
+    await _default_store.record_file_write(path, data_id, content=content, user_id=user_id)
 
 
-async def get_file_writer(path: str, user_id: int | None = None) -> str | None:
+async def get_file_writer(path: str, user_id: int | None = None) -> tuple[str, str] | None:
     return await _default_store.get_file_writer(path, user_id=user_id)
 
 

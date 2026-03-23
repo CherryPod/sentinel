@@ -218,3 +218,184 @@ class TestAuditAdminReadOnly:
             "REVOKE SELECT ON audit_log FROM sentinel_app"
         )
         assert revoke_pos > grant_pos, "SELECT REVOKE must follow bulk GRANT"
+
+
+# ── GRANT OPTION revocation (B5-5.2.4) ────────────────────────────
+
+
+class TestGrantOptionRevocation:
+    """Verify sentinel_app cannot delegate its privileges to other roles.
+
+    B5-5.2.4: Without GRANT OPTION revocation, a compromised sentinel_app
+    could GRANT its own table/sequence privileges to arbitrary roles,
+    undermining the role separation that audit immutability depends on.
+    """
+
+    def test_revoke_grant_option_tables(self):
+        """REVOKE GRANT OPTION FOR ... ON ALL TABLES must target sentinel_app."""
+        combined = " ".join(_ROLE_SETUP)
+        assert (
+            "REVOKE GRANT OPTION FOR SELECT, INSERT, UPDATE, DELETE "
+            "ON ALL TABLES IN SCHEMA public FROM sentinel_app"
+        ) in combined
+
+    def test_revoke_grant_option_sequences(self):
+        """REVOKE GRANT OPTION FOR ... ON ALL SEQUENCES must target sentinel_app."""
+        combined = " ".join(_ROLE_SETUP)
+        assert (
+            "REVOKE GRANT OPTION FOR USAGE, SELECT "
+            "ON ALL SEQUENCES IN SCHEMA public FROM sentinel_app"
+        ) in combined
+
+    def test_grant_option_revoke_after_grants(self):
+        """GRANT OPTION revocations must come after the bulk GRANT statements.
+
+        Otherwise the GRANT re-establishes WITH GRANT OPTION implicitly.
+        """
+        combined = " ".join(_ROLE_SETUP)
+        grant_pos = combined.index(
+            "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES"
+        )
+        revoke_pos = combined.index(
+            "REVOKE GRANT OPTION FOR SELECT, INSERT, UPDATE, DELETE"
+        )
+        assert revoke_pos > grant_pos, (
+            "GRANT OPTION revoke must follow bulk GRANT"
+        )
+
+    def test_grant_option_revoke_before_default_privileges(self):
+        """GRANT OPTION revocations must come before ALTER DEFAULT PRIVILEGES.
+
+        The default privileges apply to future tables — if GRANT OPTION is
+        revoked after DEFAULT PRIVILEGES, future tables would still allow
+        delegation until the next schema migration.
+        """
+        combined = " ".join(_ROLE_SETUP)
+        revoke_pos = combined.index(
+            "REVOKE GRANT OPTION FOR SELECT, INSERT, UPDATE, DELETE"
+        )
+        default_pos = combined.index(
+            "ALTER DEFAULT PRIVILEGES FOR ROLE sentinel_owner"
+        )
+        assert revoke_pos < default_pos, (
+            "GRANT OPTION revoke must precede ALTER DEFAULT PRIVILEGES"
+        )
+
+
+# ── Audit log INSERT user isolation (B5-5.1.2) ────────────────────
+
+
+class TestAuditInsertUserIsolation:
+    """Verify audit_log INSERT policy enforces user_id matching.
+
+    B5-5.1.2: sentinel_app can only INSERT audit entries where the user_id
+    matches the session's app.current_user_id. Prevents a compromised worker
+    from polluting another user's audit trail.
+    """
+
+    def test_app_insert_user_isolation_policy_exists(self):
+        """app_insert_user_isolation policy must exist on audit_log."""
+        combined = " ".join(_RLS_POLICIES)
+        assert "app_insert_user_isolation" in combined
+
+    def test_app_insert_user_isolation_is_insert_only(self):
+        """app_insert_user_isolation policy must be FOR INSERT only."""
+        combined = " ".join(_RLS_POLICIES)
+        idx = combined.index("CREATE POLICY app_insert_user_isolation")
+        snippet = combined[idx : idx + 300]
+        assert "FOR INSERT" in snippet
+        assert "TO sentinel_app" in snippet
+
+    def test_app_insert_user_isolation_checks_user_id(self):
+        """app_insert_user_isolation must check user_id against session var."""
+        combined = " ".join(_RLS_POLICIES)
+        idx = combined.index("CREATE POLICY app_insert_user_isolation")
+        snippet = combined[idx : idx + 300]
+        assert "current_setting('app.current_user_id'" in snippet
+        assert "WITH CHECK" in snippet
+        assert "user_id" in snippet
+
+    def test_app_insert_user_isolation_uses_drop_create_pattern(self):
+        """Policy must use DROP IF EXISTS + CREATE (idempotent deployment)."""
+        combined = " ".join(_RLS_POLICIES)
+        assert "DROP POLICY IF EXISTS app_insert_user_isolation ON audit_log" in combined
+        assert "CREATE POLICY app_insert_user_isolation ON audit_log" in combined
+
+    def test_app_insert_only_still_exists(self):
+        """The existing app_insert_only policy must be preserved.
+
+        app_insert_only (WITH CHECK TRUE) controls operation type.
+        app_insert_user_isolation controls user_id matching.
+        Both policies must pass for an INSERT to succeed (AND composition).
+        """
+        combined = " ".join(_RLS_POLICIES)
+        assert "CREATE POLICY app_insert_only" in combined
+        assert "CREATE POLICY app_insert_user_isolation" in combined
+
+    def test_app_insert_user_isolation_missing_ok_true(self):
+        """current_setting must use missing_ok=true for fail-closed behavior.
+
+        When app.current_user_id is not set, current_setting returns NULL
+        (instead of erroring), and NULL != any integer, so the INSERT is
+        denied. This is the correct fail-closed default.
+        """
+        combined = " ".join(_RLS_POLICIES)
+        idx = combined.index("CREATE POLICY app_insert_user_isolation")
+        snippet = combined[idx : idx + 300]
+        assert "current_setting('app.current_user_id', true)" in snippet
+
+
+# ── B5 dependency chain (full integration — needs live PG) ─────────
+
+
+@pytest.mark.integration
+class TestB5DependencyChainIntegration:
+    """Integration tests for the B5 hardening dependency chain.
+
+    These tests require a live PostgreSQL instance with sentinel_owner and
+    sentinel_app roles configured. They verify that the SQL definitions in
+    pg_schema.py actually produce the expected runtime behavior.
+
+    Run with: pytest -m integration tests/test_audit_immutability.py
+    """
+
+    def test_sentinel_app_cannot_grant(self):
+        """sentinel_app must not be able to GRANT its privileges to others.
+
+        B5-5.2.4: If sentinel_app can delegate, a compromised worker could
+        create a new role with full audit_log access, bypassing immutability.
+        Requires live PG connection as sentinel_app role.
+        """
+        # This test would connect as sentinel_app and attempt:
+        #   GRANT SELECT ON audit_log TO some_test_role;
+        # Expected: InsufficientPrivilegeError
+        pytest.skip("Requires live PG with sentinel_app role — run in container")
+
+    def test_audit_log_insert_requires_matching_user_id(self):
+        """sentinel_app can only INSERT audit entries for the session user_id.
+
+        B5-5.1.2: With app.current_user_id set to 1, INSERTing a row with
+        user_id=2 must be denied by the app_insert_user_isolation policy.
+        Requires live PG connection as sentinel_app role.
+        """
+        # This test would connect as sentinel_app, then:
+        #   SET LOCAL app.current_user_id = '1';
+        #   INSERT INTO audit_log (user_id, event_type, details)
+        #       VALUES (2, 'test', '{}');
+        # Expected: RLS policy violation
+        pytest.skip("Requires live PG with sentinel_app role — run in container")
+
+    def test_b5_full_dependency_chain(self):
+        """End-to-end: sentinel_app cannot reach audit deletion.
+
+        The full chain: REVOKE DELETE (privilege layer) + trigger (function
+        layer) + RLS (row layer) + GRANT OPTION revoke (delegation layer).
+        All four must hold for audit immutability to be sound.
+        """
+        # This test would:
+        # 1. Connect as sentinel_app
+        # 2. Attempt DELETE FROM audit_log → blocked by REVOKE
+        # 3. Attempt GRANT DELETE ON audit_log TO ... → blocked by GRANT OPTION
+        # 4. Verify INSERT with wrong user_id → blocked by RLS
+        # 5. Verify INSERT with correct user_id → succeeds
+        pytest.skip("Requires live PG with sentinel_app role — run in container")

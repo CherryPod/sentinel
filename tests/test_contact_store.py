@@ -32,16 +32,16 @@ def store():
 
 class TestUsers:
     async def test_create_and_get(self, store):
-        user = await store.create_user("Alice")
+        user = await store.create_user("Keith")
         assert user["user_id"] == 1
-        assert user["display_name"] == "Alice"
+        assert user["display_name"] == "Keith"
         assert user["is_active"] is True
         assert user["pin_hash"] is None
         assert user["created_at"]
 
         fetched = await store.get_user(user["user_id"])
         assert fetched is not None
-        assert fetched["display_name"] == "Alice"
+        assert fetched["display_name"] == "Keith"
 
     async def test_create_with_pin_hash(self, store):
         user = await store.create_user("Alice", pin_hash="$2b$12$fakehash")
@@ -99,8 +99,8 @@ class TestUsers:
 
     async def test_users_can_share_names(self, store):
         """Users table has no unique constraint on display_name."""
-        u1 = await store.create_user("Alice")
-        u2 = await store.create_user("Alice")
+        u1 = await store.create_user("Keith")
+        u2 = await store.create_user("Keith")
         assert u1["user_id"] != u2["user_id"]
 
 
@@ -109,7 +109,7 @@ class TestUsers:
 
 class TestContacts:
     async def test_create_and_get(self, store):
-        user = await store.create_user("Alice")
+        user = await store.create_user("Keith")
         contact = await store.create_contact(user["user_id"], "Sarah")
         assert contact["contact_id"] == 1
         assert contact["display_name"] == "Sarah"
@@ -122,7 +122,7 @@ class TestContacts:
         assert fetched["display_name"] == "Sarah"
 
     async def test_create_with_linked_user(self, store):
-        u1 = await store.create_user("Alice")
+        u1 = await store.create_user("Keith")
         u2 = await store.create_user("Sarah")
         contact = await store.create_contact(
             u1["user_id"], "Sarah", linked_user_id=u2["user_id"], is_user=True,
@@ -134,7 +134,7 @@ class TestContacts:
         assert await store.get_contact(999) is None
 
     async def test_list_by_user(self, store):
-        u1 = await store.create_user("Alice")
+        u1 = await store.create_user("Keith")
         u2 = await store.create_user("Other")
         await store.create_contact(u1["user_id"], "Alice")
         await store.create_contact(u1["user_id"], "Bob")
@@ -147,7 +147,7 @@ class TestContacts:
         assert keith_contacts[1]["display_name"] == "Bob"
 
     async def test_update(self, store):
-        user = await store.create_user("Alice")
+        user = await store.create_user("Keith")
         contact = await store.create_contact(user["user_id"], "OldName")
         updated = await store.update_contact(
             contact["contact_id"], display_name="NewName",
@@ -156,7 +156,7 @@ class TestContacts:
         assert updated["display_name"] == "NewName"
 
     async def test_update_rejects_unknown_fields(self, store):
-        user = await store.create_user("Alice")
+        user = await store.create_user("Keith")
         contact = await store.create_contact(user["user_id"], "Test")
         with pytest.raises(ValueError, match="Invalid update fields"):
             await store.update_contact(contact["contact_id"], evil="DROP TABLE")
@@ -166,7 +166,7 @@ class TestContacts:
 
     async def test_delete_cascades_to_channels(self, store):
         """Deleting a contact removes its channel entries."""
-        user = await store.create_user("Alice")
+        user = await store.create_user("Keith")
         contact = await store.create_contact(user["user_id"], "Sarah")
         await store.create_channel(contact["contact_id"], "signal", "uuid-123")
         await store.create_channel(contact["contact_id"], "email", "s@test.com")
@@ -186,14 +186,14 @@ class TestContacts:
 
     async def test_unique_name_per_owner(self, store):
         """UNIQUE(user_id, display_name) prevents duplicate contact names."""
-        user = await store.create_user("Alice")
+        user = await store.create_user("Keith")
         await store.create_contact(user["user_id"], "Sarah")
         with pytest.raises(ValueError, match="Duplicate contact"):
             await store.create_contact(user["user_id"], "Sarah")
 
     async def test_same_name_different_owners(self, store):
         """Different users can have contacts with the same name."""
-        u1 = await store.create_user("Alice")
+        u1 = await store.create_user("Keith")
         u2 = await store.create_user("Alice")
         c1 = await store.create_contact(u1["user_id"], "Sarah")
         c2 = await store.create_contact(u2["user_id"], "Sarah")
@@ -205,7 +205,7 @@ class TestContacts:
 
 class TestContactChannels:
     async def test_create_and_get(self, store):
-        user = await store.create_user("Alice")
+        user = await store.create_user("Keith")
         contact = await store.create_contact(user["user_id"], "Sarah")
         ch = await store.create_channel(
             contact["contact_id"], "signal", "uuid-abc-123",
@@ -221,7 +221,7 @@ class TestContactChannels:
         assert channels[0]["identifier"] == "uuid-abc-123"
 
     async def test_create_non_default(self, store):
-        user = await store.create_user("Alice")
+        user = await store.create_user("Keith")
         contact = await store.create_contact(user["user_id"], "Sarah")
         ch = await store.create_channel(
             contact["contact_id"], "email", "alt@test.com", is_default=False,
@@ -229,7 +229,7 @@ class TestContactChannels:
         assert ch["is_default"] is False
 
     async def test_multiple_channels_per_contact(self, store):
-        user = await store.create_user("Alice")
+        user = await store.create_user("Keith")
         contact = await store.create_contact(user["user_id"], "Sarah")
         await store.create_channel(contact["contact_id"], "signal", "uuid-1")
         await store.create_channel(contact["contact_id"], "email", "s@test.com")
@@ -243,7 +243,7 @@ class TestContactChannels:
 
     async def test_get_by_identifier_reverse_lookup(self, store):
         """Reverse lookup — find contact by channel identifier."""
-        user = await store.create_user("Alice")
+        user = await store.create_user("Keith")
         contact = await store.create_contact(user["user_id"], "Sarah")
         await store.create_channel(contact["contact_id"], "signal", "uuid-abc")
 
@@ -257,7 +257,7 @@ class TestContactChannels:
         assert await store.get_by_identifier("signal", "nonexistent") is None
 
     async def test_update(self, store):
-        user = await store.create_user("Alice")
+        user = await store.create_user("Keith")
         contact = await store.create_contact(user["user_id"], "Sarah")
         ch = await store.create_channel(
             contact["contact_id"], "email", "old@test.com",
@@ -269,7 +269,7 @@ class TestContactChannels:
         assert updated["identifier"] == "new@test.com"
 
     async def test_update_rejects_unknown_fields(self, store):
-        user = await store.create_user("Alice")
+        user = await store.create_user("Keith")
         contact = await store.create_contact(user["user_id"], "Sarah")
         ch = await store.create_channel(contact["contact_id"], "email", "a@b.c")
         with pytest.raises(ValueError, match="Invalid update fields"):
@@ -279,7 +279,7 @@ class TestContactChannels:
         assert await store.update_channel(999, identifier="x") is None
 
     async def test_delete(self, store):
-        user = await store.create_user("Alice")
+        user = await store.create_user("Keith")
         contact = await store.create_contact(user["user_id"], "Sarah")
         ch = await store.create_channel(contact["contact_id"], "signal", "uuid-1")
 
@@ -292,7 +292,7 @@ class TestContactChannels:
 
     async def test_unique_channel_identifier(self, store):
         """UNIQUE(channel, identifier) prevents two contacts claiming same ID."""
-        user = await store.create_user("Alice")
+        user = await store.create_user("Keith")
         c1 = await store.create_contact(user["user_id"], "Sarah")
         c2 = await store.create_contact(user["user_id"], "Bob")
         await store.create_channel(c1["contact_id"], "signal", "uuid-shared")
@@ -302,7 +302,7 @@ class TestContactChannels:
 
     async def test_same_identifier_different_channels(self, store):
         """Same identifier string is allowed across different channel types."""
-        user = await store.create_user("Alice")
+        user = await store.create_user("Keith")
         contact = await store.create_contact(user["user_id"], "Sarah")
         ch1 = await store.create_channel(contact["contact_id"], "signal", "12345")
         ch2 = await store.create_channel(contact["contact_id"], "telegram", "12345")

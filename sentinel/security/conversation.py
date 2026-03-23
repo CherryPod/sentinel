@@ -530,6 +530,35 @@ class ConversationAnalyzer:
                 policy_count += 1
             # "planner" and "" contribute nothing
 
+        # Fix-cycle awareness: a successful step after scanner blocks indicates
+        # a legitimate retry workflow (e.g. code fixer correcting Qwen output).
+        # Forgive one security block per success-after-block pattern in the
+        # turn history, up to MAX_SUCCESS_FORGIVES total across the session.
+        MAX_SUCCESS_FORGIVES = 2
+        # Migration shim for sessions created before this field existed
+        success_forgives_used = getattr(session, "success_forgives_used", 0)
+
+        if security_count > 0 and success_forgives_used < MAX_SUCCESS_FORGIVES:
+            # Count successes that follow at least one prior block
+            seen_block = False
+            forgive_eligible = 0
+            for turn in session.turns:
+                if turn.result_status == "blocked" and _classify_block_category(turn.blocked_by) == "security":
+                    seen_block = True
+                elif turn.result_status == "success" and seen_block:
+                    forgive_eligible += 1
+                    seen_block = False  # Reset: each success consumes one block signal
+
+            # Apply new forgives (subtract already-used from eligible count)
+            new_forgives = min(
+                forgive_eligible - success_forgives_used,
+                MAX_SUCCESS_FORGIVES - success_forgives_used,
+                security_count,  # Never reduce below 0
+            )
+            if new_forgives > 0:
+                security_count -= new_forgives
+                session.success_forgives_used = success_forgives_used + new_forgives
+
         score = min(security_count * 1.5 + policy_count * 0.5, 5.0)
         warnings: list[str] = []
         if security_count:

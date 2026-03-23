@@ -19,7 +19,7 @@ from .scanner import (
     VulnerabilityEchoScanner,
 )
 from . import prompt_guard
-from .spotlighting import apply_datamarking
+from .spotlighting import apply_datamarking, remove_datamarking
 from sentinel.worker.base import WorkerBase
 from sentinel.worker.ollama import OllamaWorker
 
@@ -614,6 +614,33 @@ class ScanPipeline:
             },
         )
 
+        # 3.9. Strip spotlighting markers from Qwen output.
+        if marker:
+            pre_marker = response_text
+            response_text = remove_datamarking(response_text, marker=marker)
+            logger.debug(
+                "Spotlighting marker stripping",
+                extra={
+                    "event": "marker_strip",
+                    "marker": marker,
+                    "chars_removed": len(pre_marker) - len(response_text),
+                    "content_changed": (pre_marker != response_text),
+                    "has_entities_after": ("&lt;" in response_text),
+                },
+            )
+
+        logger.debug(
+            "Raw Qwen response (post-marker-strip, pre-tagging)",
+            extra={
+                "event": "qwen_response_full",
+                "content_full": response_text,
+                "content_length": len(response_text),
+                "has_entities": ("&lt;" in response_text or "&gt;" in response_text),
+                "has_response_tags": ("<RESPONSE>" in response_text),
+                "has_html_tags": ("<html" in response_text.lower() or "<!doctype" in response_text.lower()),
+            },
+        )
+
         # 4. Tag output as UNTRUSTED
         tagged = await create_tagged_data(
             content=response_text,
@@ -628,6 +655,7 @@ class ScanPipeline:
                 "data_id": tagged.id,
                 "source": "qwen",
                 "trust_level": "untrusted",
+                "content_length": len(response_text),
             },
         )
 

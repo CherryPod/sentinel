@@ -168,7 +168,7 @@ class MemoryStore:
                 updated_at=now,
             )
 
-        logger.info(
+        logger.debug(
             "Memory chunk stored with embedding",
             extra={
                 "event": "memory_store_embedded",

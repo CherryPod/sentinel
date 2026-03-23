@@ -60,12 +60,12 @@ class Settings(BaseSettings):
     # Prompt Guard (Phase 2)
     prompt_guard_enabled: bool = True
     prompt_guard_model: str = "meta-llama/Llama-Prompt-Guard-2-86M"
-    prompt_guard_threshold: float = 0.9
+    prompt_guard_threshold: float = 0.96
     require_prompt_guard: bool = True  # fail-closed: block if PG unavailable
 
     # Claude planner (Phase 3)
     claude_api_key_file: str = "/run/secrets/claude_api_key"
-    claude_model: str = "claude-sonnet-4-5-20250929"
+    claude_model: str = "claude-opus-4-6"
     claude_max_tokens: int = 8192
     claude_timeout: int = 180
 

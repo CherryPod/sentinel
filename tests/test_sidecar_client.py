@@ -361,6 +361,73 @@ class TestSidecarClientLifecycle:
             await client.start_sidecar()
 
     @pytest.mark.asyncio
+    async def test_start_sidecar_waits_for_ready_signal(self):
+        """start_sidecar() waits for the READY line from stderr, not just the socket file."""
+        client = SidecarClient(
+            socket_path="/tmp/test-ready.sock",
+            sidecar_binary_path="/usr/bin/fake-sidecar",
+        )
+
+        # Simulate sidecar stderr output: init lines then READY
+        stderr_lines = [
+            b"sidecar: 3 tool(s) registered\n",
+            b"sidecar: listening on /tmp/test-ready.sock\n",
+            b"READY\n",
+        ]
+        line_iter = iter(stderr_lines)
+
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = None  # Still running
+        mock_proc.stderr = MagicMock()
+        mock_proc.stderr.readline = MagicMock(side_effect=lambda: next(line_iter))
+
+        with patch("subprocess.Popen", return_value=mock_proc), \
+             patch.object(client, "stop_sidecar", new_callable=AsyncMock):
+            await client.start_sidecar()
+
+        # Should have read all lines up to and including READY
+        assert mock_proc.stderr.readline.call_count == 3
+        # Background drain task should have been created
+        assert client._stderr_task is not None
+
+    @pytest.mark.asyncio
+    async def test_start_sidecar_fails_if_process_exits_during_startup(self):
+        """start_sidecar() raises if the process exits before signalling ready."""
+        client = SidecarClient(
+            socket_path="/tmp/test-crash.sock",
+            sidecar_binary_path="/usr/bin/fake-sidecar",
+        )
+
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = 1  # Already exited
+        mock_proc.returncode = 1
+        mock_proc.stderr = MagicMock()
+
+        with patch("subprocess.Popen", return_value=mock_proc), \
+             patch.object(client, "stop_sidecar", new_callable=AsyncMock):
+            with pytest.raises(RuntimeError, match="sidecar exited during startup"):
+                await client.start_sidecar()
+
+    @pytest.mark.asyncio
+    async def test_start_sidecar_fails_if_no_ready_within_timeout(self):
+        """start_sidecar() raises if READY never arrives."""
+        client = SidecarClient(
+            socket_path="/tmp/test-timeout.sock",
+            sidecar_binary_path="/usr/bin/fake-sidecar",
+        )
+
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = None  # Still running
+        mock_proc.stderr = MagicMock()
+        # Simulate stderr that never sends READY — readline blocks forever
+        mock_proc.stderr.readline = MagicMock(side_effect=lambda: b"")
+
+        with patch("subprocess.Popen", return_value=mock_proc), \
+             patch.object(client, "stop_sidecar", new_callable=AsyncMock):
+            with pytest.raises(RuntimeError, match="sidecar did not signal readiness"):
+                await client.start_sidecar()
+
+    @pytest.mark.asyncio
     async def test_stop_sidecar_no_process(self):
         """Stopping when no process is running should be a no-op."""
         client = SidecarClient()

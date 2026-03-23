@@ -116,12 +116,19 @@ pub fn call_host(op: Op, request: &serde_json::Value) -> Result<serde_json::Valu
     serde_json::from_slice(resp_bytes).map_err(|e| HostError::DeserializeError(e.to_string()))
 }
 
-/// Read stdin fully into a string (for reading tool arguments).
+/// Read tool arguments from the SENTINEL_TOOL_ARGS environment variable.
+///
+/// Args are passed via env var instead of stdin because the MemoryInputPipe
+/// (wasmtime-wasi p2) doesn't signal EOF in p1 compat mode, causing stdin
+/// reads to block indefinitely.
 pub fn read_stdin() -> Result<String, std::io::Error> {
-    use std::io::Read;
-    let mut buf = String::new();
-    std::io::stdin().read_to_string(&mut buf)?;
-    Ok(buf)
+    match std::env::var("SENTINEL_TOOL_ARGS") {
+        Ok(args) => Ok(args),
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "SENTINEL_TOOL_ARGS env var not set",
+        )),
+    }
 }
 
 /// Convenience: parse stdin as a JSON value of type T.

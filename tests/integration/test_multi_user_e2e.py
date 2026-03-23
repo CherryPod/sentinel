@@ -115,7 +115,7 @@ class TestContactIsolation:
 
         # User 1 creates a contact
         resp = client.post("/api/contacts", json={
-            "display_name": "Alice",
+            "display_name": "Keith",
         }, headers=_auth_headers(t1))
         assert resp.status_code == 201
         keith_id = resp.json()["contact_id"]
@@ -123,12 +123,12 @@ class TestContactIsolation:
         # User 1 can see it
         resp = client.get("/api/contacts", headers=_auth_headers(t1))
         names_1 = [c["display_name"] for c in resp.json()]
-        assert "Alice" in names_1
+        assert "Keith" in names_1
 
         # User 2 cannot see it
         resp = client.get("/api/contacts", headers=_auth_headers(t2))
         names_2 = [c["display_name"] for c in resp.json()]
-        assert "Alice" not in names_2
+        assert "Keith" not in names_2
 
     def test_user2_contacts_not_visible_to_user1(self, two_user_app):
         client, store, _ = two_user_app

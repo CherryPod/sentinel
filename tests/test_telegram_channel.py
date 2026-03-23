@@ -186,13 +186,13 @@ class TestTelegramFormat:
         msg = OutgoingMessage(
             channel_id="1", event_type="x",
             data={
-                "preview": "Send via Signal to Alice: hello",
+                "preview": "Send via Signal to Keith: hello",
                 "confirmation_id": "abc-123",
-                "original_request": "tell alice hello",
+                "original_request": "tell keith hello",
             },
         )
         result = TelegramChannel._format_outgoing(msg)
-        assert "Send via Signal to Alice: hello" in result
+        assert "Send via Signal to Keith: hello" in result
         assert "go" in result.lower()
 
     def test_format_plan_approval(self):

@@ -569,17 +569,17 @@ async def _init_orchestrator(app: FastAPI, settings, audit, pipeline, engine,
 
         # Initialize message router (fast-path classification) — opt-in via router_enabled
         if settings.router_enabled:
-            from sentinel.router.classifier import Classifier
             from sentinel.router.fast_path import FastPathExecutor
+            from sentinel.router.keyword_classifier import KeywordClassifier
             from sentinel.router.router import MessageRouter
             from sentinel.router.templates import TemplateRegistry
 
             _template_registry = TemplateRegistry.default()
-            classifier = Classifier(
-                worker=pipeline._worker,
-                registry=_template_registry,
-                timeout=settings.router_classifier_timeout,
-            )
+            # Deterministic keyword classifier — replaces Qwen-based classifier.
+            # Zero GPU, microseconds, deterministic routing.
+            # Original Qwen classifier kept in sentinel/router/classifier.py
+            # if needed in future.
+            classifier = KeywordClassifier(registry=_template_registry)
             from sentinel.core.confirmation import ConfirmationGate
             confirmation_gate = ConfirmationGate(pg_pool)
 

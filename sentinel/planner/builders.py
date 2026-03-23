@@ -355,14 +355,21 @@ def build_step_outcome(
     )
 
     # File metadata
-    outcome["file_path"] = step.args.get("path") if step.tool in ("file_write", "file_read") else None
+    outcome["file_path"] = step.args.get("path") if step.tool in ("file_write", "file_read", "file_patch") else None
+    # Tool-specific metadata — surface identifiers from tool outputs so the
+    # planner can reference prior outputs (e.g. reuse a website site_id).
+    # All data here is orchestrator-generated (TRUSTED), not Qwen output.
+    if exec_meta and step.tool == "website":
+        outcome["site_id"] = exec_meta.get("site_id")
+        outcome["site_url"] = exec_meta.get("url")
+        outcome["site_files"] = exec_meta.get("filenames")  # list of deployed filenames
     # REVIEWED (B2 red team, 0 S0/S1): fed to planner (trusted), not Qwen.
     # Side-channel risk outside threat model.
     outcome["file_size_before"] = exec_meta.get("file_size_before") if exec_meta else None
     outcome["file_size_after"] = exec_meta.get("file_size_after") if exec_meta else None
 
     # Diff stats for file_write
-    if exec_meta and "file_content_before" in exec_meta and step.tool == "file_write":
+    if exec_meta and "file_content_before" in exec_meta and step.tool in ("file_write", "file_patch"):
         after_content = step.args.get("content", "")
         outcome["diff_stats"] = extract_diff_stats(
             exec_meta.get("file_content_before"), after_content
@@ -375,6 +382,13 @@ def build_step_outcome(
     outcome["code_fixer_changed"] = exec_meta.get("code_fixer_changed", False) if exec_meta else False
     outcome["code_fixer_fixes"] = exec_meta.get("code_fixer_fixes", []) if exec_meta else []
     outcome["code_fixer_errors"] = exec_meta.get("code_fixer_errors", []) if exec_meta else []
+
+    # file_patch metadata — patch operation details for planner history
+    if exec_meta and step.tool == "file_patch":
+        outcome["patch_operation"] = exec_meta.get("patch_operation")
+        outcome["patch_anchor_length"] = exec_meta.get("patch_anchor_length")
+        if "anchor_size_warning" in exec_meta:
+            outcome["anchor_size_warning"] = exec_meta["anchor_size_warning"]
 
     # Sandbox termination flags — tells the planner whether the sandbox hit a
     # resource limit so it can replan (e.g. reduce scope or split the task).
@@ -535,10 +549,20 @@ def _classify_request_domain(user_request: str) -> str | None:
         return "code_debugging"
     if any(w in low for w in ("send", "message", "email", "signal", "telegram")):
         return "messaging"
+    # Site/file modification takes priority over search — "search X then add
+    # to dashboard" is a composite task, not a pure search task
+    has_site_mod = any(w in low for w in (
+        "dashboard", "panel", "website", "site", "sitrep",
+        "add to", "update the", "populate", "add a",
+    ))
     if any(w in low for w in ("search", "find", "look up", "google")):
+        if has_site_mod:
+            return "composite"
         return "search"
     if any(w in low for w in ("calendar", "event", "schedule", "meeting")):
         return "calendar"
+    if has_site_mod:
+        return "file_ops"
     return None
 
 

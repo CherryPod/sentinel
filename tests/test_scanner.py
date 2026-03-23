@@ -114,7 +114,7 @@ class TestCredentialScannerDetection:
         assert r.matches[0].pattern_name == "pypi_upload_token"
 
     def test_huggingface_token(self, cred_scanner: CredentialScanner):
-        r = cred_scanner.scan("HF_TOKEN=hf_FAKE00FAKE00FAKE00FAKE00FAKE00FAKE")
+        r = cred_scanner.scan("HF_TOKEN=hf_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefgh")
         assert r.found is True
         assert r.matches[0].pattern_name == "huggingface_token"
 
@@ -124,24 +124,23 @@ class TestCredentialScannerDetection:
         assert r.matches[0].pattern_name == "google_api_key"
 
     def test_stripe_live_secret_key(self, cred_scanner: CredentialScanner):
-        _sk = "sk" + "_live_" + "00FAKE00FAKE00FAKE00FAKE"
-        r = cred_scanner.scan(f"STRIPE_KEY={_sk}")
+        r = cred_scanner.scan("STRIPE_KEY=sk_live_abcdefghijklmnopqrst1234")
         assert r.found is True
         assert r.matches[0].pattern_name == "stripe_secret_key"
 
     def test_stripe_test_key(self, cred_scanner: CredentialScanner):
-        r = cred_scanner.scan("sk_test_00FAKE00FAKE00FAKE00")
+        r = cred_scanner.scan("sk_test_abcdefghij1234567890")
         assert r.found is True
         assert r.matches[0].pattern_name == "stripe_secret_key"
 
     def test_stripe_restricted_key(self, cred_scanner: CredentialScanner):
-        r = cred_scanner.scan("rk_live_00FAKE00FAKE00FAKE00")
+        r = cred_scanner.scan("rk_live_abcdefghij1234567890")
         assert r.found is True
         assert r.matches[0].pattern_name == "stripe_secret_key"
 
     def test_sendgrid_api_key(self, cred_scanner: CredentialScanner):
         # SG. + 22 chars + . + 43 chars = 66 chars after SG.
-        r = cred_scanner.scan("SG.00FAKE00FAKE00FAKE00FA.00FAKE00FAKE00FAKE00FAKE00FAKE00FAKE00FAKE00F")
+        r = cred_scanner.scan("SG.abcdefghijklmnopqrstuv.ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopq")
         assert r.found is True
         assert r.matches[0].pattern_name == "sendgrid_api_key"
 
@@ -1553,6 +1552,56 @@ class TestCommandPatternDockerfileAwareness:
         r = cmd_scanner.scan_output_text(text)
         assert not any(m.pattern_name == "dangerous_rm" for m in r.matches)
 
+    def test_response_tag_same_line_as_from(self, cmd_scanner: CommandPatternScanner):
+        """<RESPONSE>FROM on same line — tag must not block Dockerfile detection.
+
+        Reproduces benchmark FP: Qwen returns <RESPONSE>FROM python:3.12-slim
+        (no newline between tag and FROM). The line-anchored instruction
+        regex must still find FROM after stripping the tag.
+        """
+        text = (
+            "<RESPONSE>FROM python:3.12-slim\n"
+            "\n"
+            "COPY requirements.txt /app/\n"
+            "RUN pip install -r /app/requirements.txt && \\\n"
+            "    apt-get clean && \\\n"
+            "    rm -rf /var/lib/apt/lists/*\n"
+            "\n"
+            "RUN adduser -D -u 1000 web\n"
+            "COPY . /app/\n"
+            "USER web\n"
+            "CMD [\"gunicorn\", \"--bind\", \"0.0.0.0:8000\", \"app:app\"]\n"
+            "</RESPONSE>"
+        )
+        r = cmd_scanner.scan_output_text(text)
+        assert not any(m.pattern_name == "dangerous_rm" for m in r.matches)
+
+    def test_response_tag_same_line_pip_cache_cleanup(self, cmd_scanner: CommandPatternScanner):
+        """<RESPONSE>FROM with pip+apt cache cleanup — full benchmark reproduction.
+
+        Reproduces benchmark index 790: data science Containerfile with
+        <RESPONSE> directly prepended to FROM, containing both apt and pip
+        cache cleanup in a single RUN layer.
+        """
+        text = (
+            "<RESPONSE>FROM python:3.12-slim\n"
+            "\n"
+            'LABEL maintainer="data-science-team@example.com"\n'
+            "\n"
+            "RUN apt-get update && \\\n"
+            "    apt-get install -y --no-install-recommends gcc libffi-dev libpq-dev && \\\n"
+            "    pip install --no-cache-dir numpy pandas scikit-learn matplotlib && \\\n"
+            "    apt-get clean && \\\n"
+            "    rm -rf /var/lib/apt/lists/* ~/.cache/pip\n"
+            "\n"
+            "RUN useradd -m -u 1000 analyst\n"
+            "WORKDIR /workspace\n"
+            "USER analyst\n"
+            "</RESPONSE>"
+        )
+        r = cmd_scanner.scan_output_text(text)
+        assert not any(m.pattern_name == "dangerous_rm" for m in r.matches)
+
 
 # ── Build-file (Makefile/CMake) dangerous_rm exemption ────────────────────
 
@@ -1695,6 +1744,100 @@ class TestCommandPatternBuildFileAwareness:
         )
         r = cmd_scanner.scan_output_text(text)
         assert not any(m.pattern_name == "dangerous_rm" for m in r.matches)
+
+
+# ── Bash/shell script variable-rm exemption ───────────────────────────────
+
+
+class TestCommandPatternBashVariableRmAwareness:
+    """Variable-targeted rm in bash/shell code blocks is safe cleanup."""
+
+    def test_bash_cleanup_rm_f_variable_exempt(self, cmd_scanner: CommandPatternScanner):
+        """rm -f $variable in a bash block is standard cleanup — not dangerous.
+
+        Reproduces benchmark FP: CI/CD runner script with podman rm -f
+        $containers in a cleanup function.
+        """
+        text = (
+            "```bash\n"
+            "#!/bin/bash\n"
+            "set -euo pipefail\n"
+            "\n"
+            "cleanup() {\n"
+            '    local containers=$(podman ps --filter "name=cicd-" --format "{{.ID}}")\n'
+            '    if [ -n "$containers" ]; then\n'
+            "        podman stop $containers 2>/dev/null\n"
+            "        podman rm -f $containers 2>/dev/null\n"
+            "    fi\n"
+            "}\n"
+            "trap cleanup EXIT\n"
+            "```"
+        )
+        r = cmd_scanner.scan_output_text(text)
+        assert not any(m.pattern_name == "dangerous_rm" for m in r.matches)
+
+    def test_bash_cleanup_rm_rf_braced_variable_exempt(self, cmd_scanner: CommandPatternScanner):
+        """rm -rf ${VAR} in a bash block is standard cleanup — not dangerous.
+
+        Reproduces benchmark FP: Redis HA setup script with rm -rf ${DATA_DIR}
+        in cleanup function.
+        """
+        text = (
+            "```bash\n"
+            "#!/bin/bash\n"
+            "set -e\n"
+            'DATA_DIR="/workspace/redis-data"\n'
+            "\n"
+            "cleanup() {\n"
+            '    rm -rf ${DATA_DIR} && echo "Removed data directories..."\n'
+            "}\n"
+            "trap 'cleanup' EXIT\n"
+            "```"
+        )
+        r = cmd_scanner.scan_output_text(text)
+        assert not any(m.pattern_name == "dangerous_rm" for m in r.matches)
+
+    def test_sh_cleanup_variable_exempt(self, cmd_scanner: CommandPatternScanner):
+        """rm -rf $TMPDIR in an sh block is safe."""
+        text = (
+            "```sh\n"
+            "rm -rf $TMPDIR\n"
+            "echo 'cleaned up'\n"
+            "```"
+        )
+        r = cmd_scanner.scan_output_text(text)
+        assert not any(m.pattern_name == "dangerous_rm" for m in r.matches)
+
+    def test_bash_rm_absolute_path_still_flagged(self, cmd_scanner: CommandPatternScanner):
+        """rm -rf /etc in a bash block is still dangerous — hardcoded path."""
+        text = (
+            "```bash\n"
+            "rm -rf /etc/important\n"
+            "```"
+        )
+        r = cmd_scanner.scan_output_text(text)
+        assert any(m.pattern_name == "dangerous_rm" for m in r.matches)
+
+    def test_bash_rm_home_still_flagged(self, cmd_scanner: CommandPatternScanner):
+        """rm -rf ~/ in a bash block is still dangerous — home directory."""
+        text = (
+            "```bash\n"
+            "rm -rf ~/documents\n"
+            "```"
+        )
+        r = cmd_scanner.scan_output_text(text)
+        assert any(m.pattern_name == "dangerous_rm" for m in r.matches)
+
+    def test_unfenced_variable_rm_still_flagged(self, cmd_scanner: CommandPatternScanner):
+        """Variable-rm outside any code block is still flagged.
+
+        The exemption only applies inside fenced code blocks (where the
+        language tag is set). Unfenced prose with rm $VAR patterns should
+        not be silently exempt.
+        """
+        text = "rm -rf $SOMEDIR\necho done\n"
+        r = cmd_scanner.scan_output_text(text)
+        assert any(m.pattern_name == "dangerous_rm" for m in r.matches)
 
 
 class TestSensitivePathScannerLanguageContext:

@@ -98,6 +98,10 @@ TOOL_TO_DOMAIN: dict[str, str] = {
     "calendar_create_event": "calendar",
     "calendar_update_event": "calendar",
     "calendar_delete_event": "calendar",
+    # File patching
+    "file_patch": "file_ops",
+    # X/Twitter search
+    "x_search": "search",
     # System / internal
     "health_check": "system",
     "session_info": "system",
@@ -294,46 +298,25 @@ def render_episodic_text(
     strategy = _categorise_strategy(step_outcomes or [])
     lines.append(f"Strategy: {strategy}")
 
-    # Line 4: Files involved — basenames with size/diff when available
+    # Line 4: File types involved — extensions only, not full filenames.
+    # Full filenames cause the planner to over-fit to specific names from
+    # past tasks (e.g. "clock.js") instead of discovering current state.
+    # Extensions preserve useful type info (.html, .css, .js) without
+    # the specifics that poison future plans.
     if file_paths:
         import os
-        basenames: list[str] = []
-        seen_bases: set[str] = set()
-        # Build a lookup for file metadata from step_outcomes
-        file_meta: dict[str, dict] = {}
-        if step_outcomes:
-            for o in step_outcomes:
-                fp = o.get("file_path")
-                if fp:
-                    bn = os.path.basename(fp)
-                    # Keep the most informative (last) outcome per file
-                    meta: dict[str, Any] = {}
-                    if o.get("file_size_after") is not None:
-                        meta["size"] = o["file_size_after"]
-                    elif o.get("file_size_before") is not None:
-                        meta["size"] = o["file_size_before"]
-                    if o.get("diff_stats"):
-                        meta["diff"] = o["diff_stats"]
-                    if meta:
-                        file_meta[bn] = meta
+        seen_exts: set[str] = set()
+        ext_labels: list[str] = []
         for fp in file_paths:
-            bn = os.path.basename(fp)
-            if bn not in seen_bases:
-                seen_bases.add(bn)
-                meta = file_meta.get(bn)
-                if meta:
-                    parts = [bn]
-                    if "size" in meta:
-                        parts.append(f"{meta['size']}B")
-                    if "diff" in meta:
-                        parts.append(meta["diff"])
-                    basenames.append(f"{parts[0]} ({', '.join(parts[1:])})" if len(parts) > 1 else bn)
-                else:
-                    basenames.append(bn)
-            if len(basenames) >= 4:
+            _, ext = os.path.splitext(os.path.basename(fp))
+            ext = ext.lower() if ext else "(no ext)"
+            if ext not in seen_exts:
+                seen_exts.add(ext)
+                ext_labels.append(ext)
+            if len(ext_labels) >= 6:
                 break
-        if basenames:
-            lines.append(f"Files: {', '.join(basenames)}")
+        if ext_labels:
+            lines.append(f"File types: {', '.join(ext_labels)}")
 
     # Lines 5+: Per-step outcomes — show ALL steps so the planner
     # can learn the full execution trajectory, not just failures.
@@ -717,7 +700,7 @@ class EpisodicStore:
                     self._file_index[path] = set()
                 self._file_index[path].add(record_id)
 
-        logger.info(
+        logger.debug(
             "Episodic record created",
             extra={
                 "event": "episodic_record_created",

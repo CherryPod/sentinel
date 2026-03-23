@@ -1681,8 +1681,9 @@ class TestFileWriteTL3Provenance:
                     })
 
             # Provenance chain: file → writer data_id
-            writer_id = await get_file_writer(path)
-            assert writer_id is not None
+            writer_info = await get_file_writer(path)
+            assert writer_info is not None
+            writer_id = writer_info[0]
             writer_data = await get_tagged_data(writer_id)
             assert writer_data is not None
             assert writer_data.source == DataSource.TOOL
@@ -1715,8 +1716,9 @@ class TestFileWriteTL3Provenance:
         await record_file_write("/workspace/payload.sh", write_result.id)
 
         # Step 3: File read back — should inherit UNTRUSTED from writer
-        writer_id = await get_file_writer("/workspace/payload.sh")
-        assert writer_id is not None
+        writer_info = await get_file_writer("/workspace/payload.sh")
+        assert writer_info is not None
+        writer_id = writer_info[0]
 
         read_data = await create_tagged_data(
             content="malicious payload",

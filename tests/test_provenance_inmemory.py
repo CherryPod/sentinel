@@ -95,14 +95,18 @@ class TestProvenanceStoreInMemory:
     async def test_file_provenance_roundtrip(self, store):
         t = await store.create_tagged_data("written", DataSource.TOOL, TrustLevel.TRUSTED)
         await store.record_file_write("/workspace/test.txt", t.id)
-        assert await store.get_file_writer("/workspace/test.txt") == t.id
+        result = await store.get_file_writer("/workspace/test.txt")
+        assert result is not None
+        assert result[0] == t.id
 
     async def test_file_provenance_overwrite(self, store):
         t1 = await store.create_tagged_data("first", DataSource.TOOL, TrustLevel.TRUSTED)
         t2 = await store.create_tagged_data("second", DataSource.TOOL, TrustLevel.TRUSTED)
         await store.record_file_write("/workspace/out.txt", t1.id)
         await store.record_file_write("/workspace/out.txt", t2.id)
-        assert await store.get_file_writer("/workspace/out.txt") == t2.id
+        result = await store.get_file_writer("/workspace/out.txt")
+        assert result is not None
+        assert result[0] == t2.id
 
     async def test_file_provenance_unknown(self, store):
         assert await store.get_file_writer("/workspace/unknown.txt") is None

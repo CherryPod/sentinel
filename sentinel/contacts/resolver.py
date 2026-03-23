@@ -187,6 +187,54 @@ async def resolve_tool_recipient(
     return {**args, arg_name: resolved}
 
 
+async def resolve_default_recipient(
+    store: ContactStore | None,
+    tool_name: str,
+    user_id: int,
+) -> str | None:
+    """Find the requesting user's own channel identifier for a messaging tool.
+
+    Used as a fallback when no explicit recipient is specified — sends the
+    message back to the requesting user. Looks up the contact where
+    linked_user_id == user_id and is_user == True, then resolves that
+    contact's channel identifier for the tool's channel type.
+
+    Returns the resolved identifier string, or None if not found.
+    """
+    tool_info = _MESSAGING_TOOLS.get(tool_name)
+    if tool_info is None or store is None:
+        return None
+
+    channel, _ = tool_info
+
+    # Find the user's own contact entry
+    contacts = await store.list_contacts(user_id)
+    self_contact = None
+    for c in contacts:
+        if c.get("is_user") and c.get("linked_user_id") == user_id:
+            self_contact = c
+            break
+
+    if self_contact is None:
+        return None
+
+    # Resolve that contact's channel identifier
+    resolved = await resolve_recipient_to_channel(
+        store, self_contact["contact_id"], channel,
+    )
+    if resolved:
+        logger.info(
+            "Default recipient resolved to self",
+            extra={
+                "event": "default_recipient_resolved",
+                "tool": tool_name,
+                "contact_id": self_contact["contact_id"],
+                "channel": channel,
+            },
+        )
+    return resolved
+
+
 async def rewrite_message(
     store: ContactStore, text: str, user_id: int,
 ) -> tuple[str, list[dict]]:
