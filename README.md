@@ -6,6 +6,8 @@ Built with [Claude](https://claude.ai) (Anthropic) as the trusted planner and [Q
 
 ![Sentinel](ui/social-preview-v2.png)
 
+**[Follow the build journey](https://cherrypod-sentinel.duckdns.org/)** — one developer, one GPU, building an AI security platform from scratch.
+
 ---
 
 ## Tested and Verified
@@ -314,10 +316,6 @@ sentinel/
 **v0.5.0** — Multi-user auth, goal verification, anchor allocator, 17/17 security audit complete. Trust level 4 active (full tool execution with human approval gates).
 
 See [CHANGELOG](docs/CHANGELOG.md) for version history.
-
-## Blog
-
-Follow the journey of one developer building an AI security platform from scratch: **[cherrypod-sentinel.duckdns.org](https://cherrypod-sentinel.duckdns.org/)**
 
 ## License
 
