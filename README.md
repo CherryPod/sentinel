@@ -4,7 +4,7 @@ A defence-in-depth AI assistant built on the [CaMeL architecture](https://arxiv.
 
 Built with [Claude](https://claude.ai) (Anthropic) as the trusted planner and [Qwen 3](https://huggingface.co/Qwen) (Alibaba) as the air-gapped worker. Security scanning by [Prompt Guard 2](https://huggingface.co/meta-llama/Prompt-Guard-2-86M) (Meta) and [Semgrep](https://semgrep.dev/) (r2c).
 
-![Sentinel](ui/social-preview-v2.png)
+![Sentinel](ui/social-preview-v3.png)
 
 **[Follow the build journey](https://cherrypod-sentinel.duckdns.org/)** — one developer, one GPU, building an AI security platform from scratch.
 
