@@ -94,6 +94,7 @@ class EventBus:
             if isinstance(result, Exception):
                 logger.error(
                     "Event handler error",
+                    exc_info=result,
                     extra={
                         "event": "bus_handler_error",
                         "topic": topic,

@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from starlette.testclient import TestClient
 
+from tests.conftest import auth_headers
 from sentinel.core.approval import ApprovalManager, ApprovalEntry
 from sentinel.core.models import (
     ConversationInfo,
@@ -77,7 +78,7 @@ class TestTaskSubmission:
         with patch("sentinel.api.routes.task._orchestrator", mock_orch):
             from sentinel.api.app import app
             client = TestClient(app)
-            resp = client.post("/api/task", json={"request": "Hello world"}, headers=_ORIGIN)
+            resp = client.post("/api/task", json={"request": "Hello world"}, headers={**auth_headers(), **_ORIGIN})
 
         assert resp.status_code == 200
         data = resp.json()
@@ -114,7 +115,7 @@ class TestApprovalFlow:
         with patch("sentinel.api.routes.task._orchestrator", mock_orch):
             from sentinel.api.app import app
             client = TestClient(app)
-            resp = client.get("/api/approval/test-approval-1")
+            resp = client.get("/api/approval/test-approval-1", headers=auth_headers())
 
         assert resp.status_code == 200
         data = resp.json()
@@ -152,7 +153,7 @@ class TestApprovalFlow:
             resp = client.post(
                 "/api/approve/approve-1",
                 json={"granted": True, "reason": "Looks good"},
-                headers=_ORIGIN,
+                headers={**auth_headers(), **_ORIGIN},
             )
 
         assert resp.status_code == 200
@@ -181,7 +182,7 @@ class TestApprovalFlow:
             resp = client.post(
                 "/api/approve/deny-1",
                 json={"granted": False, "reason": "Not safe"},
-                headers=_ORIGIN,
+                headers={**auth_headers(), **_ORIGIN},
             )
 
         assert resp.status_code == 200
@@ -201,7 +202,7 @@ class TestApprovalFlow:
         with patch("sentinel.api.routes.task._orchestrator", mock_orch):
             from sentinel.api.app import app
             client = TestClient(app)
-            resp = client.get("/api/approval/nonexistent-id")
+            resp = client.get("/api/approval/nonexistent-id", headers=auth_headers())
 
         assert resp.status_code == 200
         data = resp.json()

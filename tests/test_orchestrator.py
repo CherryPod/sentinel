@@ -1813,8 +1813,7 @@ class TestDynamicReplanning:
     async def test_replan_budget_exhaustion(self, mock_planner, mock_pipeline):
         """After 3 replans, further replan_after markers are ignored."""
         # Build a plan with 4 replan_after steps (exceeds budget of 3)
-        # The validation caps at 3, so we test the runtime budget instead
-        # by creating plans that each have 1 replan_after step
+        # Using file_write so each cycle has mutations (avoids stagnation abort)
         plans = []
         for i in range(4):
             plans.append(Plan(
@@ -1823,9 +1822,9 @@ class TestDynamicReplanning:
                 steps=[PlanStep(
                     id=f"step_{i + 1}",
                     type="tool_call",
-                    tool="shell",
+                    tool="file_write",
                     description=f"Step {i + 1}",
-                    args={"command": f"echo phase{i}"},
+                    args={"path": f"/workspace/out_{i}.txt", "content": f"phase{i}"},
                     output_var=f"$out_{i}",
                     replan_after=True,
                 )],
@@ -1840,15 +1839,17 @@ class TestDynamicReplanning:
         ))
         mock_planner.create_plan.side_effect = plans
 
-        # Each shell step returns output
-        shell_data = await create_tagged_data(
+        # Each file_write step returns output with file size metadata
+        write_data = await create_tagged_data(
             content="output\n", source=DataSource.TOOL, trust_level=TrustLevel.TRUSTED,
         )
         mock_executor = MagicMock()
         mock_executor.get_tool_descriptions.return_value = [
-            {"name": "shell", "description": "Run a shell command"},
+            {"name": "file_write", "description": "Write a file"},
         ]
-        mock_executor.execute = AsyncMock(return_value=(shell_data, {"exit_code": 0, "stderr": ""}))
+        mock_executor.execute = AsyncMock(return_value=(
+            write_data, {"exit_code": 0, "stderr": "", "file_size_before": 0, "file_size_after": 7},
+        ))
         mock_pipeline.scan_output.return_value = PipelineScanResult()
 
         done_data = await create_tagged_data("done", DataSource.QWEN, TrustLevel.UNTRUSTED)

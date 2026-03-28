@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import re
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -28,6 +30,32 @@ from typing import Any
 from sentinel.core.context import current_user_id, get_task_id
 
 logger = logging.getLogger("sentinel.audit")
+
+# Finding #6: Module-level constant for render budget (was hardcoded inside function)
+RENDER_MAX_CHARS = 800
+
+# Finding #1: Regex patterns for sanitising user_request before planner injection.
+# Defence-in-depth against stored injection: strip XML/HTML-like tags and common
+# injection markers. The planner needs the gist, not the exact user phrasing.
+_TAG_PATTERN = re.compile(r"<[^>]{1,100}>")
+_INJECTION_MARKERS = re.compile(
+    r"(?:IGNORE\s+(?:ALL\s+)?PREVIOUS|SYSTEM\s*:|ASSISTANT\s*:|<\|(?:im_start|im_end)\|>)",
+    re.IGNORECASE,
+)
+
+
+def _sanitise_for_planner(text: str) -> str:
+    """Strip injection-prone patterns from user_request before planner replay.
+
+    Finding #1: user_request is user-supplied text that passed S1 scanning at
+    intake, but is replayed verbatim to the planner via render_episodic_text().
+    If S1 has a gap, a stored payload is replayed indefinitely. This sanitisation
+    is defence-in-depth — it strips common injection markers without losing the
+    semantic content the planner needs for task relevance.
+    """
+    text = _TAG_PATTERN.sub("", text)
+    text = _INJECTION_MARKERS.sub("[REDACTED]", text)
+    return text
 
 
 def _now_iso() -> str:
@@ -56,6 +84,7 @@ class EpisodicRecord:
     access_count: int
     last_accessed: str | None
     task_domain: str | None = None
+    plan_json: dict | None = None          # Full plan evolution (phases + outcomes)
     memory_chunk_id: str | None = None
     created_at: str = ""
 
@@ -70,7 +99,7 @@ class EpisodicFact:
     content: str
     file_path: str | None
     created_at: str
-    user_id: int = 1
+    user_id: int = 0  # Finding #2: 0 = unset; callers should pass explicit user_id
 
 
 # Tool name → domain mapping for task classification
@@ -149,8 +178,15 @@ def classify_task_domain(step_outcomes: list[dict]) -> str | None:
     if tool_steps == 0:
         return None
 
-    # Check for debug pattern: file_read + llm_task + file_write sequence
-    # indicates debugging even though tools map to code_generation/file_ops
+    # Dominant domain: >50% of tool steps (checked first — Finding #4)
+    for domain, count in sorted(domain_counts.items(), key=lambda x: x[1], reverse=True):
+        if count > tool_steps / 2:
+            return domain
+
+    # Finding #4: Debug pattern heuristic moved AFTER dominant-domain check.
+    # Previously this fired before the dominant check, misclassifying tasks
+    # with a dominant domain (e.g. 5 web_search + 1 file_read + 1 file_write
+    # + 1 llm_task would wrongly get "code_debugging" instead of "search").
     has_file_read = any(
         o.get("tool") == "file_read" for o in step_outcomes
         if o.get("step_type") == "tool_call"
@@ -164,11 +200,6 @@ def classify_task_domain(step_outcomes: list[dict]) -> str | None:
     )
     if has_file_read and has_file_write and has_llm_task:
         return "code_debugging"
-
-    # Dominant domain: >50% of tool steps
-    for domain, count in sorted(domain_counts.items(), key=lambda x: x[1], reverse=True):
-        if count > tool_steps / 2:
-            return domain
 
     return "composite"
 
@@ -232,6 +263,70 @@ def _categorise_strategy(step_outcomes: list[dict]) -> str:
     return " → ".join(simplified)
 
 
+def _render_compact_plan_line(plan_json: dict) -> str:
+    """Render a one-line plan chain with outcome annotations for compact display.
+
+    Produces: file_read($page):OK -> llm_task($widget):OK -> file_patch(BLOCKED:innerHTML)
+    Walks all phases in order so the chain includes continuation steps.
+    Budget: ~200 chars — truncates with '...' if needed.
+    """
+    parts: list[str] = []
+    for phase in plan_json.get("phases", []):
+        # Mark phase transitions with [replan] marker
+        if phase.get("trigger"):
+            parts.append("[replan]")
+
+        plan_data = phase.get("plan", {})
+        outcomes = phase.get("step_outcomes_summary", {})
+
+        for step in plan_data.get("steps", []):
+            step_id = step.get("id", "?")
+            tool = step.get("tool") or step.get("type", "?")
+            var = step.get("output_var", "")
+
+            # Outcome annotation
+            outcome = outcomes.get(step_id, {})
+            status = outcome.get("status", "?")
+            if status == "success":
+                annotation = "OK"
+            elif status == "blocked":
+                error = outcome.get("error", "")
+                short_err = error.split()[0] if error else "blocked"
+                annotation = f"BLOCKED:{short_err}"
+            elif status in ("failed", "soft_failed", "error"):
+                annotation = status.upper()
+            else:
+                annotation = status.upper()
+
+            if var:
+                parts.append(f"{tool}({var}):{annotation}")
+            else:
+                parts.append(f"{tool}({annotation})")
+
+    result = " -> ".join(parts)
+
+    # Append completion marker for non-full completions
+    completion = plan_json.get("completion", "full")
+    if completion == "partial":
+        result += " [PARTIAL]"
+    elif completion == "abandoned":
+        result += " [ABANDONED]"
+
+    if len(result) > 220:  # Slightly larger budget to accommodate markers
+        truncated = result[:200]
+        last_arrow = truncated.rfind(" -> ")
+        if last_arrow > 0:
+            result = truncated[:last_arrow] + " -> ..."
+        else:
+            result = truncated[:197] + "..."
+        # Re-append marker after truncation
+        if completion == "partial":
+            result += " [PARTIAL]"
+        elif completion == "abandoned":
+            result += " [ABANDONED]"
+    return result
+
+
 def render_episodic_text(
     user_request: str,
     task_status: str,
@@ -244,6 +339,7 @@ def render_episodic_text(
     task_domain: str | None = None,
     original_request: str | None = None,
     prior_error_summary: str | None = None,
+    plan_json: dict | None = None,
 ) -> str:
     """Render outcome-aware text for embedding + planner context.
 
@@ -264,15 +360,14 @@ def render_episodic_text(
     the real constraint is the planner's token budget for episodic
     context (~2K tokens shared across multiple records).
     """
-    _MAX_CHARS = 800
-
     # Line 1: [domain] request — use original scenario for fix-cycles
     # so the embedding/search key reflects the actual task, not the
     # generic "previous task failed" retry prompt.
-    display_request = user_request
+    # Finding #1: Sanitise user_request and original_request before planner replay
+    display_request = _sanitise_for_planner(user_request)
     is_fix_cycle = original_request is not None and original_request != user_request
     if is_fix_cycle:
-        display_request = original_request
+        display_request = _sanitise_for_planner(original_request)
 
     if task_domain:
         header = f"[{task_domain}] {display_request[:140]}"
@@ -303,8 +398,8 @@ def render_episodic_text(
     # past tasks (e.g. "clock.js") instead of discovering current state.
     # Extensions preserve useful type info (.html, .css, .js) without
     # the specifics that poison future plans.
+    # Finding #5: import os moved to module level
     if file_paths:
-        import os
         seen_exts: set[str] = set()
         ext_labels: list[str] = []
         for fp in file_paths:
@@ -337,11 +432,13 @@ def render_episodic_text(
                 step_parts.append(f"exit={exit_code}")
 
             # For failures: stderr is the most valuable diagnostic
+            # Finding #7: Redact internal paths from stderr before planner injection
             if step_status in ("failed", "error", "soft_failed"):
                 stderr = o.get("stderr_preview", "")
                 if stderr:
                     stderr_line = _extract_key_stderr_line(stderr)
                     if stderr_line:
+                        stderr_line = _redact_paths(stderr_line)
                         step_parts.append(f"stderr: {stderr_line}")
                 elif o.get("error_detail"):
                     step_parts.append(o["error_detail"][:60])
@@ -361,7 +458,7 @@ def render_episodic_text(
             line = "; ".join(step_parts)
             # Stop adding steps if we'd bust the budget
             current_len = sum(len(l) + 1 for l in lines) + len(line)
-            if current_len > _MAX_CHARS - 100:  # reserve 100 chars for remaining fields
+            if current_len > RENDER_MAX_CHARS - 100:  # reserve 100 chars for remaining fields
                 lines.append(f"... +{len(step_outcomes) - i} more steps")
                 break
             lines.append(line)
@@ -371,14 +468,33 @@ def render_episodic_text(
     if prior_error_summary:
         lines.append(f"Prior error: {prior_error_summary[:120]}")
 
-    # Plan summary
-    if plan_summary:
+    # Plan line — if plan_json is available, render compact tool chain with
+    # outcome annotations. Otherwise fall back to plain plan_summary.
+    if plan_json and plan_json.get("phases"):
+        plan_line = _render_compact_plan_line(plan_json)
+        if plan_line:
+            lines.append(f"Plan: {plan_line}")
+    elif plan_summary:
         lines.append(f"Plan: {plan_summary[:100]}")
 
     result = "\n".join(lines)
-    if len(result) > _MAX_CHARS:
-        result = result[:_MAX_CHARS - 3] + "..."
+    if len(result) > RENDER_MAX_CHARS:
+        result = result[:RENDER_MAX_CHARS - 3] + "..."
     return result
+
+
+_ABS_PATH_PATTERN = re.compile(r"(?:/[a-zA-Z0-9._-]+){3,}")
+
+
+def _redact_paths(text: str) -> str:
+    """Finding #7: Redact absolute paths from text to avoid leaking internal structure.
+
+    Replaces paths like /opt/sentinel/internal/foo.py with just the basename.
+    The planner needs the error message, not the full filesystem layout.
+    """
+    def _replace_path(m: re.Match) -> str:
+        return os.path.basename(m.group(0))
+    return _ABS_PATH_PATTERN.sub(_replace_path, text)
 
 
 def _extract_key_stderr_line(stderr: str) -> str:
@@ -567,6 +683,11 @@ def _row_to_record(row: Any) -> EpisodicRecord:
     if isinstance(linked_records, str):
         linked_records = json.loads(linked_records)
 
+    # plan_json may not exist on older databases — graceful fallback
+    plan_json = row.get("plan_json") if hasattr(row, "get") else None
+    if isinstance(plan_json, str):
+        plan_json = json.loads(plan_json)
+
     return EpisodicRecord(
         record_id=row["record_id"],
         session_id=row["session_id"],
@@ -586,6 +707,7 @@ def _row_to_record(row: Any) -> EpisodicRecord:
         access_count=row["access_count"],
         last_accessed=_dt_to_iso(row["last_accessed"]),
         task_domain=row.get("task_domain") if hasattr(row, "get") else row["task_domain"],
+        plan_json=plan_json,
         memory_chunk_id=row["memory_chunk_id"],
         created_at=_dt_to_iso(row["created_at"]) or "",
     )
@@ -609,7 +731,7 @@ _RECORD_COLUMNS = (
     "task_status, plan_summary, step_count, success_count, "
     "file_paths, error_patterns, defined_symbols, step_outcomes, "
     "linked_records, relevance_score, access_count, last_accessed, "
-    "task_domain, memory_chunk_id, created_at"
+    "task_domain, plan_json, memory_chunk_id, created_at"
 )
 
 
@@ -636,10 +758,14 @@ class EpisodicStore:
         error_patterns: list[str] | None = None,
         defined_symbols: list[str] | None = None,
         step_outcomes: list[dict] | None = None,
-        user_id: int = 1,
+        user_id: int | None = None,  # Finding #9: fallback to current_user_id
         task_domain: str | None = None,
+        plan_json: dict | None = None,
     ) -> str:
         """Create an episodic record + file index entries. Returns record_id."""
+        # Finding #9: Resolve user_id from contextvar if not explicitly passed
+        if user_id is None:
+            user_id = current_user_id.get(1)
         record_id = str(uuid.uuid4())
         file_paths = file_paths or []
         error_patterns = error_patterns or []
@@ -652,15 +778,17 @@ class EpisodicStore:
                         "INSERT INTO episodic_records "
                         "(record_id, session_id, task_id, user_id, user_request, "
                         "task_status, plan_summary, step_count, success_count, "
-                        "file_paths, error_patterns, defined_symbols, step_outcomes, task_domain) "
+                        "file_paths, error_patterns, defined_symbols, step_outcomes, "
+                        "task_domain, plan_json) "
                         "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, "
-                        "$10::jsonb, $11::jsonb, $12::jsonb, $13::jsonb, $14)",
+                        "$10::jsonb, $11::jsonb, $12::jsonb, $13::jsonb, $14, $15::jsonb)",
                         record_id, session_id, task_id, user_id, user_request,
                         task_status, plan_summary, step_count, success_count,
                         json.dumps(file_paths), json.dumps(error_patterns),
                         json.dumps(defined_symbols),
                         json.dumps(step_outcomes) if step_outcomes else None,
                         task_domain,
+                        json.dumps(plan_json) if plan_json else None,
                     )
 
                     # Populate file index
@@ -691,6 +819,7 @@ class EpisodicStore:
                 access_count=0,
                 last_accessed=None,
                 task_domain=task_domain,
+                plan_json=plan_json,
                 memory_chunk_id=None,
                 created_at=now,
             )
@@ -756,9 +885,12 @@ class EpisodicStore:
         return records[:limit]
 
     async def list_by_file(
-        self, file_path: str, user_id: int = 1, limit: int = 50,
+        self, file_path: str, user_id: int | None = None, limit: int = 50,
     ) -> list[EpisodicRecord]:
         """List records that affected a given file path, newest first."""
+        # Finding #10: Consistent with other methods — fallback to contextvar
+        if user_id is None:
+            user_id = current_user_id.get(1)
         if self._pool is not None:
             async with self._pool.acquire() as conn:
                 rows = await conn.fetch(
@@ -893,13 +1025,27 @@ class EpisodicStore:
 
     async def prune_stale(
         self, threshold: float = 0.05, min_age_days: int = 30,
-        user_id: int | None = None,
+        user_id: int | None = None, *, admin: bool = False,
     ) -> int:
         """Remove old, unaccessed episodic records below relevance threshold.
 
-        When user_id is None, prunes across all users (admin mode).
+        Finding #11: Cross-user pruning requires explicit ``admin=True``.
+        When user_id is None and admin is False, falls back to current_user_id.
+        When user_id is None and admin is True, prunes across ALL users.
         When user_id is an int, only that user's records are considered.
         """
+        if user_id is None and not admin:
+            user_id = current_user_id.get(1)
+            logger.debug(
+                "prune_stale: no user_id provided, using current_user_id=%d",
+                user_id,
+                extra={"event": "prune_stale_user_fallback", "user_id": user_id},
+            )
+        elif user_id is None and admin:
+            logger.warning(
+                "prune_stale: admin mode — pruning across ALL users",
+                extra={"event": "prune_stale_admin"},
+            )
         if self._pool is not None:
             async with self._pool.acquire() as conn:
                 if user_id is not None:
@@ -954,10 +1100,19 @@ class EpisodicStore:
                         )
 
                 # Batch delete episodic records — FK CASCADE handles file_index + facts
-                await conn.execute(
-                    "DELETE FROM episodic_records WHERE record_id = ANY($1)",
-                    record_ids_to_prune,
-                )
+                # Finding #13: Re-verify user_id in the DELETE for defence-in-depth.
+                # The candidate list was already filtered, but this prevents
+                # cross-user deletion if the filter query is ever corrupted.
+                if user_id is not None:
+                    await conn.execute(
+                        "DELETE FROM episodic_records WHERE record_id = ANY($1) AND user_id = $2",
+                        record_ids_to_prune, user_id,
+                    )
+                else:
+                    await conn.execute(
+                        "DELETE FROM episodic_records WHERE record_id = ANY($1)",
+                        record_ids_to_prune,
+                    )
 
                 pruned = len(record_ids_to_prune)
                 if pruned > 0:
@@ -1073,6 +1228,7 @@ class EpisodicStore:
         task_domain: str | None = None,
         original_request: str | None = None,
         prior_error_summary: str | None = None,
+        plan_json: dict | None = None,
     ) -> str:
         """Create episodic record + memory_chunks shadow entry."""
         record_id = await self.create(
@@ -1089,6 +1245,7 @@ class EpisodicStore:
             step_outcomes=step_outcomes,
             user_id=user_id,
             task_domain=task_domain,
+            plan_json=plan_json,
         )
 
         # Render text for shadow entry (include step_outcomes for enriched FTS/vector search)
@@ -1104,6 +1261,7 @@ class EpisodicStore:
             task_domain=task_domain,
             original_request=original_request,
             prior_error_summary=prior_error_summary,
+            plan_json=plan_json,
         )
 
         metadata = {

@@ -30,6 +30,7 @@ from typing import Any
 
 from sentinel.core.bus import EventBus
 from sentinel.core.config import settings
+from sentinel.core.context import current_user_id
 from sentinel.core.models import TaskResult
 from sentinel.planner.orchestrator import Orchestrator
 
@@ -69,8 +70,12 @@ AGENT_CARD: dict[str, Any] = {
 # ---- JSON-RPC 2.0 error codes -------------------------------------------
 
 INVALID_REQUEST = -32600
+INVALID_PARAMS = -32602
 METHOD_NOT_FOUND = -32601
 INTERNAL_ERROR = -32603
+
+# Maximum allowed length for user request text via A2A
+MAX_TEXT_LENGTH = 50_000
 
 
 # ---- Sentinel -> A2A state mapping --------------------------------------
@@ -207,6 +212,10 @@ async def handle_tasks_send(
     if not user_request:
         raise ValueError("No text content found in message parts")
 
+    # Input length limit — prevent oversized payloads from consuming resources
+    if len(user_request) > MAX_TEXT_LENGTH:
+        raise ValueError(f"Request text too long ({len(user_request)} chars, max {MAX_TEXT_LENGTH})")
+
     source_key = f"a2a:{client_ip}"
     try:
         result = await asyncio.wait_for(
@@ -246,6 +255,13 @@ async def handle_tasks_get(
         status_val = approval_status.get("status", "not_found")
 
         if status_val != "not_found":
+            # Ownership check: verify the approval belongs to the requesting user.
+            # Approval user_id is set when the task was created — if present, it
+            # must match the current authenticated user.
+            approval_user_id = approval_status.get("user_id")
+            uid = current_user_id.get()
+            if approval_user_id is not None and approval_user_id != uid:
+                return None  # treat as not found to avoid leaking existence
             # Map approval states to A2A states
             state_map = {
                 "pending": "input-required",

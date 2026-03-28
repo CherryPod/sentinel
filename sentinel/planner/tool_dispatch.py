@@ -77,6 +77,9 @@ async def check_provenance(
     # (sites/) has the same risk profile as website create — the output is
     # displayed, not executed. Patching scripts or configs is higher risk
     # and stays gated.
+    # NOTE: step.args.get("path") is UNRESOLVED at this point (pre-resolve_args).
+    # If path is a $variable, it won't match and is_content_creation stays False —
+    # this is FAIL-SAFE (provenance gate blocks, then S4 validates resolved path).
     if step.tool == "file_patch" and not is_content_creation:
         patch_path = step.args.get("path", "")
         if any(patch_path.startswith(p) for p in FILE_PATCH_CONTENT_PATHS):
@@ -190,8 +193,10 @@ async def validate_constraints(
                     error=f"Command constraint violation: {cmd_result.reason}",
                 )
 
-    # file_write / file_read: validate resolved path
-    if step.tool in ("file_write", "file_read") and "path" in resolved_args:
+    # file_write / file_read / file_patch: validate resolved path.
+    # file_patch writes files — same path constraint validation as file_write/file_read.
+    # PolicyEngine also validates at dispatch time (defence-in-depth, not sole gate).
+    if step.tool in ("file_write", "file_read", "file_patch") and "path" in resolved_args:
         path_result = validate_path_constraints(
             resolved_args["path"], step.allowed_paths,
         )
@@ -398,7 +403,9 @@ async def dispatch_tool(
         from sentinel.tools.executor import ToolBlockedError
         status = "blocked" if isinstance(exc, ToolBlockedError) else "error"
         logger.error(
-            "Tool execution exception",
+            "Tool execution exception: %s — %s",
+            type(exc).__name__, str(exc)[:500],
+            exc_info=True,
             extra={
                 "event": "tool_execution_exception",
                 "step_id": step.id,

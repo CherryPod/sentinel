@@ -8,6 +8,7 @@ from starlette.testclient import TestClient
 from sentinel.api.auth import PinVerifier
 from sentinel.core.approval import ApprovalManager
 from sentinel.api.metrics import get_metrics
+from tests.conftest import auth_headers
 
 
 @pytest.fixture
@@ -48,7 +49,7 @@ class TestMetricsEndpoint:
              patch("sentinel.api.routes.health._get_metrics_fn", get_metrics):
             from sentinel.api.app import app
             client = TestClient(app)
-            resp = client.get("/api/metrics")
+            resp = client.get("/api/metrics", headers=auth_headers())
             assert resp.status_code == 200
             data = resp.json()
             assert data["status"] == "ok"
@@ -69,7 +70,7 @@ class TestMetricsEndpoint:
             from sentinel.api.app import app
             client = TestClient(app)
             for window in ["7d", "30d", "all"]:
-                resp = client.get(f"/api/metrics?window={window}")
+                resp = client.get(f"/api/metrics?window={window}", headers=auth_headers())
                 assert resp.status_code == 200
                 assert resp.json()["window"] == window
 
@@ -82,7 +83,7 @@ class TestMetricsEndpoint:
              patch("sentinel.api.routes.health._get_metrics_fn", get_metrics):
             from sentinel.api.app import app
             client = TestClient(app)
-            resp = client.get("/api/metrics?window=1y")
+            resp = client.get("/api/metrics?window=1y", headers=auth_headers())
             assert resp.status_code == 422
 
     @patch("sentinel.api.lifecycle._pin_verifier", None)
@@ -95,7 +96,7 @@ class TestMetricsEndpoint:
              patch("sentinel.core.config.settings.trust_level", 2):
             from sentinel.api.app import app
             client = TestClient(app)
-            resp = client.get("/api/metrics")
+            resp = client.get("/api/metrics", headers=auth_headers())
             assert resp.status_code == 200
             assert resp.json()["trust_level"] == 2
 

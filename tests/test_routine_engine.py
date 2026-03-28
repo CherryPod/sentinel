@@ -803,3 +803,115 @@ async def test_try_fast_path_passes_skip_confirmation(
     )
     _, kwargs = mock_fast_path.execute.call_args
     assert kwargs.get("skip_confirmation") is True
+
+
+# ── Audit finding tests ──────────────────────────────────────────
+
+
+class TestApprovalModeDefault:
+    """Finding #1: User-created routines default to approval_mode='full'."""
+
+    async def test_default_approval_mode_is_full(self, engine, store, mock_orchestrator):
+        """A routine with no explicit approval_mode uses 'full'."""
+        r = await store.create(
+            name="User routine",
+            trigger_type="cron",
+            trigger_config={"cron": "0 9 * * *"},
+            action_config={"prompt": "test prompt"},
+            next_run_at="2020-01-01T00:00:00.000Z",
+        )
+
+        await engine._check_due_routines()
+        await asyncio.sleep(0.1)
+
+        mock_orchestrator.handle_task.assert_called_once()
+        call_kwargs = mock_orchestrator.handle_task.call_args.kwargs
+        assert call_kwargs["approval_mode"] == "full"
+
+    async def test_explicit_auto_approval_preserved(self, engine, store, mock_orchestrator):
+        """A routine with explicit approval_mode='auto' keeps it."""
+        r = await store.create(
+            name="System routine",
+            trigger_type="cron",
+            trigger_config={"cron": "0 9 * * *"},
+            action_config={"prompt": "test", "approval_mode": "auto"},
+            next_run_at="2020-01-01T00:00:00.000Z",
+        )
+
+        await engine._check_due_routines()
+        await asyncio.sleep(0.1)
+
+        mock_orchestrator.handle_task.assert_called_once()
+        call_kwargs = mock_orchestrator.handle_task.call_args.kwargs
+        assert call_kwargs["approval_mode"] == "auto"
+
+
+class TestStarvationAlerting:
+    """Finding #8: Starvation counter tracks consecutive max_concurrent hits."""
+
+    async def test_starvation_counter_increments(self, store, bus):
+        hold = asyncio.Event()
+
+        async def slow_task(**kwargs):
+            await hold.wait()
+            return TaskResult(status="success", plan_summary="done", task_id="x")
+
+        slow_orch = AsyncMock()
+        slow_orch.handle_task = AsyncMock(side_effect=slow_task)
+
+        eng = RoutineEngine(
+            store=store, orchestrator=slow_orch, event_bus=bus,
+            tick_interval=1, max_concurrent=1, execution_timeout=30,
+        )
+
+        # Create 2 due routines — one runs, one skipped
+        for i in range(2):
+            await store.create(
+                name=f"Starve {i}", trigger_type="cron",
+                trigger_config={"cron": "0 9 * * *"},
+                action_config={"prompt": f"test {i}"},
+                next_run_at="2020-01-01T00:00:00.000Z",
+            )
+
+        await eng._check_due_routines()
+        assert eng._starvation_ticks == 1
+
+        await eng._check_due_routines()
+        assert eng._starvation_ticks == 2
+
+        hold.set()
+        await asyncio.sleep(0.1)
+        await eng.stop()
+
+    async def test_starvation_resets_when_slots_free(self, engine, store, mock_orchestrator):
+        """Starvation counter resets when all due routines are processed."""
+        # No routines — should reset counter
+        engine._starvation_ticks = 5
+        await engine._check_due_routines()
+        assert engine._starvation_ticks == 0
+
+
+class TestSeedDefaultsRequiresUserId:
+    """Finding #13: seed_defaults requires explicit user_id."""
+
+    async def test_seed_defaults_no_default(self, engine):
+        import inspect
+        sig = inspect.signature(engine.seed_defaults)
+        param = sig.parameters["user_id"]
+        assert param.default is inspect.Parameter.empty, \
+            "seed_defaults should require explicit user_id"
+
+
+class TestCleanupStaleMultiUser:
+    """Finding #11: cleanup_stale handles all users' executions."""
+
+    async def test_cleanup_stale_handles_multi_user(self, engine):
+        await engine.record_start("exec-1", "r1", 1, "scheduler")
+        await engine.record_start("exec-2", "r2", 42, "scheduler")
+
+        count = await engine.cleanup_stale()
+        assert count == 2
+
+        for eid in ("exec-1", "exec-2"):
+            rec = engine._mem_executions[eid]
+            assert rec["status"] == "interrupted"

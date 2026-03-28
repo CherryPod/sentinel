@@ -18,6 +18,7 @@ from typing import Any
 from fastapi import APIRouter, FastAPI, HTTPException, Query, Request
 
 from sentinel.core.config import settings
+from sentinel.core.context import current_user_id
 
 logger = logging.getLogger("sentinel.api")
 
@@ -58,6 +59,7 @@ _session_store: Any = None
 _orchestrator: Any = None
 _routine_engine: Any = None
 _get_metrics_fn: Any = None
+_contact_store: Any = None
 
 
 def init(
@@ -67,14 +69,16 @@ def init(
     orchestrator: Any = None,
     routine_engine: Any = None,
     get_metrics_fn: Any = None,
+    contact_store: Any = None,
 ) -> None:
     """Inject dependencies — called once from app.py lifespan."""
-    global _health_state, _session_store, _orchestrator, _routine_engine, _get_metrics_fn
+    global _health_state, _session_store, _orchestrator, _routine_engine, _get_metrics_fn, _contact_store
     _health_state = health_state
     _session_store = session_store
     _orchestrator = orchestrator
     _routine_engine = routine_engine
     _get_metrics_fn = get_metrics_fn
+    _contact_store = contact_store
 
 
 # ── Accessors ──────────────────────────────────────────────────────
@@ -170,27 +174,17 @@ async def check_pg_ready(app_instance: FastAPI) -> bool | None:
 
 @root_router.get("/health")
 async def health(request: Request):
+    """Container probe — minimal response, no config details."""
     hs = _health_state
-    status = gather_component_status(hs)
     # BOOT-1: Flag degraded when both security scanners are offline
     pg_loaded = hs.prompt_guard_loaded if hs else False
     sg_loaded = hs.semgrep_loaded if hs else False
     degraded = not pg_loaded and not sg_loaded
-    result = {
+    return {
         "status": "ok",
         "degraded": degraded,
-        "policy_loaded": (hs.engine is not None) if hs else False,
-        "conversation_tracking": settings.conversation_enabled,
-        "baseline_mode": settings.baseline_mode,
-        "pin_auth_enabled": (hs.pin_verifier is not None) if hs else False,
-        "approval_mode": settings.approval_mode,
-        "benchmark_mode": settings.benchmark_mode,
-        **status,
+        "version": "0.2.0",
     }
-    pg_ready = await check_pg_ready(request.app)
-    if pg_ready is not None:
-        result["pg_ready"] = pg_ready
-    return result
 
 
 # ── Client-facing health check at /api/health ─────────────────────
@@ -202,18 +196,19 @@ async def api_health(request: Request):
     status = gather_component_status(hs)
 
     # Email status — config-level (no persistent runtime service)
+    # Omit backend technology details (IMAP/Gmail/CalDAV) from response
     if settings.email_backend == "imap" and settings.imap_host:
-        email_status = "enabled (IMAP)"
+        email_status = "enabled"
     elif settings.gmail_enabled:
-        email_status = "enabled (Gmail)"
+        email_status = "enabled"
     else:
         email_status = "disabled"
 
     # Calendar status — config-level
     if settings.calendar_backend == "caldav" and settings.caldav_url:
-        calendar_status = "enabled (CalDAV)"
+        calendar_status = "enabled"
     elif settings.calendar_enabled:
-        calendar_status = "enabled (Google)"
+        calendar_status = "enabled"
     else:
         calendar_status = "disabled"
 
@@ -245,10 +240,19 @@ async def api_health(request: Request):
 async def dashboard_metrics(
     window: str = Query("24h", pattern=r"^(24h|7d|30d|all)$"),
 ):
-    """Dashboard metrics aggregated over a time window."""
+    """Dashboard metrics aggregated over a time window (admin only)."""
+    # Role check — metrics are sensitive operational data
+    uid = current_user_id.get()
+    if _contact_store is not None and uid:
+        role = await _contact_store.get_user_role(uid)
+        if role != "admin":
+            raise HTTPException(status_code=403, detail="Admin access required")
+
     if _session_store is None or _orchestrator is None:
         raise HTTPException(status_code=503, detail="Database not available")
-    data = await _get_metrics_fn(
+
+    fn = _get_metrics_callable()
+    data = await fn(
         session_store=_session_store,
         approval_manager=_orchestrator.approval_manager,
         routine_engine=_routine_engine,

@@ -51,6 +51,19 @@ def validate_trigger_config(trigger_type: str, trigger_config: dict) -> None:
         event_topic = trigger_config.get("event")
         if not event_topic or not isinstance(event_topic, str):
             raise ValueError("Event trigger requires 'event' key with a topic pattern")
+        # Finding #7: Reject overly-broad patterns that could exhaust concurrent slots.
+        # Must not be a bare wildcard or single-segment wildcard (e.g. "task.*").
+        parts = event_topic.split(".")
+        if event_topic == "*":
+            raise ValueError(
+                "Event pattern '*' is too broad — use a specific topic prefix "
+                "(e.g. 'webhook.*', 'task.*.completed')"
+            )
+        if len(parts) == 2 and parts[1] == "*":
+            raise ValueError(
+                f"Event pattern '{event_topic}' is too broad — add a more specific "
+                f"suffix (e.g. '{parts[0]}.*.completed')"
+            )
 
     elif trigger_type == "interval":
         seconds = trigger_config.get("seconds")

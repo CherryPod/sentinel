@@ -113,12 +113,16 @@ class PlanStep(BaseModel):
     # Dynamic replanning: pause execution after this step and call the planner
     # again with results, so it can plan remaining steps with actual data
     replan_after: bool = False
+    # Verification: planner-generated post-conditions checked after execution
+    assertions: list[dict] = Field(default_factory=list)
 
 
 class Plan(BaseModel):
     plan_summary: str
     steps: list[PlanStep]
     continuation: bool = False  # True when this plan continues a prior replan phase
+    # Plan-level assertions (cross-step post-conditions)
+    assertions: list[dict] = Field(default_factory=list)
 
 
 class StepResult(BaseModel):
@@ -162,3 +166,12 @@ class TaskResult(BaseModel):
     step_outcomes: list[dict] = Field(default_factory=list)
     # Dynamic replanning: number of replan calls made during execution
     replan_count: int = 0
+    # Plan-outcome memory: plan evolution phases for episodic storage
+    plan_phases: list[dict] = Field(default_factory=list)
+    # Goal verification signals (computed at end of _execute_plan)
+    completion: str = "full"             # "full" / "partial" / "abandoned"
+    goal_actions_executed: bool | None = None  # True if any effect tool ran
+    file_mutations: list[dict] = Field(default_factory=list)
+    assertion_failures: list[dict] = Field(default_factory=list)
+    tool_output_warnings: list[dict] = Field(default_factory=list)
+    judge_verdict: dict | None = None    # Tier 2 planner-as-judge result

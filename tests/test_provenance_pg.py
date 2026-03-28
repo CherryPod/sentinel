@@ -487,3 +487,83 @@ class TestGetProvenanceChainUserIsolation:
         assert len(chain) == 1
         sql = conn.fetch.call_args[0][0]
         assert "user_id = $3" not in sql
+
+
+# ── file_provenance composite PK (file_path, user_id) ────────
+
+
+class TestFileProvenanceMultiUserPK:
+    """Verify composite PK (file_path, user_id) allows per-user provenance."""
+
+    @pytest.fixture
+    def store(self, mock_pool):
+        pool, _ = mock_pool
+        return ProvenanceStore(pool=pool)
+
+    @pytest.mark.asyncio
+    async def test_two_users_same_path_separate_records(self, store, mock_pool):
+        """Two users writing the same path should create separate provenance records."""
+        _, mock_conn = mock_pool
+        await store.record_file_write("/workspace/index.html", "data-1", content="<h1>A</h1>", user_id=1)
+        insert_call = mock_conn.execute.call_args
+        sql = insert_call[0][0]
+        assert "ON CONFLICT (file_path, user_id)" in sql, (
+            "ON CONFLICT must use composite key (file_path, user_id)"
+        )
+
+    @pytest.mark.asyncio
+    async def test_get_file_writer_user_scoped(self, store, mock_pool):
+        """get_file_writer with user_id should filter by user."""
+        _, mock_conn = mock_pool
+        mock_conn.fetchrow.return_value = {"writer_data_id": "d1", "content_sha256": "abc"}
+        result = await store.get_file_writer("/workspace/index.html", user_id=1)
+        sql = mock_conn.fetchrow.call_args[0][0]
+        assert "user_id" in sql
+        assert result == ("d1", "abc")
+
+
+# ── cleanup_old user_id scoping ──────────────────────────────
+
+
+class TestCleanupOldUserScoped:
+    """Verify cleanup_old can be scoped to a user."""
+
+    @pytest.fixture
+    def store(self, mock_pool):
+        pool, _ = mock_pool
+        return ProvenanceStore(pool=pool)
+
+    @pytest.mark.asyncio
+    async def test_cleanup_with_user_id_filters(self, store, mock_pool):
+        _, mock_conn = mock_pool
+        # asyncpg transaction() is sync callable → async context manager
+        tx = MagicMock()
+        tx.__aenter__ = AsyncMock(return_value=None)
+        tx.__aexit__ = AsyncMock(return_value=False)
+        mock_conn.transaction = MagicMock(return_value=tx)
+        mock_conn.execute.return_value = "DELETE 5"
+
+        await store.cleanup_old(days=7, user_id=1)
+
+        calls = mock_conn.execute.call_args_list
+        for call in calls:
+            sql = call[0][0]
+            if "DELETE" in sql:
+                assert "user_id" in sql, f"DELETE should filter by user_id: {sql}"
+
+    @pytest.mark.asyncio
+    async def test_cleanup_without_user_id_is_global(self, store, mock_pool):
+        _, mock_conn = mock_pool
+        tx = MagicMock()
+        tx.__aenter__ = AsyncMock(return_value=None)
+        tx.__aexit__ = AsyncMock(return_value=False)
+        mock_conn.transaction = MagicMock(return_value=tx)
+        mock_conn.execute.return_value = "DELETE 3"
+
+        await store.cleanup_old(days=7)
+
+        calls = mock_conn.execute.call_args_list
+        for call in calls:
+            sql = call[0][0]
+            if "DELETE" in sql:
+                assert "user_id =" not in sql, f"Global cleanup should not filter by user_id: {sql}"

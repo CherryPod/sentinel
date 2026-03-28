@@ -26,6 +26,18 @@ logger = logging.getLogger("sentinel.audit")
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
 
 
+def _mask_email(address: str) -> str:
+    """Mask email address for logging — 'a***@example.com'."""
+    if "@" in address:
+        return address[0] + "***@" + address.split("@")[-1]
+    return "***"
+
+
+def _mask_query(query: str) -> str:
+    """Mask email addresses within a search query for logging."""
+    return re.sub(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+", _mask_email, query)[:100]
+
+
 class ImapEmailError(Exception):
     """Error from IMAP/SMTP operations."""
 
@@ -61,25 +73,42 @@ class EmailMessage:
 # TLS / SSL context helpers
 # ---------------------------------------------------------------------------
 
-def _build_ssl_context(tls_mode: str, cert_file: str) -> ssl.SSLContext | None:
+# #1 HIGH: hosts where CERT_NONE is acceptable (loopback only)
+_LOCALHOST_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
+
+
+def _build_ssl_context(
+    tls_mode: str, cert_file: str, host: str = "",
+) -> ssl.SSLContext | None:
     """Build an SSL context for IMAP or SMTP connections.
 
     Supports custom CA certs for self-signed servers (Proton Bridge).
-    Falls back to CERT_NONE for localhost when no cert file is provided.
+    Falls back to CERT_NONE only for verified localhost connections.
     """
+    # #2 LOW: warn on plaintext mode — credentials traverse network in cleartext
     if tls_mode == "none":
+        logger.warning(
+            "IMAP/SMTP using plaintext (tls_mode=none) — credentials sent unencrypted",
+            extra={"event": "tls_plaintext_warning", "host": host},
+        )
         return None
 
     ctx = ssl.create_default_context()
     if cert_file:
         ctx.load_verify_locations(cert_file)
     else:
-        # Self-signed cert without exported CA — only safe for localhost
+        # #1 HIGH: enforce localhost-only for CERT_NONE — remote servers
+        # without cert verification are vulnerable to MITM interception
+        if host and host not in _LOCALHOST_HOSTS:
+            raise ImapEmailError(
+                f"TLS cert file required for remote host '{host}' — "
+                f"CERT_NONE is only safe for localhost ({', '.join(sorted(_LOCALHOST_HOSTS))})"
+            )
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
         logger.warning(
             "IMAP/SMTP TLS: no cert file, using CERT_NONE (localhost only)",
-            extra={"event": "tls_cert_none"},
+            extra={"event": "tls_cert_none", "host": host},
         )
     return ctx
 
@@ -175,7 +204,7 @@ def _truncate_body(body: str, max_length: int) -> str:
 def _imap_connect(config) -> imaplib.IMAP4_SSL | imaplib.IMAP4:
     """Connect and authenticate to IMAP server. Blocking call."""
     password = _read_password(config.imap_password_file)
-    ssl_ctx = _build_ssl_context(config.imap_tls_mode, config.imap_tls_cert_file)
+    ssl_ctx = _build_ssl_context(config.imap_tls_mode, config.imap_tls_cert_file, config.imap_host)
 
     try:
         if config.imap_tls_mode == "ssl":
@@ -308,37 +337,45 @@ def _imap_search_sync(config, query: str, max_results: int) -> list[EmailSearchR
             pass
 
 
+# #3 MED: allowlist-based IMAP escape — only permit safe characters
+_IMAP_SAFE_RE = re.compile(r"[^a-zA-Z0-9@._\-+\s]")
+
+# #4 MED: single regex extracts all field:value patterns non-destructively
+_QUERY_FIELD_RE = re.compile(r"(from|to|subject):(\S+)", re.IGNORECASE)
+
+_IMAP_FIELD_MAP = {"from": "FROM", "to": "TO", "subject": "SUBJECT"}
+
+
 def _build_imap_search(query: str) -> str:
     """Translate a simple search query to IMAP SEARCH criteria.
 
     Supports: from:X, to:X, subject:X, and free text (searches body+subject).
     """
-    # Whitelist approach: keep only safe characters for IMAP SEARCH quoted strings.
-    # Strips quotes, backslashes, parens, braces, brackets, control chars, and newlines
-    # to prevent IMAP command injection.
     def _imap_escape(value: str) -> str:
-        return re.sub(r'["\\\(\)\{\}\[\]\r\n\x00-\x1f]', "", value)
+        return _IMAP_SAFE_RE.sub("", value)
 
     parts = []
-    remaining = query
 
-    # Extract from: patterns
-    for match in re.finditer(r"from:(\S+)", query):
-        parts.append(f'FROM "{_imap_escape(match.group(1))}"')
-        remaining = remaining.replace(match.group(0), "")
+    # #4 MED: extract field patterns via regex, collect remaining text
+    # by tracking match spans — avoids str.replace() mangling on overlapping patterns
+    matched_spans: list[tuple[int, int]] = []
+    for match in _QUERY_FIELD_RE.finditer(query):
+        field = match.group(1).lower()
+        value = match.group(2)
+        imap_key = _IMAP_FIELD_MAP.get(field)
+        if imap_key:
+            parts.append(f'{imap_key} "{_imap_escape(value)}"')
+            matched_spans.append(match.span())
 
-    # Extract to: patterns
-    for match in re.finditer(r"to:(\S+)", query):
-        parts.append(f'TO "{_imap_escape(match.group(1))}"')
-        remaining = remaining.replace(match.group(0), "")
+    # Build remaining text from unmatched portions
+    remaining_parts = []
+    prev_end = 0
+    for start, end in sorted(matched_spans):
+        remaining_parts.append(query[prev_end:start])
+        prev_end = end
+    remaining_parts.append(query[prev_end:])
+    remaining = " ".join(remaining_parts).strip()
 
-    # Extract subject: patterns
-    for match in re.finditer(r"subject:(\S+)", query):
-        parts.append(f'SUBJECT "{_imap_escape(match.group(1))}"')
-        remaining = remaining.replace(match.group(0), "")
-
-    # Remaining text — search in subject and body
-    remaining = remaining.strip()
     if remaining and remaining != "*":
         parts.append(f'TEXT "{_imap_escape(remaining)}"')
 
@@ -350,11 +387,17 @@ def _build_imap_search(query: str) -> str:
 
 def _imap_read_sync(config, message_id: str, max_body_length: int) -> EmailMessage:
     """Fetch a full email by UID. Blocking."""
+    # #5 MED: validate message_id is numeric — prevents IMAP range injection
+    # (e.g. "1:*" would fetch ALL messages, causing resource exhaustion)
+    if not message_id or not message_id.strip().isdigit():
+        raise ImapEmailError(
+            f"Invalid message_id '{message_id}' — must be a numeric IMAP UID"
+        )
     conn = _imap_connect(config)
     try:
         conn.select("INBOX", readonly=True)
 
-        status, msg_data = conn.uid("fetch", message_id, "(RFC822)")
+        status, msg_data = conn.uid("fetch", message_id.strip(), "(RFC822)")
         if status != "OK" or not msg_data or not msg_data[0]:
             raise ImapEmailError(f"Message {message_id} not found")
 
@@ -421,6 +464,37 @@ def _imap_create_draft_sync(config, to: str, subject: str, body: str) -> str:
 # Transient connection errors worth retrying (auth failures are permanent — never retry)
 _IMAP_TRANSIENT_ERRORS = (ConnectionRefusedError, TimeoutError, OSError)
 
+# #8 LOW: basic email address validation — prevents MIME header injection via newlines
+_EMAIL_RE = re.compile(r"^[^@\r\n]+@[^@\r\n]+\.[^@\r\n]+$")
+
+# #7 MED: per-recipient send rate limit (timestamps of recent sends)
+_send_timestamps: dict[str, list[float]] = {}
+_SEND_RATE_LIMIT = 5       # max sends per window
+_SEND_RATE_WINDOW = 3600   # 1 hour window
+
+
+def _check_send_rate(recipient: str) -> None:
+    """Enforce per-recipient rate limit on email sends."""
+    now = time.monotonic()
+    key = recipient.lower().strip()
+    timestamps = _send_timestamps.get(key, [])
+    # Prune old entries outside the window
+    timestamps = [t for t in timestamps if now - t < _SEND_RATE_WINDOW]
+    if len(timestamps) >= _SEND_RATE_LIMIT:
+        raise ImapEmailError(
+            f"Rate limit exceeded: max {_SEND_RATE_LIMIT} emails per hour to {key}"
+        )
+    timestamps.append(now)
+    _send_timestamps[key] = timestamps
+
+
+def _validate_email_address(address: str) -> None:
+    """Validate email address format — rejects newlines and malformed addresses."""
+    if not _EMAIL_RE.match(address):
+        raise ImapEmailError(
+            f"Invalid email address format: '{address[:50]}'"
+        )
+
 
 async def search_emails(
     config,
@@ -436,7 +510,8 @@ async def search_emails(
             results = await asyncio.to_thread(_imap_search_sync, config, query, max_results)
             logger.info(
                 "imap.search_emails",
-                extra={"query": query[:100], "results": len(results), "elapsed_s": round(time.monotonic() - t0, 2)},
+                # #10 LOW: mask query in logs — may contain PII (email addresses, names)
+                extra={"query": _mask_query(query), "results": len(results), "elapsed_s": round(time.monotonic() - t0, 2)},
             )
             return results
         except ImapEmailError as exc:
@@ -495,10 +570,12 @@ async def send_email(
     """Send an email via SMTP (aiosmtplib)."""
     if not config.smtp_host:
         raise ImapEmailError("SMTP host not configured")
+    _validate_email_address(to)
+    _check_send_rate(to)
     t0 = time.monotonic()
 
     password = _read_password(config.smtp_password_file)
-    ssl_ctx = _build_ssl_context(config.smtp_tls_mode, config.imap_tls_cert_file)
+    ssl_ctx = _build_ssl_context(config.smtp_tls_mode, config.imap_tls_cert_file, config.smtp_host)
 
     msg = MIMEText(body, "plain", "utf-8")
     msg["To"] = to
@@ -572,13 +649,15 @@ async def create_draft(
     """Create a draft email via IMAP APPEND to Drafts folder."""
     if not config.imap_host:
         raise ImapEmailError("IMAP host not configured")
+    _validate_email_address(to)
     t0 = time.monotonic()
     for attempt in range(2):
         try:
             result = await asyncio.to_thread(_imap_create_draft_sync, config, to, subject, body)
             logger.info(
                 "imap.create_draft",
-                extra={"to": to[:100], "subject": subject[:100], "elapsed_s": round(time.monotonic() - t0, 2)},
+                # #9 LOW: mask recipient in draft logs (consistent with send_email)
+                extra={"to": _mask_email(to), "subject": subject[:100], "elapsed_s": round(time.monotonic() - t0, 2)},
             )
             return result
         except ImapEmailError as exc:

@@ -16,7 +16,13 @@ from sentinel.api.models import (
     MAX_REASON_LENGTH,
 )
 from sentinel.security.pipeline import ScanPipeline, SecurityViolation
-from sentinel.security.scanner import CommandPatternScanner, CredentialScanner, SensitivePathScanner
+from sentinel.security.scanner import (
+    CommandPatternScanner,
+    CredentialScanner,
+    EncodingNormalizationScanner,
+    SensitivePathScanner,
+    VulnerabilityEchoScanner,
+)
 from sentinel.worker.ollama import OllamaWorker
 from sentinel.security.provenance import reset_store
 from sentinel.security import prompt_guard
@@ -51,10 +57,14 @@ def pipeline(engine, mock_worker):
     cred = CredentialScanner(engine.policy.get("credential_patterns", []))
     path = SensitivePathScanner(engine.policy.get("sensitive_path_patterns", []))
     cmd = CommandPatternScanner()
+    enc = EncodingNormalizationScanner(cred, path, cmd)
+    echo = VulnerabilityEchoScanner()
     return ScanPipeline(
         cred_scanner=cred,
         path_scanner=path,
         cmd_scanner=cmd,
+        encoding_scanner=enc,
+        echo_scanner=echo,
         worker=mock_worker,
     )
 
@@ -259,15 +269,16 @@ class TestPipelinePromptLengthGate:
 
     @patch("sentinel.security.pipeline.settings")
     @pytest.mark.asyncio
-    async def test_exactly_at_limit_passes(self, mock_settings, pipeline):
-        """Exactly 100,000 chars combined should pass (limit is >100K, not >=)."""
+    async def test_under_both_limits_passes(self, mock_settings, pipeline):
+        """70K chars combined passes both the char limit (100K) and the token
+        estimate gate (70K / 3.0 = 23.3K tokens < 24K context limit)."""
         mock_settings.prompt_guard_enabled = False
         mock_settings.baseline_mode = False
         mock_settings.spotlighting_enabled = False
         mock_settings.ollama_model = "qwen3:14b"
 
-        prompt = "a" * 50_000
-        data = "b" * 50_000
+        prompt = "a" * 35_000
+        data = "b" * 35_000
         tagged, _stats = await pipeline.process_with_qwen(
             prompt=prompt,
             untrusted_data=data,

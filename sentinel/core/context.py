@@ -9,6 +9,7 @@ Set by:
   - Orchestrator.handle_task (task_id)
 """
 
+import asyncio
 import contextvars
 from contextvars import ContextVar
 
@@ -30,6 +31,23 @@ def get_request_id() -> str | None:
 def get_task_id() -> str | None:
     """Return the current task ID, or None if not in a task context."""
     return current_task_id.get()
+
+
+def spawn_task(coro, *, name: str | None = None) -> asyncio.Task:
+    """Create an asyncio task that inherits the current ContextVar values.
+
+    Use this instead of bare asyncio.create_task() for any user-scoped work
+    (task execution, logging, cleanup). The child task will see the same
+    current_user_id, current_request_id, etc. as the parent.
+
+    Infrastructure tasks (health checks, server lifecycle) can use bare
+    asyncio.create_task() — add a comment explaining why.
+
+    The context= parameter on asyncio.create_task was added in Python 3.11,
+    and this project targets Python 3.12, so it is always available.
+    """
+    ctx = contextvars.copy_context()
+    return asyncio.create_task(coro, name=name, context=ctx)
 
 
 def resolve_trust_level(user_trust_level: int | None, system_default: int) -> int:

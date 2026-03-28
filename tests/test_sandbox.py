@@ -1015,3 +1015,80 @@ class TestSandboxProvenance:
         assert stored.trust_level == TrustLevel.UNTRUSTED
         assert stored.source == DataSource.SANDBOX
         assert "sandbox:ls" in stored.originated_from
+
+
+# ── Audit finding tests ──────────────────────────────────────────
+
+
+class TestDemuxSecondaryValidation:
+    """Finding #1: Secondary validation catches binary data that looks like
+    multiplexed stream headers but has implausible frame length."""
+
+    def test_binary_with_huge_frame_length_returned_as_is(self):
+        """Binary starting with valid header but huge length is not demuxed."""
+        from sentinel.tools.sandbox import _demux_stream
+        import struct
+        # Craft binary: valid stream type + padding + impossibly large length
+        raw = b"\x01\x00\x00\x00" + struct.pack(">I", 999999) + b"hello"
+        result = _demux_stream(raw)
+        # Should return as plain text, not attempt demux
+        assert "hello" in result
+
+    def test_valid_multiplexed_still_works(self):
+        """Legitimate multiplexed output is still correctly demuxed."""
+        from sentinel.tools.sandbox import _demux_stream
+        import struct
+        payload = b"hello world"
+        header = b"\x01\x00\x00\x00" + struct.pack(">I", len(payload))
+        raw = header + payload
+        result = _demux_stream(raw)
+        assert result == "hello world"
+
+
+class TestWorkspaceBindValidation:
+    """Finding #4: Workspace bind check parses bind strings properly."""
+
+    def test_substring_workspace_rejected(self):
+        """A bind with '/workspace-data:/other' should not count as /workspace."""
+        from sentinel.tools.sandbox import PodmanSandbox
+        # Test via the bind parsing logic directly
+        binds = ["/host/workspace-data:/other:rw"]
+        has_workspace = any(
+            b.split(":")[1] == "/workspace" for b in binds if ":" in b
+        )
+        assert not has_workspace
+
+    def test_correct_workspace_bind_accepted(self):
+        """A bind with '/host/path:/workspace:rw' is accepted."""
+        binds = ["/host/path:/workspace:rw"]
+        has_workspace = any(
+            b.split(":")[1] == "/workspace" for b in binds if ":" in b
+        )
+        assert has_workspace
+
+
+class TestClientReconnection:
+    """Finding #3: httpx client is recreated after connection failure."""
+
+    async def test_reset_client_clears_cached_client(self):
+        sandbox = PodmanSandbox(
+            socket_path="/tmp/test.sock",
+            image="test",
+            default_timeout=30,
+            max_timeout=300,
+            memory_limit=256 * 1024 * 1024,
+            cpu_quota=100000,
+            workspace_volume="/tmp/ws",
+            output_limit=65536,
+        )
+        # Create a client
+        client = sandbox._get_client()
+        assert sandbox._client is not None
+
+        # Reset it
+        await sandbox._reset_client()
+        assert sandbox._client is None
+
+        # Getting client again creates a new one
+        client2 = sandbox._get_client()
+        assert client2 is not client

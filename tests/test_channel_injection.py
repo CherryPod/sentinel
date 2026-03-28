@@ -190,7 +190,7 @@ class TestSignalChannelInjection:
 
     async def test_signal_message_tagged_with_source_signal(self):
         """Messages from Signal have source='signal' for audit trail."""
-        cfg = SignalConfig()
+        cfg = SignalConfig(allowed_senders=["+15551234567"])
         channel = SignalChannel(cfg)
         reader = FakeSocketReader()
         channel._reader = reader
@@ -219,7 +219,7 @@ class TestSignalChannelInjection:
 
     async def test_signal_injection_in_message_content(self):
         """Message containing JSON-RPC method injection is treated as plain text."""
-        cfg = SignalConfig()
+        cfg = SignalConfig(allowed_senders=["+15559999999"])
         channel = SignalChannel(cfg)
         reader = FakeSocketReader()
         channel._reader = reader

@@ -26,6 +26,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 
 from sentinel.api.models import ProcessRequest, ScanRequest
+from sentinel.api.rate_limit import limiter
 from sentinel.core.config import settings
 from sentinel.core.models import PolicyResult, ValidationResult
 from sentinel.security.pipeline import SecurityViolation
@@ -100,8 +101,8 @@ def _resolve_shutting_down(request: Request) -> bool:
 
 @router.get("/validate/path")
 async def validate_path(
-    path: str = Query(..., description="File path to validate"),
-    operation: str = Query("read", description="'read' or 'write'"),
+    path: str = Query(..., max_length=4096, description="File path to validate"),
+    operation: str = Query("read", max_length=16, description="'read' or 'write'"),
 ) -> ValidationResult:
     engine = _resolve_engine()
     if engine is None:
@@ -133,7 +134,7 @@ async def validate_path(
 
 @router.get("/validate/command")
 async def validate_command(
-    command: str = Query(..., description="Shell command to validate"),
+    command: str = Query(..., max_length=4096, description="Shell command to validate"),
 ) -> ValidationResult:
     engine = _resolve_engine()
     if engine is None:
@@ -162,7 +163,8 @@ async def validate_command(
 # ── Scan / Process endpoints ───────────────────────────────────────
 
 @router.post("/scan")
-async def scan_text(req: ScanRequest):
+@limiter.limit("10/minute")
+async def scan_text(request: Request, req: ScanRequest):
     """Run full scan pipeline on text (Prompt Guard + credential + path)."""
     pipeline = _resolve_pipeline()
     if pipeline is None:
@@ -182,7 +184,8 @@ async def scan_text(req: ScanRequest):
 
 
 @router.post("/process")
-async def process_text(req: ProcessRequest, request: Request):
+@limiter.limit("5/minute")
+async def process_text(request: Request, req: ProcessRequest):
     """Send text through the full Qwen pipeline (scan → spotlight → Qwen → scan)."""
     if _resolve_shutting_down(request):
         return JSONResponse(
@@ -227,7 +230,10 @@ async def process_text(req: ProcessRequest, request: Request):
         )
     except SecurityViolation as exc:
         # Log full details server-side for forensic analysis
-        audit.warning("Security violation on /process: %s", exc)
+        if audit:
+            audit.warning("Security violation on /process: %s", exc)
+        else:
+            logger.warning("Security violation on /process (audit unavailable): %s", exc)
         return {
             "status": "blocked",
             "reason": "Request blocked by security policy",

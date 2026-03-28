@@ -3,8 +3,24 @@ from pathlib import Path
 
 import pytest
 
+from sentinel.api.sessions import create_session_token
+from sentinel.api.rate_limit import limiter
 from sentinel.security.policy_engine import PolicyEngine
 from sentinel.security.scanner import CommandPatternScanner, CredentialScanner, SensitivePathScanner
+
+
+@pytest.fixture(autouse=True)
+def _disable_rate_limiting():
+    """Disable rate limiting during tests to avoid 429s from rapid requests."""
+    limiter.enabled = False
+    yield
+    limiter.enabled = True
+
+
+def auth_headers(user_id: int = 1, role: str = "owner") -> dict:
+    """Generate Bearer token headers for test requests."""
+    token = create_session_token(user_id=user_id, role=role)
+    return {"Authorization": f"Bearer {token}"}
 
 # Locate the real policy YAML — works both locally and in container
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -50,3 +66,10 @@ def encoding_scanner(cred_scanner, path_scanner, cmd_scanner):
     """EncodingNormalizationScanner wired to real policy-based inner scanners."""
     from sentinel.security.scanner import EncodingNormalizationScanner
     return EncodingNormalizationScanner(cred_scanner, path_scanner, cmd_scanner)
+
+
+@pytest.fixture
+def echo_scanner():
+    """VulnerabilityEchoScanner with default config."""
+    from sentinel.security.scanner import VulnerabilityEchoScanner
+    return VulnerabilityEchoScanner()

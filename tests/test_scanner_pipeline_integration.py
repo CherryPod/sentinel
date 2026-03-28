@@ -123,10 +123,16 @@ def pipeline_no_semgrep(
     This represents the fallback configuration when Semgrep binary is
     unavailable. All deterministic scanners are REAL instances.
     """
+    real_echo_scanner = VulnerabilityEchoScanner()
+    real_encoding_scanner = EncodingNormalizationScanner(
+        real_cred_scanner, real_path_scanner, real_cmd_scanner,
+    )
     return ScanPipeline(
         cred_scanner=real_cred_scanner,
         path_scanner=real_path_scanner,
         cmd_scanner=real_cmd_scanner,
+        encoding_scanner=real_encoding_scanner,
+        echo_scanner=real_echo_scanner,
         worker=mock_worker,
     )
 

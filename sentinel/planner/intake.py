@@ -127,6 +127,9 @@ async def analyze_conversation(
 
     try:
         analysis = conversation_analyzer.analyze(session, user_request)
+        # Persist fix-cycle forgiveness (Finding #11: moved out of analyzer)
+        if analysis.new_success_forgives is not None:
+            session.success_forgives_used = analysis.new_success_forgives
         conv_info = ConversationInfo(
             session_id=session.session_id,
             turn_number=len(session.turns),
@@ -371,11 +374,25 @@ async def resolve_contacts(
             )
     else:
         # NON-MESSAGING SOURCE (api, websocket, webhook, None, etc.)
-        # Single-user default — multi-user auth will replace this path
-        user_id = 1
+        # Read user identity from the ContextVar set by JWTMiddleware (HTTP) or by the
+        # WebSocket / webhook handlers. If no auth context is present (user_id == 0),
+        # reject loudly — this should never happen once auth is wired end-to-end.
+        from sentinel.core.context import current_user_id
+        user_id = current_user_id.get()
+        if user_id == 0:
+            logger.error(
+                "No user context for non-messaging request — rejecting",
+                extra={"event": "missing_user_context", "source_key": source_key},
+            )
+            return ContactResolutionResult(
+                user_id=0,
+                rewritten_text=user_request,
+                rejected=True,
+                error="Authentication required",
+            )
         logger.debug(
-            "API request — using default user_id=1",
-            extra={"event": "api_default_user", "source_key": source_key},
+            "Non-messaging request — user_id from context",
+            extra={"event": "api_user_from_context", "source_key": source_key, "user_id": user_id},
         )
 
     # Step 3-4: Message rewriting (only reached for resolved/default users)

@@ -371,11 +371,11 @@ class TestPruneStaleUserIsolation:
 
     @pytest.mark.asyncio
     async def test_prune_stale_pg_no_user_id_prunes_all(self, store, mock_pool):
-        """PG path: when user_id is None, no user_id filter applied."""
+        """PG path: admin=True with no user_id prunes across all users."""
         _, conn = mock_pool
         conn.fetch.return_value = []
 
-        await store.prune_stale(threshold=0.5, user_id=None)
+        await store.prune_stale(threshold=0.5, user_id=None, admin=True)
 
         sql = conn.fetch.call_args[0][0]
         assert "user_id" not in sql

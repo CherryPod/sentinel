@@ -10,9 +10,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from starlette.testclient import TestClient
 
 from sentinel.routines.store import RoutineStore
+from tests.conftest import auth_headers
 
 # Valid Origin header for CSRF middleware — matches settings.allowed_origins default
 _ORIGIN = {"Origin": "https://localhost:3001"}
+# Combine auth headers with CSRF Origin for state-changing requests
+_AUTH_ORIGIN = {**_ORIGIN, **auth_headers()}
+_AUTH = auth_headers()
 
 
 @pytest.fixture
@@ -39,7 +43,7 @@ class TestRoutineList:
     def test_routine_list_empty(self, client_with_store):
         """GET /api/routine with no routines returns empty list."""
         client, _ = client_with_store
-        resp = client.get("/api/routine")
+        resp = client.get("/api/routine", headers=_AUTH)
         assert resp.status_code == 200
         data = resp.json()
         assert data["status"] == "ok"
@@ -59,7 +63,7 @@ class TestRoutineCreate:
             "trigger_type": "cron",
             "trigger_config": {"cron": "0 9 * * *"},
             "action_config": {"prompt": "Summarise today's activity"},
-        }, headers=_ORIGIN)
+        }, headers=_AUTH_ORIGIN)
         assert resp.status_code == 200
         data = resp.json()
         assert data["status"] == "ok"
@@ -68,7 +72,7 @@ class TestRoutineCreate:
         assert data["routine"]["enabled"] is True
 
         # Verify it appears in the list
-        resp2 = client.get("/api/routine")
+        resp2 = client.get("/api/routine", headers=_AUTH)
         assert resp2.json()["count"] == 1
 
     @pytest.mark.capability
@@ -80,7 +84,7 @@ class TestRoutineCreate:
             "trigger_type": "cron",
             "trigger_config": {"cron": "not a cron"},
             "action_config": {"prompt": "Do something"},
-        }, headers=_ORIGIN)
+        }, headers=_AUTH_ORIGIN)
         assert resp.status_code == 400
         assert resp.json()["status"] == "error"
 
@@ -93,7 +97,7 @@ class TestRoutineCreate:
             "trigger_type": "cron",
             "trigger_config": {"cron": "0 9 * * *"},
             "action_config": {"prompt": "Do something"},
-        }, headers=_ORIGIN)
+        }, headers=_AUTH_ORIGIN)
         assert resp.status_code == 422  # Pydantic validation
 
 
@@ -118,7 +122,7 @@ class TestRoutineToggle:
         resp = client.patch(
             f"/api/routine/{routine.routine_id}",
             json={"enabled": False},
-            headers=_ORIGIN,
+            headers=_AUTH_ORIGIN,
         )
         assert resp.status_code == 200
         data = resp.json()
@@ -129,7 +133,7 @@ class TestRoutineToggle:
         resp2 = client.patch(
             f"/api/routine/{routine.routine_id}",
             json={"enabled": True},
-            headers=_ORIGIN,
+            headers=_AUTH_ORIGIN,
         )
         assert resp2.status_code == 200
         assert resp2.json()["routine"]["enabled"] is True
@@ -150,12 +154,12 @@ class TestRoutineDelete:
             action_config={"prompt": "Test"},
         )
 
-        resp = client.delete(f"/api/routine/{routine.routine_id}", headers=_ORIGIN)
+        resp = client.delete(f"/api/routine/{routine.routine_id}", headers=_AUTH_ORIGIN)
         assert resp.status_code == 200
         assert resp.json()["status"] == "ok"
 
         # Verify it's gone
-        resp2 = client.get("/api/routine")
+        resp2 = client.get("/api/routine", headers=_AUTH)
         assert resp2.json()["count"] == 0
 
 
@@ -174,7 +178,7 @@ class TestRoutineExecutionHistory:
             action_config={"prompt": "Test"},
         )
 
-        resp = client.get(f"/api/routine/{routine.routine_id}/executions")
+        resp = client.get(f"/api/routine/{routine.routine_id}/executions", headers=_AUTH)
         assert resp.status_code == 200
         data = resp.json()
         assert data["status"] == "ok"
@@ -197,7 +201,7 @@ class TestRoutineManualTrigger:
         )
 
         # _routine_engine is None (patched in fixture)
-        resp = client.post(f"/api/routine/{routine.routine_id}/run", headers=_ORIGIN)
+        resp = client.post(f"/api/routine/{routine.routine_id}/run", headers=_AUTH_ORIGIN)
         assert resp.status_code == 503
         assert resp.json()["reason"] == "Routine engine not running"
 
@@ -230,7 +234,7 @@ class TestRoutineRateLimit:
                         "trigger_type": "cron",
                         "trigger_config": {"cron": "0 9 * * *"},
                         "action_config": {"prompt": f"Task {i}"},
-                    }, headers=_ORIGIN)
+                    }, headers=_AUTH_ORIGIN)
                     assert resp.status_code == 200, f"Routine {i} failed: {resp.json()}"
 
                 # Third should be rejected (rate limit / max per user)
@@ -239,7 +243,7 @@ class TestRoutineRateLimit:
                     "trigger_type": "cron",
                     "trigger_config": {"cron": "0 9 * * *"},
                     "action_config": {"prompt": "Should fail"},
-                }, headers=_ORIGIN)
+                }, headers=_AUTH_ORIGIN)
                 assert resp.status_code == 429
         finally:
             settings.routine_max_per_user = original_max

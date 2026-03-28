@@ -15,6 +15,7 @@ from fnmatch import fnmatch
 from typing import TYPE_CHECKING, Any, cast
 
 from sentinel.core.bus import EventBus
+from sentinel.core.context import spawn_task
 from sentinel.planner.orchestrator import Orchestrator
 from sentinel.routines.cron import next_run as cron_next_run
 from sentinel.routines.store import Routine, RoutineStore
@@ -77,6 +78,7 @@ class RoutineEngine:
         self._scheduler_task: asyncio.Task | None = None
         self._running: dict[str, asyncio.Task] = {}  # execution_id → Task
         self._stopped = False
+        self._starvation_ticks = 0  # Finding #8: consecutive ticks at max concurrency
 
     # -- lifecycle --
 
@@ -100,7 +102,11 @@ class RoutineEngine:
                 },
             )
 
+        # Infrastructure: no user context needed — the scheduler loop manages
+        # routine scheduling globally, not on behalf of a specific user.
         self._scheduler_task = asyncio.create_task(self._scheduler_loop())
+        # Finding #4: Restart scheduler if it dies unexpectedly
+        self._scheduler_task.add_done_callback(self._on_scheduler_done)
         self._event_bus.subscribe("*", self._on_event)
         logger.info(
             "Routine engine started",
@@ -154,6 +160,29 @@ class RoutineEngine:
 
         logger.info("Routine engine stopped", extra={"event": "routine_engine_stop"})
 
+    def _on_scheduler_done(self, task: asyncio.Task) -> None:
+        """Finding #4: Restart the scheduler if it exited unexpectedly."""
+        if self._stopped:
+            return  # Normal shutdown — don't restart
+        exc = task.exception() if not task.cancelled() else None
+        if exc is not None:
+            logger.error(
+                "Scheduler loop died unexpectedly, restarting",
+                extra={"event": "routine_scheduler_crash", "error": str(exc)},
+            )
+        elif task.cancelled():
+            logger.warning(
+                "Scheduler loop was cancelled unexpectedly, restarting",
+                extra={"event": "routine_scheduler_cancelled"},
+            )
+        else:
+            logger.warning(
+                "Scheduler loop exited without stop(), restarting",
+                extra={"event": "routine_scheduler_unexpected_exit"},
+            )
+        self._scheduler_task = asyncio.create_task(self._scheduler_loop())
+        self._scheduler_task.add_done_callback(self._on_scheduler_done)
+
     # -- scheduler loop --
 
     async def _scheduler_loop(self) -> None:
@@ -171,8 +200,10 @@ class RoutineEngine:
     async def _check_due_routines(self) -> None:
         """Find routines whose next_run_at has passed and execute them.
 
-        Uses admin pool to discover routines across ALL users (bypasses RLS).
-        Each routine's execution sets ContextVar to routine.user_id (line ~316).
+        Finding #6: Admin pool bypasses Row-Level Security to discover routines
+        across all users. Each routine's execution runs under the routine
+        owner's user_id via current_user_id contextvar (set in _execute_routine).
+        If admin_pool is None, falls back to the regular pool (single-user mode).
         """
         now = _now_iso()
         due = await self._store.list_due_all_users(now, admin_pool=self._admin_pool)
@@ -181,16 +212,32 @@ class RoutineEngine:
             if self._in_cooldown(routine):
                 continue
             if len(self._running) >= self._max_concurrent:
+                # Finding #8: Track consecutive starvation ticks
+                self._starvation_ticks += 1
                 logger.warning(
-                    "Max concurrent routines reached, skipping",
+                    "Max concurrent routines reached, skipping remaining due routines",
                     extra={
                         "event": "routine_max_concurrent",
                         "running": len(self._running),
                         "skipped_routine": routine.routine_id,
+                        "consecutive_starvation_ticks": self._starvation_ticks,
                     },
                 )
+                if self._starvation_ticks >= 3:
+                    logger.error(
+                        "Routine starvation: %d consecutive ticks at max concurrency — "
+                        "routines may be starved indefinitely",
+                        self._starvation_ticks,
+                        extra={
+                            "event": "routine_starvation_alert",
+                            "consecutive_ticks": self._starvation_ticks,
+                        },
+                    )
                 break
             await self._spawn_execution(routine, triggered_by="scheduler")
+        else:
+            # All due routines were processed — reset starvation counter
+            self._starvation_ticks = 0
 
     # -- event trigger --
 
@@ -252,6 +299,7 @@ class RoutineEngine:
                 "execution_id": execution_id,
                 "triggered_by": triggered_by,
                 "name": routine.name,
+                "user_id": routine.user_id,
             })
         except Exception as pub_exc:
             logger.debug(
@@ -275,7 +323,7 @@ class RoutineEngine:
             },
         )
 
-        task = asyncio.create_task(
+        task = spawn_task(
             self._execute_routine(routine, execution_id, triggered_by)
         )
         self._running[execution_id] = task
@@ -326,7 +374,10 @@ class RoutineEngine:
             )
             return
 
-        approval_mode = routine.action_config.get("approval_mode", "auto")
+        # Finding #1: Default to "full" for user-created routines — require human
+        # approval for plan execution. "auto" is only set explicitly by seed_defaults()
+        # for system routines.
+        approval_mode = routine.action_config.get("approval_mode", "full")
         max_iterations = min(routine.action_config.get("max_iterations", 1), 50)
         per_iteration_timeout = routine.action_config.get(
             "per_iteration_timeout", self._execution_timeout,
@@ -494,6 +545,7 @@ class RoutineEngine:
                 "execution_id": execution_id,
                 "triggered_by": triggered_by,
                 "name": routine.name,
+                "user_id": routine.user_id,
             })
         except Exception as pub_exc:
             logger.debug(
@@ -706,7 +758,11 @@ class RoutineEngine:
             )
 
     async def cleanup_stale(self) -> int:
-        """Mark stale 'running' executions as 'interrupted'. Returns count."""
+        """Mark stale 'running' executions as 'interrupted'. Returns count.
+
+        Finding #11: Uses admin pool (bypasses RLS) since stale executions
+        may belong to any user. Removed hardcoded current_user_id.set(1).
+        """
         if self._in_memory:
             count = 0
             for rec in self._mem_executions.values():
@@ -716,23 +772,10 @@ class RoutineEngine:
                     rec["completed_at"] = _now_iso()
                     count += 1
             return count
-        # BH3-055: Set ContextVar so RLS allows the UPDATE. Without this,
-        # default=0 at startup → zero rows updated.
-        from sentinel.core.context import current_user_id
-        ctx_token = current_user_id.set(1)
-        try:
-            return await self._cleanup_stale_pg()
-        finally:
-            current_user_id.reset(ctx_token)
-
-    async def _cleanup_stale_pg(self) -> int:
-        """PG implementation of cleanup_stale (called with ContextVar set).
-
-        BH3-054: Logs individual interrupted executions so the operator knows
-        exactly which routines were lost on restart.
-        """
-        async with self._pool.acquire() as conn:
-            # Fetch details before updating so we can log them
+        # Use admin pool to bypass RLS — stale executions span all users
+        pool = self._admin_pool or self._pool
+        async with pool.acquire() as conn:
+            # BH3-054: Log individual interrupted executions
             stale_rows = await conn.fetch(
                 "SELECT execution_id, routine_id, started_at "
                 "FROM routine_executions WHERE status = 'running'",
@@ -915,7 +958,7 @@ class RoutineEngine:
             return None
         return await self._spawn_execution(routine, triggered_by="manual")
 
-    async def seed_defaults(self, user_id: int = 1) -> list[str]:
+    async def seed_defaults(self, user_id: int) -> list[str]:
         """Create starter routine templates if the user has no routines.
 
         Returns a list of created routine IDs (empty if user already has routines).

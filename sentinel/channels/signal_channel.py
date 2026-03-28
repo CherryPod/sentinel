@@ -22,6 +22,17 @@ from sentinel.core.config import settings
 logger = logging.getLogger("sentinel.audit")
 
 
+def _redact_phone(number: str) -> str:
+    """Redact phone number to last 4 digits for logging.
+
+    Phone numbers are PII — only the last 4 digits are logged so that log
+    records can still be correlated without exposing the full identifier.
+    """
+    if len(number) >= 4:
+        return f"***{number[-4:]}"
+    return "***"
+
+
 @dataclass
 class SignalConfig:
     """Configuration for the Signal channel."""
@@ -102,7 +113,9 @@ class SignalChannel(Channel):
         await self._start_process()
         if self._process is not None:
             await self._connect_socket()
-        # Start background tasks for reading and health monitoring (BH3-016: tracked for shutdown)
+        # Infrastructure: no user context needed — read loop and health monitor
+        # are channel-level background tasks not scoped to any particular user.
+        # (BH3-016: tracked for shutdown)
         for coro in (self._read_loop(), self._health_monitor()):
             task = asyncio.create_task(coro)
             self._background_tasks.add(task)
@@ -364,7 +377,7 @@ class SignalChannel(Channel):
                         "Malformed JSON from signal-cli",
                         extra={
                             "event": "signal_malformed_json",
-                            "raw": line.decode()[:200],
+                            "raw_excerpt": line.decode(errors="replace")[:100],
                         },
                     )
                     continue
@@ -382,12 +395,12 @@ class SignalChannel(Channel):
 
                     # Sender allowlist check — runs BEFORE rate limiting so
                     # unknown senders don't pollute rate limit state
-                    if self._config.allowed_senders and source not in self._config.allowed_senders:
+                    if source not in self._config.allowed_senders:
                         logger.info(
                             "Signal message from unknown sender dropped",
                             extra={
                                 "event": "signal_unknown_sender",
-                                "sender": source,
+                                "sender": _redact_phone(source),  # was: source
                             },
                         )
                         continue
@@ -398,7 +411,7 @@ class SignalChannel(Channel):
                             "Signal sender rate limited",
                             extra={
                                 "event": "signal_rate_limited",
-                                "sender": source,
+                                "sender": _redact_phone(source),  # was: source
                                 "limit": self._config.rate_limit,
                             },
                         )
@@ -534,6 +547,7 @@ _MD_ITALIC_UNDERSCORE = re.compile(r"_(.+?)_")
 _MD_HEADER = re.compile(r"^#{1,6}\s+", re.MULTILINE)
 _MD_HR = re.compile(r"^-{3,}$", re.MULTILINE)
 _MD_STRIKETHROUGH = re.compile(r"~~(.+?)~~")
+_SENTENCE_END = re.compile(r"[.!?](?:\s|$)")
 
 
 def _strip_markdown(text: str) -> str:
@@ -645,7 +659,7 @@ def _split_response(text: str, max_length: int) -> list[str]:
         # Try to split at a sentence boundary
         # Look for '. ', '! ', '? ' or end-of-sentence at end of segment
         best_sentence = -1
-        for match in re.finditer(r"[.!?](?:\s|$)", segment):
+        for match in _SENTENCE_END.finditer(segment):
             pos = match.end()
             if pos <= max_length:
                 best_sentence = pos

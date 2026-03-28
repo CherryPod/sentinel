@@ -17,6 +17,7 @@ from sentinel.api.auth import PinVerifier
 
 import pytest
 from starlette.testclient import TestClient
+from tests.conftest import auth_headers
 
 
 class TestLogStream:
@@ -60,7 +61,7 @@ class TestLogStream:
 
         with patch("sentinel.api.routes.streaming.LogSSEWriter", QuickLogWriter):
             client = TestClient(app)
-            resp = client.get("/api/logs/stream")
+            resp = client.get("/api/logs/stream", headers=auth_headers())
             assert resp.status_code == 200
 
     @pytest.mark.capability
@@ -103,7 +104,7 @@ class TestLogStream:
 
         with patch("sentinel.api.routes.streaming.LogSSEWriter", StructuredLogWriter):
             client = TestClient(app)
-            resp = client.get("/api/logs/stream?level=WARNING")
+            resp = client.get("/api/logs/stream?level=WARNING", headers=auth_headers())
             assert resp.status_code == 200
             # Parse SSE response body — look for the structured data
             body = resp.text

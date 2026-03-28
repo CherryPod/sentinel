@@ -48,7 +48,7 @@ def _disable_prompt_guard():
 
 
 @pytest.fixture
-def real_pipeline(cred_scanner, path_scanner, cmd_scanner, encoding_scanner):
+def real_pipeline(cred_scanner, path_scanner, cmd_scanner, encoding_scanner, echo_scanner):
     """Real ScanPipeline with deterministic scanners from policy YAML.
 
     Worker is mocked — we're testing the scan layer, not Qwen.
@@ -58,8 +58,9 @@ def real_pipeline(cred_scanner, path_scanner, cmd_scanner, encoding_scanner):
         cred_scanner=cred_scanner,
         path_scanner=path_scanner,
         cmd_scanner=cmd_scanner,
-        worker=mock_worker,
         encoding_scanner=encoding_scanner,
+        echo_scanner=echo_scanner,
+        worker=mock_worker,
     )
 
 

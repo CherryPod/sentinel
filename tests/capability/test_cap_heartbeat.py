@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from sentinel.memory.chunks import MemoryStore
+from tests.conftest import auth_headers
 from sentinel.routines.heartbeat import (
     HEARTBEAT_SOURCE,
     HeartbeatManager,
@@ -185,7 +186,7 @@ class TestHeartbeatApiEndpoint:
             async with httpx.AsyncClient(
                 transport=transport, base_url="http://test"
             ) as client:
-                resp = await client.get("/api/heartbeat")
+                resp = await client.get("/api/heartbeat", headers=auth_headers())
 
             assert resp.status_code == 200
             data = resp.json()
@@ -211,7 +212,7 @@ class TestHeartbeatApiEndpoint:
             async with httpx.AsyncClient(
                 transport=transport, base_url="http://test"
             ) as client:
-                resp = await client.get("/api/heartbeat")
+                resp = await client.get("/api/heartbeat", headers=auth_headers())
 
             assert resp.status_code == 503
         finally:

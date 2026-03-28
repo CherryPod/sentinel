@@ -169,8 +169,9 @@ def test_set_user_context_nested():
 
 @pytest.mark.asyncio
 async def test_user_context_middleware_sets_user_id():
-    """UserContextMiddleware sets current_user_id=1 for HTTP requests."""
+    """UserContextMiddleware sets current_user_id from JWT Bearer token."""
     from sentinel.api.middleware import UserContextMiddleware
+    from sentinel.api.sessions import create_session_token
     from starlette.testclient import TestClient
     from starlette.applications import Starlette
     from starlette.responses import JSONResponse
@@ -183,11 +184,12 @@ async def test_user_context_middleware_sets_user_id():
         captured_user_id = current_user_id.get()
         return JSONResponse({"user_id": captured_user_id})
 
-    app = Starlette(routes=[Route("/", homepage)])
+    app = Starlette(routes=[Route("/test-auth", homepage)])
     app.add_middleware(UserContextMiddleware)
 
+    token = create_session_token(user_id=1, role="owner")
     client = TestClient(app)
-    response = client.get("/")
+    response = client.get("/test-auth", headers={"Authorization": f"Bearer {token}"})
     assert response.status_code == 200
     assert captured_user_id == 1
 

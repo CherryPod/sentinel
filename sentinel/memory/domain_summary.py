@@ -180,6 +180,24 @@ class DomainSummaryStore:
                 return self._mem[key].last_task_count
             return 0
 
+    async def reset_task_count(
+        self, domain: str, user_id: int | None = None,
+    ) -> None:
+        """Reset task count to 0 after a refresh has been triggered."""
+        resolved_uid = user_id if user_id is not None else current_user_id.get()
+
+        if self._pool is not None:
+            async with self._pool.acquire() as conn:
+                await conn.execute(
+                    "UPDATE domain_summaries SET last_task_count = 0 "
+                    "WHERE domain = $1 AND user_id = $2",
+                    domain, resolved_uid,
+                )
+        else:
+            key = (domain, resolved_uid)
+            if key in self._mem:
+                self._mem[key].last_task_count = 0
+
 
 async def _build_patterns(
     domain: str,

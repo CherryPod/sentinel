@@ -80,3 +80,4 @@ docs/assessments/tainted_run14/
 # Injection benchmark — sensitive config and cleanup manifests
 injection_benchmark_config.yaml
 benchmarks/.injection_benchmark_cleanup.json
+.superpowers/

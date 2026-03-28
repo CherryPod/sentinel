@@ -186,10 +186,10 @@ class TestHistoryPruning:
         assert "12 turns pruned" in result
         assert "summary persisted to memory" in result
 
-    def test_prune_history_returns_pruned_turns(self):
-        """_prune_history returns the correct pruned turn entries."""
+    def testprune_history_returns_pruned_turns(self):
+        """prune_history returns the correct pruned turn entries."""
         history = self._make_history(25)
-        kept, pruned = ClaudePlanner._prune_history(history, max_turns=20)
+        kept, pruned = ClaudePlanner.prune_history(history, max_turns=20)
         assert len(kept) == 13  # 3 head + 10 tail
         assert len(pruned) == 12  # turns 4-15
         assert pruned[0]["turn"] == 4
@@ -210,7 +210,7 @@ class TestHistoryPruning:
     def test_exact_threshold_no_pruning(self):
         """History exactly at threshold should not be pruned."""
         history = self._make_history(20)
-        kept, pruned = ClaudePlanner._prune_history(history, max_turns=20)
+        kept, pruned = ClaudePlanner.prune_history(history, max_turns=20)
         assert len(kept) == 20
         assert len(pruned) == 0
 
@@ -242,7 +242,7 @@ class TestPrePruningFlush:
 
         # Build pruned turns (turns 4-15 from a 25-turn history)
         history = self._make_history(25)
-        _, pruned = ClaudePlanner._prune_history(history, max_turns=20)
+        _, pruned = ClaudePlanner.prune_history(history, max_turns=20)
         assert len(pruned) == 12  # sanity check
 
         await flush_pruned_turns("sess-001", pruned, memory_store=memory_store)
@@ -261,7 +261,7 @@ class TestPrePruningFlush:
         memory_store = MemoryStore()
 
         history = self._make_history(25)
-        _, pruned = ClaudePlanner._prune_history(history, max_turns=20)
+        _, pruned = ClaudePlanner.prune_history(history, max_turns=20)
 
         # Flush twice with the same session and range
         await flush_pruned_turns("sess-dup", pruned, memory_store=memory_store)
@@ -276,7 +276,7 @@ class TestPrePruningFlush:
         memory_store = MemoryStore()
 
         history = self._make_history(25, with_step_outcomes=True)
-        _, pruned = ClaudePlanner._prune_history(history, max_turns=20)
+        _, pruned = ClaudePlanner.prune_history(history, max_turns=20)
 
         await flush_pruned_turns("sess-paths", pruned, memory_store=memory_store)
 

@@ -21,12 +21,20 @@ def test_repair_truncated_array():
     assert len(parsed["steps"]) >= 1
 
 
-def test_repair_truncated_string_value():
+def test_repair_truncated_string_value_rejected():
+    """#1 HIGH: truncation inside a string value is rejected to prevent
+    semantically corrupted content (e.g. mangled prompts or paths)."""
     truncated = '{"plan_summary": "do something with the fi'
     result = _repair_truncated_json(truncated)
-    assert result is not None
-    parsed = json.loads(result)
-    assert "plan_summary" in parsed
+    assert result is None
+
+
+def test_repair_truncated_inside_path_rejected():
+    """#1 HIGH: truncation inside an allowed_paths value could permit
+    unintended access (e.g. '/workspace/secret' → '/workspace/secret"')."""
+    truncated = '{"steps": [{"allowed_paths": ["/workspace/secret'
+    result = _repair_truncated_json(truncated)
+    assert result is None
 
 
 def test_repair_valid_json_passthrough():

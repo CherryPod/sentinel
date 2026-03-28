@@ -17,8 +17,12 @@ class HTTPSRedirectApp:
         # Build redirect URL from the request
         headers = dict(scope.get("headers", []))
         host_header = headers.get(b"host", b"localhost").decode()
-        # Strip any existing port from the host
-        host = host_header.split(":")[0]
+        # Strip any existing port from the host (handle IPv6 like [::1]:8080)
+        if host_header.startswith("["):
+            bracket_end = host_header.find("]")
+            host = host_header[:bracket_end + 1] if bracket_end != -1 else host_header
+        else:
+            host = host_header.split(":")[0]
         path = scope.get("path", "/")
         query = scope.get("query_string", b"")
 

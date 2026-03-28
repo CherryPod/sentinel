@@ -188,10 +188,10 @@ class TestUserContextMiddleware:
         assert resp.status_code == 200
         assert resp.json()["user_id"] == 42
 
-    def test_no_auth_defaults_to_user_1(self, mw_app):
+    def test_no_auth_returns_401(self, mw_app):
+        """Unauthenticated requests are rejected with 401 (JWT-only middleware)."""
         resp = mw_app.get("/test/whoami")
-        assert resp.status_code == 200
-        assert resp.json()["user_id"] == 1
+        assert resp.status_code == 401
 
     def test_expired_token_returns_401(self, mw_app):
         secret = get_secret()

@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import html as html_module
 import json
 import logging
@@ -7,7 +8,7 @@ import time
 import uuid
 
 from sentinel.core.bus import EventBus
-from sentinel.core.context import current_task_id, current_user_id, resolve_trust_level
+from sentinel.core.context import current_task_id, current_user_id, resolve_trust_level, spawn_task
 # Variable reference pattern: matches $lowercase_with_underscores_and_digits.
 # Shared across resolve_text, resolve_text_safe, and get_referenced_data_ids
 # to ensure consistent behaviour. Broad \w+ would match $HOME/$PATH which
@@ -24,6 +25,13 @@ from sentinel.core.models import (
     TrustLevel,
 )
 from sentinel.core.config import settings
+from sentinel.planner.verification import (
+    check_goal_actions_executed,
+    extract_file_mutations,
+    scan_tool_output,
+    check_stagnation,
+    detect_idempotent_calls,
+)
 from sentinel.security import semgrep_scanner
 from sentinel.security.code_extractor import (
     close_unclosed_fences,
@@ -117,6 +125,116 @@ def _extract_prior_error(step_outcomes: list[dict]) -> str | None:
     return None
 
 
+def _categorise_error(
+    error_detail: str,
+    scanner_result: str | None = None,
+    exit_code: int | None = None,
+    sandbox_timed_out: bool = False,
+    sandbox_oom_killed: bool = False,
+    constraint_result: str | None = None,
+) -> str:
+    """Map step failure details to a generic error category.
+
+    Categories are intentionally coarse — the goal is fingerprinting
+    repeated identical failures, not detailed diagnostics. Priority
+    order ensures the most specific signal wins (e.g. scanner block
+    over generic exit code).
+    """
+    if scanner_result == "blocked":
+        return "scanner_block"
+    if sandbox_timed_out:
+        return "timeout"
+    if sandbox_oom_killed:
+        return "oom"
+    if constraint_result in ("violation", "denylist_block"):
+        return "constraint_violation"
+    if exit_code is not None and exit_code != 0:
+        return "exit_nonzero"
+    return "unknown"
+
+
+def _failure_fingerprint(step: PlanStep, error_category: str) -> str:
+    """Deterministic hash identifying a repeated failure pattern.
+
+    Hashes (tool_name, sorted arg keys, error category) so the planner
+    can spot "I've tried this exact approach multiple times and it keeps
+    failing" — the circuit breaker signal from PentAGI Finding #6.
+    """
+    tool_name = step.tool or step.type
+    key = f"{tool_name}:{sorted(step.args.keys())}:{error_category}"
+    return hashlib.sha256(key.encode()).hexdigest()[:12]
+
+
+def _truncate_plan_prompts(plan_dict: dict, max_prompt_len: int = 200) -> dict:
+    """Truncate worker prompts in a serialised plan dict for storage.
+
+    Real worker prompts can be 500+ chars. Storing full prompts in every
+    phase of plan_json bloats storage. Truncating to 200 chars at capture
+    time preserves the instruction intent without the bulk.
+
+    Mutates and returns the dict (not a deep copy — caller owns the dict).
+    """
+    for step in plan_dict.get("steps", []):
+        prompt = step.get("prompt")
+        if prompt and len(prompt) > max_prompt_len:
+            step["prompt"] = prompt[:max_prompt_len] + "..."
+    return plan_dict
+
+
+def _build_replan_summary(
+    executed_steps: list[PlanStep],
+    step_outcomes: list[dict],
+    failure_trigger: bool = False,
+) -> str:
+    """Build a condensed replan context summary from structured data.
+
+    Unlike _build_replan_context() which produces verbose text for the
+    planner's continuation call (~4000 chars), this produces a compact
+    summary (~200-300 chars) for storage in plan_json. Built directly
+    from structured data — no string round-trip through rendered text.
+    """
+    if not executed_steps:
+        return ""
+
+    parts: list[str] = []
+
+    # Error diagnostic for failure-triggered replans
+    if failure_trigger and step_outcomes:
+        last = step_outcomes[-1]
+        error = last.get("error_detail") or last.get("stderr_preview") or ""
+        if error:
+            parts.append(f"Error: {error[:120]}")
+
+    # Step status lines
+    for step, outcome in zip(executed_steps, step_outcomes):
+        status = outcome.get("status", "unknown")
+        tool_label = step.tool or step.type
+        var_suffix = f" → {step.output_var}" if step.output_var else ""
+        meta_parts: list[str] = []
+        if outcome.get("output_size"):
+            meta_parts.append(f"{outcome['output_size']}B")
+        if outcome.get("exit_code") is not None and outcome["exit_code"] != 0:
+            meta_parts.append(f"exit={outcome['exit_code']}")
+        meta = f" ({', '.join(meta_parts)})" if meta_parts else ""
+        parts.append(f"{step.id} [{tool_label}]{var_suffix}: {status}{meta}")
+
+    if not parts:
+        return ""
+
+    result = "; ".join(parts)
+
+    # Hard cap at 500 chars — truncate cleanly at last semicolon boundary
+    if len(result) > 500:
+        truncated = result[:497]
+        last_semi = truncated.rfind(";")
+        if last_semi > 0:
+            result = truncated[:last_semi] + "..."
+        else:
+            result = truncated + "..."
+
+    return result
+
+
 class ExecutionContext:
     """Tracks variable bindings during plan execution."""
 
@@ -180,13 +298,20 @@ class ExecutionContext:
         return resolved
 
     def resolve_args(self, args: dict) -> dict:
-        """Replace $var_name references in dict values (recurses into nested dicts)."""
+        """Replace $var_name references in dict values (recurses into nested dicts and lists)."""
         resolved = {}
         for key, value in args.items():
             if isinstance(value, str):
                 resolved[key] = self.resolve_text(value)
             elif isinstance(value, dict):
                 resolved[key] = self.resolve_args(value)
+            elif isinstance(value, list):
+                resolved[key] = [
+                    self.resolve_text(item) if isinstance(item, str)
+                    else self.resolve_args(item) if isinstance(item, dict)
+                    else item
+                    for item in value
+                ]
             else:
                 resolved[key] = value
         return resolved
@@ -204,13 +329,17 @@ class ExecutionContext:
         return data_ids
 
     def get_referenced_data_ids_from_args(self, args: dict) -> list[str]:
-        """Return data IDs from all $var_name references in dict values (recurses into nested dicts)."""
+        """Return data IDs from all $var_name references in dict values (recurses into nested dicts and lists)."""
         data_ids = []
         for value in args.values():
             if isinstance(value, str):
                 data_ids.extend(self.get_referenced_data_ids(value))
             elif isinstance(value, dict):
                 data_ids.extend(self.get_referenced_data_ids_from_args(value))
+            elif isinstance(value, list):
+                for item in value:
+                    if isinstance(item, str):
+                        data_ids.extend(self.get_referenced_data_ids(item))
         return data_ids
 
     def resolve_text_safe(self, text: str, marker: str) -> str:
@@ -246,6 +375,110 @@ class ExecutionContext:
             resolved += f"\n\n{CHAIN_REMINDER}"
 
         return resolved
+
+
+def _should_invoke_judge(
+    result: TaskResult, task_category: str, assertions_defined: int = 0,
+) -> bool:
+    """Decide whether to invoke the planner-as-judge (Tier 2).
+
+    Decision matrix:
+    - Any Tier 1 RED signal (partial/abandoned) → skip (conclusive)
+    - Deterministic + assertions defined & pass → skip
+    - Structural + assertions defined & pass → skip
+    - Semantic → always invoke
+    - Structural + assertions fail → invoke (judge arbitrates)
+    - No assertions defined + not deterministic → invoke (no evidence)
+    - Tool output warnings present → invoke (something looked off)
+    """
+    # Tier 1 RED: conclusive, no judge needed
+    if result.completion in ("partial", "abandoned"):
+        logger.debug(
+            "Judge gate: SKIP — Tier 1 RED (completion=%s)",
+            result.completion,
+            extra={"event": "judge_gate_skip", "reason": "tier1_red", "completion": result.completion},
+        )
+        return False
+    if result.status != "success":
+        logger.debug(
+            "Judge gate: SKIP — non-success status (%s)",
+            result.status,
+            extra={"event": "judge_gate_skip", "reason": "non_success", "status": result.status},
+        )
+        return False
+
+    # Semantic tasks always need the judge
+    if task_category == "semantic":
+        logger.debug(
+            "Judge gate: INVOKE — semantic task always needs judge",
+            extra={"event": "judge_gate_invoke", "reason": "semantic_always"},
+        )
+        return True
+
+    # Tool output warnings present — something looked off, invoke judge
+    if result.tool_output_warnings:
+        logger.debug(
+            "Judge gate: INVOKE — %d tool output warning(s) detected",
+            len(result.tool_output_warnings),
+            extra={
+                "event": "judge_gate_invoke",
+                "reason": "tool_output_warnings",
+                "warning_count": len(result.tool_output_warnings),
+            },
+        )
+        return True
+
+    # Structural with failed assertions: judge arbitrates
+    if task_category == "structural" and result.assertion_failures:
+        logger.debug(
+            "Judge gate: INVOKE — structural task with %d assertion failure(s)",
+            len(result.assertion_failures),
+            extra={"event": "judge_gate_invoke", "reason": "structural_assertion_fail"},
+        )
+        return True
+
+    # No assertions defined → no evidence of success beyond Tier 1 signals.
+    # Deterministic tasks can skip (specific values are verifiable by assertions
+    # if the planner generated them; if not, the task is simple enough).
+    # Structural/other tasks without assertions need the judge.
+    if assertions_defined == 0:
+        if task_category == "deterministic":
+            logger.debug(
+                "Judge gate: SKIP — deterministic task, no assertions needed",
+                extra={"event": "judge_gate_skip", "reason": "deterministic_no_assertions"},
+            )
+            return False
+        else:
+            logger.debug(
+                "Judge gate: INVOKE — %s task with no assertions defined (no evidence)",
+                task_category,
+                extra={
+                    "event": "judge_gate_invoke",
+                    "reason": "no_assertions_defined",
+                    "category": task_category,
+                },
+            )
+            return True
+
+    # Assertions were defined and none failed → confident
+    if not result.assertion_failures:
+        logger.debug(
+            "Judge gate: SKIP — %d assertion(s) defined, all passed",
+            assertions_defined,
+            extra={
+                "event": "judge_gate_skip",
+                "reason": "assertions_passed",
+                "assertions_defined": assertions_defined,
+            },
+        )
+        return False
+
+    # Default: invoke
+    logger.debug(
+        "Judge gate: INVOKE — default fallthrough",
+        extra={"event": "judge_gate_invoke", "reason": "default"},
+    )
+    return True
 
 
 class Orchestrator:
@@ -302,6 +535,10 @@ class Orchestrator:
         self._strategy_store = None
         # SYS-5a: Shutdown coordination — checked by _execute_plan before each step
         self._shutting_down: bool = False
+        # SYS-5b: Track background tasks for graceful cancellation on shutdown
+        self._background_tasks: set[asyncio.Task] = set()
+        # Cross-user isolation: map task_id → user_id for ownership checks
+        self._task_owners: dict[str, int] = {}
 
     def set_routine_engine(self, engine) -> None:
         """Set routine engine after construction (breaks circular dep)."""
@@ -320,6 +557,14 @@ class Orchestrator:
     def set_reranker(self, reranker) -> None:
         """Set reranker after construction (loaded during lifespan)."""
         self._reranker = reranker
+
+    def get_task_owner(self, task_id: str) -> int | None:
+        """Return the user_id that owns a task, or None if unknown."""
+        return self._task_owners.get(task_id)
+
+    def _register_task_owner(self, task_id: str, user_id: int) -> None:
+        """Record task ownership for cross-user isolation checks."""
+        self._task_owners[task_id] = user_id
 
     def set_strategy_store(self, store) -> None:
         """Set strategy pattern store after construction (loaded during lifespan)."""
@@ -380,9 +625,12 @@ class Orchestrator:
         In-flight plans will exit early at the next step boundary.
         """
         self._shutting_down = True
+        # Cancel tracked background tasks (domain summary refreshes, etc.)
+        for task in self._background_tasks:
+            task.cancel()
         logger.info(
             "Orchestrator shutdown requested — in-flight plans will stop at next step boundary",
-            extra={"event": "orchestrator_shutdown"},
+            extra={"event": "orchestrator_shutdown", "cancelled_bg_tasks": len(self._background_tasks)},
         )
 
     async def _emit(self, task_id: str, event: str, data: dict | None = None) -> None:
@@ -393,6 +641,7 @@ class Orchestrator:
             except Exception as exc:
                 logger.warning(
                     "Event publish failed (non-fatal)",
+                    exc_info=True,
                     extra={"event": "event_publish_failed", "topic": event, "error": str(exc)},
                 )
 
@@ -420,6 +669,7 @@ class Orchestrator:
         self._evict_stale_contexts()
 
         task_id = task_id or str(uuid.uuid4())
+        self._register_task_owner(task_id, current_user_id.get())
         task_id_token = current_task_id.set(task_id)
         task_t0 = time.monotonic()
         auto_approved = False
@@ -476,6 +726,7 @@ class Orchestrator:
         self._evict_stale_contexts()
 
         task_id = task_id or str(uuid.uuid4())
+        self._register_task_owner(task_id, current_user_id.get())
         task_id_token = current_task_id.set(task_id)
         task_t0 = time.monotonic()
         auto_approved = False
@@ -654,7 +905,7 @@ class Orchestrator:
             # After flushing, replace conversation_history with the kept portion so
             # the planner's _format_conversation_history doesn't re-prune redundantly.
             if conversation_history and len(conversation_history) > settings.session_max_history_turns:
-                kept_turns, pruned_turns = ClaudePlanner._prune_history(
+                kept_turns, pruned_turns = ClaudePlanner.prune_history(
                     conversation_history, max_turns=settings.session_max_history_turns,
                 )
                 if pruned_turns:
@@ -675,6 +926,7 @@ class Orchestrator:
                     cross_session_token_budget=settings.cross_session_token_budget,
                     domain_summary_store=self._domain_summary_store,
                     reranker=self._reranker,
+                    episodic_store=self._episodic_store,
                 )
 
             # F3: Session workspace tracking — planner sees which files this session modified
@@ -787,58 +1039,347 @@ class Orchestrator:
                         conversation=conv_info,
                     )
 
-            # 5. Execute plan
-            result = await self._execute_plan(
-                plan, user_input=user_request, task_id=task_id, session_id=session_id,
-                user_id=contact_result.user_id, effective_tl=effective_tl,
-                available_tools=available_tools,
-            )
-            result.task_id = task_id
-            result.conversation = conv_info
-            result.planner_usage = planner_usage
+            # 5. Execute plan (with judge-driven replan loop)
+            # The judge can trigger at most 1 replan attempt if it determines the
+            # goal was not met. This is the outer "autonomous loop" gate — the judge
+            # verdict feeds GAP context back into a new plan-execute cycle.
+            max_judge_replans = 1
+            judge_replan_count = 0
 
-            task_elapsed = time.monotonic() - task_t0
-            logger.info(
-                "Task completed",
-                extra={
-                    "event": "task_completed",
-                    "task_id": task_id,
-                    "status": result.status,
-                    "plan_summary": plan.plan_summary,
-                    "step_count": len(plan.steps),
-                    "elapsed_s": round(task_elapsed, 2),
-                },
+            from sentinel.planner.verification import (
+                classify_task_category,
+                build_judge_payload,
+                process_judge_verdict,
+                evaluate_assertions,
             )
 
-            # Event: task completed
-            await self._emit(task_id, "completed", {
-                "status": result.status,
-                "plan_summary": result.plan_summary,
-                "elapsed_s": round(task_elapsed, 2),
-                "response": result.response,
-                "step_results": [
-                    {
-                        "step_id": sr.step_id,
-                        "status": sr.status,
-                        "content": sr.content,
-                        "error": sr.error,
-                    }
-                    for sr in result.step_results
-                ],
-            })
-
-            # Auto-memory: store a brief summary of successful tasks
-            if (
-                result.status == "success"
-                and settings.auto_memory
-                and self._memory_store is not None
-            ):
-                await auto_store_memory(
-                    user_request=user_request,
-                    plan_summary=plan.plan_summary,
-                    memory_store=self._memory_store,
-                    embedding_client=self._embedding_client,
+            while True:
+                loop_label = f"attempt_{judge_replan_count}" if judge_replan_count > 0 else "initial"
+                logger.debug(
+                    "Execution loop: starting %s (judge_replan_count=%d/%d)",
+                    loop_label, judge_replan_count, max_judge_replans,
+                    extra={
+                        "event": "exec_loop_start",
+                        "task_id": task_id,
+                        "attempt": loop_label,
+                        "judge_replan_count": judge_replan_count,
+                        "max_judge_replans": max_judge_replans,
+                    },
                 )
+
+                result = await self._execute_plan(
+                    plan, user_input=user_request, task_id=task_id, session_id=session_id,
+                    user_id=contact_result.user_id, effective_tl=effective_tl,
+                    available_tools=available_tools,
+                )
+                result.task_id = task_id
+                result.conversation = conv_info
+                result.planner_usage = planner_usage
+
+                task_elapsed = time.monotonic() - task_t0
+                logger.info(
+                    "Task execution completed (%s)",
+                    loop_label,
+                    extra={
+                        "event": "task_completed",
+                        "task_id": task_id,
+                        "status": result.status,
+                        "plan_summary": plan.plan_summary,
+                        "step_count": len(plan.steps),
+                        "elapsed_s": round(task_elapsed, 2),
+                        "attempt": loop_label,
+                    },
+                )
+
+                # Event: task completed
+                await self._emit(task_id, "completed", {
+                    "status": result.status,
+                    "plan_summary": result.plan_summary,
+                    "elapsed_s": round(task_elapsed, 2),
+                    "response": result.response,
+                    "step_results": [
+                        {
+                            "step_id": sr.step_id,
+                            "status": sr.status,
+                            "content": sr.content,
+                            "error": sr.error,
+                        }
+                        for sr in result.step_results
+                    ],
+                })
+
+                # Auto-memory: store a brief summary of successful tasks
+                if (
+                    result.status == "success"
+                    and settings.auto_memory
+                    and self._memory_store is not None
+                ):
+                    await auto_store_memory(
+                        user_request=user_request,
+                        plan_summary=plan.plan_summary,
+                        memory_store=self._memory_store,
+                        embedding_client=self._embedding_client,
+                    )
+
+                # ── Tier 2: Planner-as-judge (conditional) ──
+                logger.debug(
+                    "Post-execution: Tier 1 signals — status=%s, completion=%s, goal_actions=%s, mutations=%d, warnings=%d",
+                    result.status, result.completion,
+                    result.goal_actions_executed,
+                    len(result.file_mutations) if result.file_mutations else 0,
+                    len(result.tool_output_warnings) if result.tool_output_warnings else 0,
+                    extra={"event": "post_exec_tier1_signals", "task_id": task_id, "attempt": loop_label},
+                )
+
+                # Evaluate plan-level assertions if any
+                all_assertions = []
+                for pstep in plan.steps:
+                    all_assertions.extend(pstep.assertions)
+                all_assertions.extend(plan.assertions)
+
+                if all_assertions:
+                    logger.debug(
+                        "Assertions: %d defined (step-level: %d, plan-level: %d)",
+                        len(all_assertions),
+                        sum(len(ps.assertions) for ps in plan.steps),
+                        len(plan.assertions),
+                        extra={
+                            "event": "assertions_defined",
+                            "task_id": task_id,
+                            "total": len(all_assertions),
+                            "step_level": sum(len(ps.assertions) for ps in plan.steps),
+                            "plan_level": len(plan.assertions),
+                            "attempt": loop_label,
+                        },
+                    )
+                else:
+                    logger.debug(
+                        "Assertions: NONE defined by planner — judge may be needed for non-deterministic tasks",
+                        extra={
+                            "event": "no_assertions_defined",
+                            "task_id": task_id,
+                            "task_category_hint": "will classify next",
+                            "attempt": loop_label,
+                        },
+                    )
+
+                if all_assertions and result.completion == "full":
+                    # Use user-scoped workspace path for assertion evaluation
+                    from sentinel.core.workspace import get_user_workspace
+                    try:
+                        ws_root = str(get_user_workspace())
+                    except ValueError:
+                        ws_root = "/workspace"  # Fallback if no user context
+                    assertion_results = evaluate_assertions(
+                        all_assertions,
+                        step_outcomes=result.step_outcomes,
+                        workspace_root=ws_root,
+                    )
+                    result.assertion_failures = [
+                        {"type": r.assertion_type, "path": r.path, "passed": r.passed, "message": r.message, "recovery": r.recovery}
+                        for r in assertion_results if not r.passed
+                    ]
+                    # Assertion failure is conclusive → mark partial
+                    if result.assertion_failures and result.completion == "full":
+                        result.completion = "partial"
+                        result.status = "partial"
+                        logger.info(
+                            "Assertion failure(s) detected — marking partial",
+                            extra={
+                                "event": "assertion_failure",
+                                "failures": len(result.assertion_failures),
+                                "task_id": task_id,
+                                "attempt": loop_label,
+                            },
+                        )
+
+                # Classify task and decide if judge is needed
+                task_category = classify_task_category(
+                    user_request,
+                    assertions_count=len(all_assertions),
+                )
+
+                should_judge = _should_invoke_judge(
+                    result, task_category, assertions_defined=len(all_assertions),
+                )
+                logger.debug(
+                    "Post-execution: judge decision — category=%s, should_invoke=%s, "
+                    "assertions_defined=%d, assertion_failures=%d, warnings=%d",
+                    task_category, should_judge, len(all_assertions),
+                    len(result.assertion_failures) if result.assertion_failures else 0,
+                    len(result.tool_output_warnings) if result.tool_output_warnings else 0,
+                    extra={
+                        "event": "post_exec_judge_decision",
+                        "task_id": task_id,
+                        "category": task_category,
+                        "invoke_judge": should_judge,
+                        "assertions_defined": len(all_assertions),
+                        "assertion_failures": len(result.assertion_failures) if result.assertion_failures else 0,
+                        "tool_output_warnings": len(result.tool_output_warnings) if result.tool_output_warnings else 0,
+                        "attempt": loop_label,
+                    },
+                )
+
+                judge_says_retry = False  # Will be set if judge wants a replan
+
+                if should_judge:
+                    try:
+                        judge_prompt = build_judge_payload(
+                            original_request=user_request,
+                            plan_summary=plan.plan_summary,
+                            step_outcomes=result.step_outcomes,
+                            file_mutations=result.file_mutations,
+                            completion=result.completion,
+                            goal_actions_executed=result.goal_actions_executed or False,
+                            assertion_results=result.assertion_failures,
+                            tool_output_warnings=result.tool_output_warnings,
+                        )
+                        verdict = await self._planner.verify_goal(judge_prompt)
+                        result.judge_verdict = verdict
+                        processed = process_judge_verdict(verdict, result.completion)
+
+                        logger.debug(
+                            "Judge verdict: GOAL_MET=%s, CONFIDENCE=%s, acted_on=%s, completion=%s, GAP=%s",
+                            verdict.get("GOAL_MET"), verdict.get("CONFIDENCE"),
+                            processed["acted_on"], processed.get("completion"),
+                            verdict.get("GAP", "none"),
+                            extra={
+                                "event": "judge_verdict_detail",
+                                "task_id": task_id,
+                                "goal_met": verdict.get("GOAL_MET"),
+                                "confidence": verdict.get("CONFIDENCE"),
+                                "acted_on": processed["acted_on"],
+                                "new_completion": processed.get("completion"),
+                                "gap": verdict.get("GAP"),
+                                "attempt": loop_label,
+                            },
+                        )
+
+                        if processed["acted_on"]:
+                            result.completion = processed["completion"]
+                            if processed["completion"] in ("partial", "failed"):
+                                result.status = processed["completion"]
+                                # Judge says goal not met — should we retry?
+                                gap = verdict.get("GAP") or ""
+                                if (
+                                    judge_replan_count < max_judge_replans
+                                    and gap  # Only retry if judge gave actionable feedback
+                                    and result.status != "error"  # Don't retry hard errors
+                                ):
+                                    judge_says_retry = True
+                                    logger.info(
+                                        "Judge-driven replan: goal not met (GOAL_MET=%s, CONFIDENCE=%s) — "
+                                        "requesting new plan with GAP context (attempt %d/%d)",
+                                        verdict.get("GOAL_MET"), verdict.get("CONFIDENCE"),
+                                        judge_replan_count + 1, max_judge_replans,
+                                        extra={
+                                            "event": "judge_replan_triggered",
+                                            "task_id": task_id,
+                                            "goal_met": verdict.get("GOAL_MET"),
+                                            "confidence": verdict.get("CONFIDENCE"),
+                                            "gap": gap,
+                                            "judge_replan_count": judge_replan_count,
+                                        },
+                                    )
+                                elif judge_replan_count >= max_judge_replans:
+                                    logger.warning(
+                                        "Judge-driven replan budget exhausted — accepting %s verdict",
+                                        processed["completion"],
+                                        extra={
+                                            "event": "judge_replan_budget_exhausted",
+                                            "task_id": task_id,
+                                            "judge_replan_count": judge_replan_count,
+                                            "max_judge_replans": max_judge_replans,
+                                        },
+                                    )
+                                else:
+                                    logger.debug(
+                                        "Judge says incomplete but no GAP context for replan — accepting verdict",
+                                        extra={
+                                            "event": "judge_no_gap_for_replan",
+                                            "task_id": task_id,
+                                            "gap": gap,
+                                        },
+                                    )
+                    except Exception as exc:
+                        logger.warning(
+                            "Judge invocation failed — using Tier 1 verdict",
+                            exc_info=True,
+                            extra={"event": "judge_failed", "error": str(exc), "task_id": task_id},
+                        )
+
+                # ── Judge-driven replan: request a new plan with GAP context ──
+                if judge_says_retry:
+                    judge_replan_count += 1
+                    gap_context = result.judge_verdict.get("GAP", "") if result.judge_verdict else ""
+
+                    # Emit event so UI can show what's happening
+                    await self._emit(task_id, "judge_replan", {
+                        "judge_replan_number": judge_replan_count,
+                        "gap": gap_context,
+                        "previous_completion": result.completion,
+                        "goal_met": result.judge_verdict.get("GOAL_MET") if result.judge_verdict else None,
+                    })
+
+                    # Store the failed attempt's episodic record before retrying
+                    # (so we have a record of what went wrong)
+                    logger.debug(
+                        "Judge replan: storing episodic record for failed attempt before retry",
+                        extra={"event": "judge_replan_episodic_pre_store", "task_id": task_id},
+                    )
+
+                    try:
+                        # Request a new plan with GAP context injected
+                        replan_request = (
+                            f"{user_request}\n\n"
+                            f"[PREVIOUS ATTEMPT FAILED — Judge feedback: {gap_context}]\n"
+                            f"[Previous plan summary: {plan.plan_summary}]\n"
+                            f"[Address the gap identified above. Do not repeat the same approach.]"
+                        )
+                        logger.debug(
+                            "Judge replan: requesting new plan with GAP context — %s",
+                            gap_context[:200],
+                            extra={
+                                "event": "judge_replan_plan_request",
+                                "task_id": task_id,
+                                "gap_context": gap_context[:500],
+                            },
+                        )
+                        plan = await asyncio.wait_for(
+                            self._planner.create_plan(
+                                user_request=replan_request,
+                                available_tools=available_tools,
+                            ),
+                            timeout=settings.planner_timeout,
+                        )
+                        # Capture updated planner usage (overwrites — latest call only)
+                        planner_usage = getattr(self._planner, "_last_usage", None)
+                        logger.info(
+                            "Judge replan: new plan received — %d steps, summary: %s",
+                            len(plan.steps), plan.plan_summary[:100],
+                            extra={
+                                "event": "judge_replan_plan_received",
+                                "task_id": task_id,
+                                "new_step_count": len(plan.steps),
+                                "new_summary": plan.plan_summary[:200],
+                            },
+                        )
+                        continue  # Go back to top of while loop for re-execution
+
+                    except (PlannerError, PlannerRefusalError, asyncio.TimeoutError) as exc:
+                        logger.error(
+                            "Judge-driven replan failed — accepting original verdict",
+                            exc_info=True,
+                            extra={
+                                "event": "judge_replan_failed",
+                                "task_id": task_id,
+                                "error": str(exc),
+                            },
+                        )
+                        # Fall through to return the original result
+
+                # No retry needed — break out of the execution loop
+                break
 
             # F4: Store episodic record (best-effort, alongside auto-memory)
             # For fix-cycle turns (session has prior turns), include the
@@ -856,6 +1397,20 @@ class Orchestrator:
                         prior_error_summary = _extract_prior_error(prev_turn.step_outcomes)
                         break
 
+            logger.debug(
+                "Post-execution: storing episodic record — status=%s, completion=%s, fix_cycle=%s",
+                result.status, result.completion, original_request is not None,
+                extra={
+                    "event": "post_exec_episodic_store",
+                    "task_id": task_id,
+                    "status": result.status,
+                    "completion": result.completion,
+                    "has_original_request": original_request is not None,
+                    "has_prior_error": prior_error_summary is not None,
+                    "judge_verdict": result.judge_verdict is not None,
+                },
+            )
+
             await self._store_episodic_record(
                 session_id=session.session_id if session else "",
                 task_id=task_id,
@@ -865,6 +1420,13 @@ class Orchestrator:
                 step_outcomes=result.step_outcomes or [],
                 original_request=original_request,
                 prior_error_summary=prior_error_summary,
+                plan_phases=result.plan_phases,
+                completion=result.completion,
+                goal_actions_executed=result.goal_actions_executed,
+                file_mutations=result.file_mutations,
+                assertion_failures=result.assertion_failures,
+                tool_output_warnings=result.tool_output_warnings,
+                judge_verdict=result.judge_verdict,
             )
 
             # Record turn with plan summary for conversation history
@@ -881,7 +1443,17 @@ class Orchestrator:
                 session.add_turn(turn)
                 if self._session_store is not None:
                     await self._session_store.add_turn(session.session_id, turn, session=session)
+                logger.debug(
+                    "Post-execution: session turn recorded — turn_count=%d, status=%s",
+                    len(session.turns), result.status,
+                    extra={"event": "post_exec_turn_recorded", "task_id": task_id, "turn_count": len(session.turns)},
+                )
 
+            logger.debug(
+                "Post-execution: complete — returning result (status=%s, completion=%s)",
+                result.status, result.completion,
+                extra={"event": "post_exec_complete", "task_id": task_id, "status": result.status, "completion": result.completion},
+            )
             return result
         finally:
             if session is not None:
@@ -925,28 +1497,61 @@ class Orchestrator:
         if self._contact_store is not None:
             _user_tl = await self._contact_store.get_user_trust_level(uid)
         _eff_tl = resolve_trust_level(_user_tl, settings.trust_level)
-        result = await self._execute_plan(
-            plan, user_input=pending.get("user_request") or None,
-            session_id=session_id, user_id=uid, effective_tl=_eff_tl,
-        )
-        elapsed = round(time.monotonic() - t0, 2)
 
-        # Record the turn in the session so conversation history builds up.
-        # In full approval mode, handle_task returns before execution, so
-        # we must record the turn here after the plan completes.
+        # SYS-4: Per-session lock — same pattern as handle_task/plan_and_execute.
+        # Without this, a concurrent request via handle_task can interleave with
+        # approved plan execution, corrupting session turn history.
+        session_lock = None
+        if source_key and self._session_store is not None:
+            session_lock = self._session_store.get_lock(source_key)
+        if session_lock is not None:
+            await session_lock.acquire()
+
+        # F2: Set task_in_progress flag (mirrors handle_task pattern)
         if session is not None:
-            turn = ConversationTurn(
-                request_text=pending.get("user_request", ""),
-                result_status=result.status,
-                plan_summary=plan.plan_summary,
-                elapsed_s=elapsed,
-                step_outcomes=result.step_outcomes if result.step_outcomes else None,
-            )
-            session.add_turn(turn)
+            session.set_task_in_progress(True)
             if self._session_store is not None:
-                await self._session_store.add_turn(session.session_id, turn, session=session)
+                await self._session_store.set_task_in_progress(session.session_id, True)
 
-        return result
+        try:
+            result = await self._execute_plan(
+                plan, user_input=pending.get("user_request") or None,
+                session_id=session_id, user_id=uid, effective_tl=_eff_tl,
+            )
+            elapsed = round(time.monotonic() - t0, 2)
+
+            # Record the turn in the session so conversation history builds up.
+            # In full approval mode, handle_task returns before execution, so
+            # we must record the turn here after the plan completes.
+            if session is not None:
+                turn = ConversationTurn(
+                    request_text=pending.get("user_request", ""),
+                    result_status=result.status,
+                    plan_summary=plan.plan_summary,
+                    elapsed_s=elapsed,
+                    step_outcomes=result.step_outcomes if result.step_outcomes else None,
+                )
+                session.add_turn(turn)
+                if self._session_store is not None:
+                    await self._session_store.add_turn(session.session_id, turn, session=session)
+
+            return result
+        except Exception as exc:
+            logger.error(
+                "Approved plan execution failed",
+                extra={"event": "approved_plan_failed", "approval_id": approval_id, "error": str(exc)},
+            )
+            return TaskResult(status="error", reason="Plan execution failed unexpectedly")
+        finally:
+            if session is not None:
+                session.set_task_in_progress(False)
+                if self._session_store is not None:
+                    try:
+                        await self._session_store.set_task_in_progress(session.session_id, False)
+                    except Exception:
+                        logger.warning("Failed to clear task_in_progress flag — will be stale until next task")
+            if session_lock is not None:
+                session_lock.release()
 
     async def _store_episodic_record(
         self,
@@ -958,6 +1563,14 @@ class Orchestrator:
         step_outcomes: list[dict],
         original_request: str | None = None,
         prior_error_summary: str | None = None,
+        plan_phases: list[dict] | None = None,
+        # Verification signals (from TaskResult)
+        completion: str = "full",
+        goal_actions_executed: bool | None = None,
+        file_mutations: list[dict] | None = None,
+        assertion_failures: list[dict] | None = None,
+        tool_output_warnings: list[dict] | None = None,
+        judge_verdict: dict | None = None,
     ) -> None:
         """Store a structured episodic record after task completion.
 
@@ -1000,6 +1613,39 @@ class Orchestrator:
             # Classify task domain from tool usage patterns
             task_domain = classify_task_domain(step_outcomes)
 
+            # Build plan_json for plan-outcome memory (before embedding so
+            # the compact plan line is included in the vector embedding)
+            plan_json_data = None
+            if plan_phases:
+                plan_json_data = {
+                    "phases": plan_phases,
+                    "user_request_full": user_request[:2000],
+                }
+                # Inject verification signals
+                plan_json_data["completion"] = completion
+                if goal_actions_executed is not None:
+                    plan_json_data["goal_actions_executed"] = goal_actions_executed
+                if file_mutations:
+                    plan_json_data["file_mutations"] = file_mutations
+                if assertion_failures:
+                    plan_json_data["assertion_failures"] = assertion_failures
+                if tool_output_warnings:
+                    plan_json_data["tool_output_warnings"] = tool_output_warnings
+                if judge_verdict:
+                    plan_json_data["judge_verdict"] = judge_verdict
+
+                plan_json_size = len(json.dumps(plan_json_data))
+                if plan_json_size > 50_000:
+                    logger.warning(
+                        "plan_history: plan_json %d bytes for task %s, consider review",
+                        plan_json_size, task_id,
+                        extra={
+                            "event": "plan_history_large",
+                            "size_bytes": plan_json_size,
+                            "task_id": task_id,
+                        },
+                    )
+
             # Try to get embedding for shadow entry.
             # For fix-cycles, use original_request so the vector embedding
             # matches on scenario content, not the generic retry prompt.
@@ -1019,6 +1665,7 @@ class Orchestrator:
                         task_domain=task_domain,
                         original_request=original_request,
                         prior_error_summary=prior_error_summary,
+                        plan_json=plan_json_data,
                     )
                     embedding = await self._embedding_client.embed(text, prefix="search_document: ")
                 except Exception as exc:
@@ -1034,7 +1681,7 @@ class Orchestrator:
                 memory_store=self._memory_store,
                 session_id=session_id,
                 task_id=task_id,
-                user_request=user_request[:1000],
+                user_request=user_request[:2000],
                 task_status=task_status,
                 plan_summary=plan_summary,
                 step_count=len(step_outcomes),
@@ -1047,6 +1694,7 @@ class Orchestrator:
                 task_domain=task_domain,
                 original_request=original_request,
                 prior_error_summary=prior_error_summary,
+                plan_json=plan_json_data,
             )
 
             # Extract and store facts
@@ -1061,6 +1709,7 @@ class Orchestrator:
                     "record_id": record_id,
                     "fact_count": len(facts),
                     "file_count": len(file_paths),
+                    "plan_phases": len(plan_phases) if plan_phases else 0,
                 },
             )
 
@@ -1095,10 +1744,13 @@ class Orchestrator:
                         task_domain
                     )
                     if new_count >= 10:
-                        # Fire-and-forget background refresh
-                        asyncio.create_task(
-                            self._refresh_domain_summary(task_domain)
+                        await self._domain_summary_store.reset_task_count(task_domain)
+                        _uid = current_user_id.get()
+                        task = spawn_task(
+                            self._refresh_domain_summary(task_domain, user_id=_uid)
                         )
+                        self._background_tasks.add(task)
+                        task.add_done_callback(self._background_tasks.discard)
                 except Exception as exc:
                     logger.debug(
                         "Domain summary check failed (non-fatal)",
@@ -1111,8 +1763,12 @@ class Orchestrator:
                 extra={"event": "episodic_store_failed", "error": str(exc)},
             )
 
-    async def _refresh_domain_summary(self, domain: str) -> None:
-        """Background refresh of a domain summary. Best-effort."""
+    async def _refresh_domain_summary(self, domain: str, user_id: int = 1) -> None:
+        """Background refresh of a domain summary. Best-effort.
+
+        user_id is threaded explicitly because asyncio.create_task does not
+        propagate ContextVars reliably to background tasks.
+        """
         try:
             from sentinel.memory.domain_summary import generate_domain_summary
             summary = await generate_domain_summary(
@@ -1139,7 +1795,7 @@ class Orchestrator:
             try:
                 from sentinel.memory.canonical import refresh_canonical_trajectories
                 await refresh_canonical_trajectories(
-                    user_id=1,
+                    user_id=user_id,
                     strategy_store=self._strategy_store,
                     episodic_store=self._episodic_store,
                     memory_store=self._memory_store,
@@ -1315,6 +1971,11 @@ class Orchestrator:
             failure_trigger=failure_trigger,
         )
 
+        # --- Inject anchor maps for files read in this task ---
+        _anchor_maps = getattr(self, '_active_anchor_maps', {})
+        if _anchor_maps:
+            replan_context += "\n\n" + "\n\n".join(_anchor_maps.values())
+
         # Collect output_var names from executed steps so the continuation
         # plan validator accepts references to them. Without this, the validator
         # rejects $weather_search etc. as "undefined variable" because it only
@@ -1365,10 +2026,29 @@ class Orchestrator:
         max_replans = 3
         failure_replan_count = 0
         max_failure_replans = 3
+        budget_exhausted = False  # Set when replan budget is hit
+        consecutive_no_mutation_replans = 0  # Stagnation: no-mutation replan counter
+        stagnation_aborted = False  # Set when stagnation abort threshold is hit
+        pre_replan_mutation_count = 0  # File mutations before last replan (for stagnation diff)
 
         # Mutable list so continuation steps can be appended dynamically
         remaining_steps = list(plan.steps)
         executed_steps: list[PlanStep] = []
+
+        # Plan-outcome memory: capture plan evolution for episodic storage.
+        plan_phases: list[dict] = []
+        current_phase: dict = {
+            "phase": "initial",
+            "trigger": None,
+            "trigger_step": None,
+            "plan": _truncate_plan_prompts(plan.model_dump(exclude_none=True)),
+            "step_outcomes_summary": {},
+            "replan_context_summary": None,
+        }
+        logger.debug(
+            "plan_history: initial phase captured",
+            extra={"event": "plan_history_init", "step_count": len(plan.steps)},
+        )
 
         while remaining_steps:
             step = remaining_steps.pop(0)
@@ -1392,6 +2072,7 @@ class Orchestrator:
                         f"({len(step_results)}/{len(plan.steps)} steps completed)"
                     ),
                     replan_count=replan_count,
+                    plan_phases=plan_phases + [current_phase],
                 )
 
             # Overall plan execution timeout — guard against plans with many steps
@@ -1419,6 +2100,7 @@ class Orchestrator:
                         f"({len(step_results)}/{len(plan.steps)} steps completed)"
                     ),
                     replan_count=replan_count,
+                    plan_phases=plan_phases + [current_phase],
                 )
             destination = get_destination(step, execution_vars)
             step_t0 = time.monotonic()
@@ -1446,6 +2128,52 @@ class Orchestrator:
                 step=step, result=result, elapsed_s=step_elapsed,
                 destination=destination, exec_meta=exec_meta,
             ))
+
+            # Plan-outcome memory: record condensed outcome for this step
+            outcome_entry: dict = {
+                "status": result.status,
+                "output_size": len(result.content) if result.content else 0,
+            }
+            # Conditionally include non-None diagnostic fields
+            step_outcome = step_outcomes[-1]  # just appended above
+            if step_outcome.get("error_detail"):
+                outcome_entry["error"] = step_outcome["error_detail"]
+            if step_outcome.get("file_path"):
+                outcome_entry["file_path"] = step_outcome["file_path"]
+            if step_outcome.get("file_size_before") is not None:
+                outcome_entry["file_size_before"] = step_outcome["file_size_before"]
+            if step_outcome.get("file_size_after") is not None:
+                outcome_entry["file_size_after"] = step_outcome["file_size_after"]
+            if step_outcome.get("scanner_result"):
+                outcome_entry["scanner_result"] = step_outcome["scanner_result"]
+            if step_outcome.get("exit_code") is not None:
+                outcome_entry["exit_code"] = step_outcome["exit_code"]
+            # Failure fingerprint for non-success steps (PentAGI Finding #6)
+            if result.status not in ("success",):
+                error_cat = _categorise_error(
+                    step_outcome.get("error_detail", ""),
+                    scanner_result=step_outcome.get("scanner_result"),
+                    exit_code=step_outcome.get("exit_code"),
+                    sandbox_timed_out=step_outcome.get("sandbox_timed_out", False),
+                    sandbox_oom_killed=step_outcome.get("sandbox_oom_killed", False),
+                    constraint_result=step_outcome.get("constraint_result"),
+                )
+                outcome_entry["failure_fingerprint"] = _failure_fingerprint(step, error_cat)
+                logger.info(
+                    "plan_history: failure fingerprint %s for %s (%s)",
+                    outcome_entry["failure_fingerprint"], step.id, error_cat,
+                    extra={
+                        "event": "plan_history_fingerprint",
+                        "step_id": step.id,
+                        "fingerprint": outcome_entry["failure_fingerprint"],
+                        "error_category": error_cat,
+                    },
+                )
+            current_phase["step_outcomes_summary"][step.id] = outcome_entry
+            logger.debug(
+                "plan_history: %s -> %s", step.id, result.status,
+                extra={"event": "plan_history_step", "step_id": step.id, "status": result.status},
+            )
 
             # F3: Update worker turn buffer after successful llm_task steps
             if (
@@ -1513,13 +2241,81 @@ class Orchestrator:
                     step_outcomes=step_outcomes,
                     reason=result.error,
                     replan_count=replan_count,
+                    plan_phases=plan_phases + [current_phase],
+                    completion="abandoned",
+                    goal_actions_executed=check_goal_actions_executed(step_outcomes),
+                    file_mutations=extract_file_mutations(step_outcomes),
                 )
 
             # ── Dynamic replanning checkpoint ──
             # When a step has replan_after=True and succeeded, call the planner
             # again with execution results to get continuation steps.
             if step.replan_after and result.status == "success":
+                # Stagnation detection: count file mutations since last replan
+                current_mutations = len(extract_file_mutations(step_outcomes))
+                mutations_this_cycle = current_mutations - pre_replan_mutation_count
+                if mutations_this_cycle == 0:
+                    consecutive_no_mutation_replans += 1
+                    logger.debug(
+                        "Stagnation tracking: no new file mutations this replan cycle — counter=%d",
+                        consecutive_no_mutation_replans,
+                        extra={
+                            "event": "stagnation_no_mutations",
+                            "consecutive_no_mutation_replans": consecutive_no_mutation_replans,
+                            "total_mutations": current_mutations,
+                            "step_id": step.id,
+                        },
+                    )
+                else:
+                    if consecutive_no_mutation_replans > 0:
+                        logger.debug(
+                            "Stagnation tracking: %d new mutation(s) — resetting counter (was %d)",
+                            mutations_this_cycle, consecutive_no_mutation_replans,
+                            extra={
+                                "event": "stagnation_reset",
+                                "mutations_this_cycle": mutations_this_cycle,
+                                "previous_counter": consecutive_no_mutation_replans,
+                            },
+                        )
+                    consecutive_no_mutation_replans = 0
+                pre_replan_mutation_count = current_mutations
+
+                stagnation_result = check_stagnation(consecutive_no_mutation_replans)
+                if stagnation_result == "abort":
+                    stagnation_aborted = True
+                    logger.warning(
+                        "Stagnation abort: %d consecutive no-mutation replans — forcing partial",
+                        consecutive_no_mutation_replans,
+                        extra={
+                            "event": "stagnation_abort",
+                            "consecutive_no_mutation_replans": consecutive_no_mutation_replans,
+                            "steps_completed": len(step_results),
+                        },
+                    )
+                    return TaskResult(
+                        status="partial",
+                        plan_summary=plan.plan_summary,
+                        step_results=step_results,
+                        step_outcomes=step_outcomes,
+                        reason=f"Stagnation detected: {consecutive_no_mutation_replans} consecutive replan cycles with no file mutations",
+                        replan_count=replan_count,
+                        plan_phases=plan_phases + [current_phase],
+                        completion="partial",
+                        goal_actions_executed=check_goal_actions_executed(step_outcomes),
+                        file_mutations=extract_file_mutations(step_outcomes),
+                    )
+                elif stagnation_result == "warn":
+                    logger.warning(
+                        "Stagnation warning: %d consecutive no-mutation replans — continuing but at risk",
+                        consecutive_no_mutation_replans,
+                        extra={
+                            "event": "stagnation_warn",
+                            "consecutive_no_mutation_replans": consecutive_no_mutation_replans,
+                        },
+                    )
+
                 if replan_count >= max_replans:
+                    budget_exhausted = True
                     logger.warning(
                         "Replan budget exhausted — executing remaining steps as-is",
                         extra={
@@ -1540,6 +2336,41 @@ class Orchestrator:
                         },
                     )
 
+                    # --- Accumulate anchor maps for file_read steps ---
+                    if step.tool == "file_read" and step.args:
+                        _file_path = step.args.get("path", "")
+                        if _file_path and hasattr(self, '_episodic_store') and self._episodic_store:
+                            try:
+                                import json as _json
+                                from sentinel.tools.anchor_allocator._memory import read_anchor_map
+                                from sentinel.tools.anchor_allocator._core import content_hash
+                                _file_content = result.content if result and result.content else ""
+                                _anchor_list = await read_anchor_map(
+                                    path=_file_path,
+                                    current_hash=content_hash(_file_content),
+                                    episodic_store=self._episodic_store,
+                                    user_id=user_id,
+                                )
+                                if _anchor_list:
+                                    _lines = [f"[ANCHOR MAP: {_file_path}]"]
+                                    for _a in _anchor_list:
+                                        _end = f" (pair: {_a['name']}-end)" if _a.get("has_end") else ""
+                                        _lines.append(f"  {_a['name']} — {_a['description']}{_end}")
+                                    _lines.append("[END ANCHOR MAP]")
+                                    if not hasattr(self, '_active_anchor_maps'):
+                                        self._active_anchor_maps = {}
+                                    self._active_anchor_maps[_file_path] = "\n".join(_lines)
+                                    logger.info(
+                                        "Anchor map injected for replan",
+                                        extra={
+                                            "event": "anchor_map_injected",
+                                            "path": _file_path,
+                                            "anchor_count": len(_anchor_list),
+                                        },
+                                    )
+                            except Exception:
+                                pass  # Non-fatal
+
                     try:
                         continuation = await self._request_continuation(
                             user_request=user_input or "",
@@ -1548,6 +2379,30 @@ class Orchestrator:
                             step_outcomes=step_outcomes,
                             executed_steps=executed_steps,
                             available_tools=available_tools,
+                        )
+
+                        # Plan-outcome memory: close current phase, start new one
+                        plan_phases.append(current_phase)
+                        current_phase = {
+                            "phase": f"continuation_{len(plan_phases)}",
+                            "trigger": "replan_after",
+                            "trigger_step": step.id,
+                            "plan": _truncate_plan_prompts(continuation.model_dump(exclude_none=True)),
+                            "step_outcomes_summary": {},
+                            "replan_context_summary": _build_replan_summary(
+                                executed_steps=executed_steps,
+                                step_outcomes=step_outcomes,
+                            ),
+                        }
+                        logger.info(
+                            "plan_history: %s closed, continuation triggered by %s (replan_after)",
+                            plan_phases[-1]["phase"], step.id,
+                            extra={
+                                "event": "plan_history_phase_close",
+                                "closed_phase": plan_phases[-1]["phase"],
+                                "trigger_step": step.id,
+                                "trigger": "replan_after",
+                            },
                         )
 
                         # Replace remaining steps with continuation steps
@@ -1596,7 +2451,43 @@ class Orchestrator:
             # ── Failure replan checkpoint ──
             # When a step soft-fails (non-zero exit code), call the planner
             # with diagnostic context to let it diagnose and fix.
+            # NOTE: failure budget check comes FIRST — soft_failed steps are
+            # actively erroring, so the failure budget is the primary control.
+            # Stagnation is logged as a secondary signal but doesn't override.
             elif result.status == "soft_failed":
+                # Stagnation: track mutations (logging/signal only — failure budget takes priority)
+                current_mutations = len(extract_file_mutations(step_outcomes))
+                mutations_this_cycle = current_mutations - pre_replan_mutation_count
+                if mutations_this_cycle == 0:
+                    consecutive_no_mutation_replans += 1
+                else:
+                    consecutive_no_mutation_replans = 0
+                pre_replan_mutation_count = current_mutations
+
+                stagnation_result = check_stagnation(consecutive_no_mutation_replans)
+                if stagnation_result == "abort":
+                    logger.warning(
+                        "Stagnation detected during failure replan (%d cycles) — "
+                        "deferring to failure budget (%d/%d)",
+                        consecutive_no_mutation_replans,
+                        failure_replan_count, max_failure_replans,
+                        extra={
+                            "event": "stagnation_during_failure_replan",
+                            "consecutive_no_mutation_replans": consecutive_no_mutation_replans,
+                            "failure_replan_count": failure_replan_count,
+                            "step_id": step.id,
+                        },
+                    )
+                elif stagnation_result == "warn":
+                    logger.warning(
+                        "Stagnation warning during failure replan: %d consecutive no-mutation cycles",
+                        consecutive_no_mutation_replans,
+                        extra={
+                            "event": "stagnation_warn_failure_replan",
+                            "consecutive_no_mutation_replans": consecutive_no_mutation_replans,
+                        },
+                    )
+
                 if failure_replan_count >= max_failure_replans:
                     logger.warning(
                         "Failure replan budget exhausted — aborting",
@@ -1613,6 +2504,10 @@ class Orchestrator:
                         step_outcomes=step_outcomes,
                         reason=f"Failure replan budget exhausted ({max_failure_replans} attempts)",
                         replan_count=replan_count,
+                        plan_phases=plan_phases + [current_phase],
+                        completion="abandoned",
+                        goal_actions_executed=check_goal_actions_executed(step_outcomes),
+                        file_mutations=extract_file_mutations(step_outcomes),
                     )
 
                 failure_replan_count += 1
@@ -1636,6 +2531,31 @@ class Orchestrator:
                         executed_steps=executed_steps,
                         available_tools=available_tools,
                         failure_trigger=True,
+                    )
+
+                    # Plan-outcome memory: close current phase, start new one
+                    plan_phases.append(current_phase)
+                    current_phase = {
+                        "phase": f"continuation_{len(plan_phases)}",
+                        "trigger": "soft_failed",
+                        "trigger_step": step.id,
+                        "plan": _truncate_plan_prompts(continuation.model_dump(exclude_none=True)),
+                        "step_outcomes_summary": {},
+                        "replan_context_summary": _build_replan_summary(
+                            executed_steps=executed_steps,
+                            step_outcomes=step_outcomes,
+                            failure_trigger=True,
+                        ),
+                    }
+                    logger.info(
+                        "plan_history: %s closed, continuation triggered by %s (soft_failed)",
+                        plan_phases[-1]["phase"], step.id,
+                        extra={
+                            "event": "plan_history_phase_close",
+                            "closed_phase": plan_phases[-1]["phase"],
+                            "trigger_step": step.id,
+                            "trigger": "soft_failed",
+                        },
                     )
 
                     # Replace remaining steps with continuation steps
@@ -1669,8 +2589,12 @@ class Orchestrator:
                         plan_summary=plan.plan_summary,
                         step_results=step_results,
                         step_outcomes=step_outcomes,
-                        reason=f"Failure replan failed: {exc}",
+                        reason=genericise_error(f"Failure replan failed: {exc}") or "Failure replan failed",
                         replan_count=replan_count,
+                        plan_phases=plan_phases + [current_phase],
+                        completion="abandoned",
+                        goal_actions_executed=check_goal_actions_executed(step_outcomes),
+                        file_mutations=extract_file_mutations(step_outcomes),
                     )
 
         # Extract response text from the last llm_task step for response
@@ -1682,13 +2606,89 @@ class Orchestrator:
                 response_text = sr.content
                 break
 
+        # Plan-outcome memory: close final phase
+        plan_phases.append(current_phase)
+
+        # ── Tier 1: Deterministic verification signals ──
+        goal_actions = check_goal_actions_executed(step_outcomes)
+        file_muts = extract_file_mutations(step_outcomes)
+
+        # Collect tool output warnings from step results
+        all_warnings: list[dict] = []
+        for sr in step_results:
+            if sr.content:
+                for w in scan_tool_output(sr.content):
+                    all_warnings.append({"step_id": sr.step_id, "pattern": w.pattern, "severity": w.severity})
+
+        # Idempotency detection: flag duplicate tool calls with identical output
+        idempotent_calls = detect_idempotent_calls(step_outcomes)
+        if idempotent_calls:
+            logger.warning(
+                "Idempotent calls detected: %d duplicate group(s) — %s",
+                len(idempotent_calls), ", ".join(idempotent_calls),
+                extra={
+                    "event": "idempotent_calls_detected",
+                    "duplicate_groups": len(idempotent_calls),
+                    "descriptions": idempotent_calls,
+                },
+            )
+            # Append as tool_output_warnings so they're visible in episodic records
+            for desc in idempotent_calls:
+                all_warnings.append({
+                    "step_id": "plan_level",
+                    "pattern": f"idempotent_call: {desc}",
+                    "severity": "MEDIUM",
+                })
+
+        # Determine completion status
+        if budget_exhausted or stagnation_aborted:
+            completion = "partial"
+        else:
+            completion = "full"
+
+        # Override status: budget exhaustion / stagnation = "partial" not "success"
+        final_status = "success"
+        if budget_exhausted:
+            final_status = "partial"
+            logger.warning(
+                "Task completed with partial status — replan budget exhausted",
+                extra={
+                    "event": "verification_partial",
+                    "reason": "budget_exhausted",
+                    "goal_actions_executed": goal_actions,
+                    "file_mutations_count": len(file_muts),
+                },
+            )
+
+        logger.debug(
+            "Tier 1 signals computed — goal_actions=%s, mutations=%d, warnings=%d, "
+            "idempotent_groups=%d, stagnation_counter=%d, budget_exhausted=%s",
+            goal_actions, len(file_muts), len(all_warnings),
+            len(idempotent_calls), consecutive_no_mutation_replans, budget_exhausted,
+            extra={
+                "event": "tier1_signals_summary",
+                "goal_actions_executed": goal_actions,
+                "file_mutations_count": len(file_muts),
+                "tool_output_warnings_count": len(all_warnings),
+                "idempotent_call_groups": len(idempotent_calls),
+                "consecutive_no_mutation_replans": consecutive_no_mutation_replans,
+                "budget_exhausted": budget_exhausted,
+                "stagnation_aborted": stagnation_aborted,
+            },
+        )
+
         return TaskResult(
-            status="success",
+            status=final_status,
             plan_summary=plan.plan_summary,
             step_results=step_results,
             step_outcomes=step_outcomes,
             response=response_text,
             replan_count=replan_count,
+            plan_phases=plan_phases,
+            completion=completion,
+            goal_actions_executed=goal_actions,
+            file_mutations=file_muts,
+            tool_output_warnings=all_warnings,
         )
 
     async def _execute_step(
@@ -1736,8 +2736,27 @@ class Orchestrator:
                 error="LLM task step has no prompt",
             )
 
-        # Chain-safe: if step references prior output, apply structural marking
-        if step.input_vars:
+        # Chain-safe: if step references prior output, apply structural marking.
+        # Defence-in-depth: also check for actual $var references in the prompt
+        # even if input_vars is empty — catches planner omissions that would
+        # otherwise cause UNTRUSTED worker output to resolve without wrapping.
+        actual_refs = set(re.findall(_VAR_RE, step.prompt or ""))
+        declared_refs = set(step.input_vars or [])
+        has_undeclared = bool(actual_refs - declared_refs) and any(
+            context.get(ref) is not None for ref in (actual_refs - declared_refs)
+        )
+        if has_undeclared:
+            logger.warning(
+                "Undeclared variable references in prompt — using safe resolver",
+                extra={
+                    "event": "input_vars_mismatch",
+                    "step_id": step.id,
+                    "declared": sorted(declared_refs),
+                    "actual": sorted(actual_refs),
+                    "undeclared": sorted(actual_refs - declared_refs),
+                },
+            )
+        if step.input_vars or has_undeclared:
             marker = _generate_marker() if settings.spotlighting_enabled else ""
             resolved_prompt = context.resolve_text_safe(step.prompt, marker=marker)
         else:
@@ -1839,7 +2858,7 @@ class Orchestrator:
             ).strip()
             if "<RESPONSE>" in stripped and "</RESPONSE>" in stripped:
                 start = stripped.index("<RESPONSE>") + len("<RESPONSE>")
-                end = stripped.index("</RESPONSE>")
+                end = stripped.rindex("</RESPONSE>")
                 extracted = stripped[start:end].strip()
                 logger.debug(
                     "RESPONSE tag extraction",
@@ -2065,10 +3084,14 @@ class Orchestrator:
                 **_v,
             )
         except Exception as exc:
+            logger.error(
+                "LLM task failed",
+                extra={"event": "llm_task_error", "step_id": step.id, "error": str(exc)},
+            )
             return StepResult(
                 step_id=step.id,
                 status="error",
-                error=f"LLM task failed: {exc}",
+                error=genericise_error(f"LLM task failed: {exc}") or "LLM task failed",
                 **_v,
             )
 
@@ -2103,6 +3126,9 @@ class Orchestrator:
         if provenance_block:
             return provenance_block, None
 
+        # resolve_args uses the UNSAFE resolver (resolve_text, not resolve_text_safe)
+        # intentionally — tools need raw content, not UNTRUSTED_DATA-wrapped content.
+        # Trust is enforced by the S3/S4/S5 gate chain, not by data marking.
         resolved_args = context.resolve_args(step.args)
 
         # Log resolved args for debugging — shows what content the tool receives

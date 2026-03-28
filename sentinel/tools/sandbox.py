@@ -39,6 +39,13 @@ def _demux_stream(raw: bytes) -> str:
     if raw[0] not in (0, 1, 2) or raw[1:4] != b"\x00\x00\x00":
         return raw.decode("utf-8", errors="replace")
 
+    # Finding #1: Secondary validation — check that the declared frame length
+    # is plausible (doesn't exceed remaining data). This catches binary output
+    # that happens to start with \x01\x00\x00\x00 followed by a huge length.
+    first_frame_len = struct.unpack(">I", raw[4:8])[0]
+    if first_frame_len > len(raw) - 8:
+        return raw.decode("utf-8", errors="replace")
+
     # Demultiplex: walk frame headers and extract payloads
     chunks: list[bytes] = []
     pos = 0
@@ -100,16 +107,42 @@ class PodmanSandbox:
         self._api_timeout = api_timeout
         self._client: httpx.AsyncClient | None = None
 
+    @property
+    def default_timeout(self) -> int:
+        return self._default_timeout
+
     def _get_client(self) -> httpx.AsyncClient:
-        """Get or create the httpx client with Unix socket transport."""
+        """Get or create the httpx client with Unix socket transport.
+
+        Finding #2: The client-level timeout is max_timeout + 10s buffer,
+        meaning the client will wait up to 310s (300s max + 10s) for execution
+        responses. The per-call api_timeout (30s) handles non-execution calls.
+        """
         if self._client is None:
-            transport = httpx.AsyncHTTPTransport(uds=self._socket_path)
-            self._client = httpx.AsyncClient(
-                transport=transport,
-                base_url="http://podman",  # hostname is ignored for UDS
-                timeout=httpx.Timeout(self._max_timeout + 10),
-            )
+            self._client = self._create_client()
         return self._client
+
+    def _create_client(self) -> httpx.AsyncClient:
+        """Create a fresh httpx client for the Podman socket."""
+        transport = httpx.AsyncHTTPTransport(uds=self._socket_path)
+        return httpx.AsyncClient(
+            transport=transport,
+            base_url="http://podman",  # hostname is ignored for UDS
+            timeout=httpx.Timeout(self._max_timeout + 10),
+        )
+
+    async def _reset_client(self) -> None:
+        """Finding #3: Recreate the httpx client after a connection failure.
+
+        If the Podman socket becomes unavailable (e.g. Podman restarts),
+        the cached client holds a dead transport. This recreates it.
+        """
+        if self._client is not None:
+            try:
+                await self._client.aclose()
+            except Exception:
+                pass
+            self._client = None
 
     async def close(self) -> None:
         """Close the httpx client and release the underlying connection pool.
@@ -157,8 +190,13 @@ class PodmanSandbox:
         if not hc.get("Memory") or hc["Memory"] <= 0:
             failures.append(f"Memory={hc.get('Memory')!r}, expected > 0")
 
+        # Finding #4: Parse bind strings ("host:container[:options]") and validate
+        # the container target is exactly /workspace, not just a substring match.
         binds = hc.get("Binds") or []
-        if not any("/workspace" in b for b in binds):
+        has_workspace = any(
+            b.split(":")[1] == "/workspace" for b in binds if ":" in b
+        )
+        if not has_workspace:
             failures.append(f"Binds={binds!r}, missing /workspace mount")
 
         # BH3-006: Verify capabilities were applied.
@@ -212,6 +250,20 @@ class PodmanSandbox:
                     },
                 )
             detail = "; ".join(failures)
+            # Finding #6: Log the HostConfig subset for post-incident investigation
+            logger.debug(
+                "Hardening failure — HostConfig details",
+                extra={
+                    "event": "sandbox_hardening_failed_detail",
+                    "container_id": container_id[:12],
+                    "host_config": {
+                        k: hc.get(k) for k in (
+                            "NetworkMode", "ReadonlyRootfs", "SecurityOpt",
+                            "Memory", "Binds", "CapDrop", "CapAdd", "Tmpfs",
+                        )
+                    },
+                },
+            )
             logger.error(
                 "Sandbox hardening verification FAILED — refusing to start",
                 extra={
@@ -346,7 +398,12 @@ class PodmanSandbox:
             self._max_timeout,
         )
         container_name = f"{self._CONTAINER_PREFIX}{uuid.uuid4().hex[:12]}"
-        client = self._get_client()
+        # Finding #3: Get client, resetting if stale from a prior connection failure
+        try:
+            client = self._get_client()
+        except Exception:
+            await self._reset_client()
+            client = self._get_client()
         container_id = None
 
         try:
@@ -361,6 +418,11 @@ class PodmanSandbox:
             # and with NoNewPrivileges (privilege DROP is always allowed).
             # Result: /etc/shadow is unreadable, user code can't escalate,
             # but /workspace stays writable for build artefacts.
+            # Finding #7: chmod 1777 runs as root on every invocation (by design).
+            # The sticky bit prevents users from deleting each other's files.
+            # This runs before hardening-verified user command; the root window
+            # between container start and setpriv is minimal and mitigated by
+            # CapDrop=ALL + ReadonlyRootfs + no-new-privileges.
             wrapped_cmd = (
                 "chmod 1777 /workspace 2>/dev/null; "
                 "exec setpriv --reuid=65534 --regid=65534 --clear-groups "
@@ -416,6 +478,16 @@ class PodmanSandbox:
                     "command": command[:200],
                 },
             )
+            # Finding #11: Log the full wrapped command (including chmod +
+            # setpriv wrapper) at debug level for audit trail.
+            logger.debug(
+                "Sandbox wrapped command",
+                extra={
+                    "event": "sandbox_wrapped_cmd",
+                    "container_id": container_id[:12],
+                    "wrapped_cmd": wrapped_cmd,
+                },
+            )
 
             # 1b. Verify hardening was applied (catches silent API field ignores)
             await self._verify_hardening(container_id)
@@ -442,11 +514,30 @@ class PodmanSandbox:
             except asyncio.TimeoutError:
                 timed_out = True
                 exit_code = -1
-                # Kill the container
-                await client.post(
-                    f"/v5.0.0/containers/{container_id}/kill",
-                    timeout=self._api_timeout,
-                )
+                # Finding #8: Kill the container and check response status
+                try:
+                    kill_resp = await client.post(
+                        f"/v5.0.0/containers/{container_id}/kill",
+                        timeout=self._api_timeout,
+                    )
+                    if kill_resp.status_code not in (200, 204):
+                        logger.warning(
+                            "Kill-on-timeout returned unexpected status",
+                            extra={
+                                "event": "sandbox_kill_failed",
+                                "container_id": container_id[:12],
+                                "status_code": kill_resp.status_code,
+                            },
+                        )
+                except Exception as kill_exc:
+                    logger.warning(
+                        "Failed to kill timed-out container: %s", kill_exc,
+                        extra={
+                            "event": "sandbox_kill_error",
+                            "container_id": container_id[:12],
+                            "error": str(kill_exc),
+                        },
+                    )
                 logger.warning(
                     "Sandbox command timed out, container killed",
                     extra={
@@ -459,6 +550,9 @@ class PodmanSandbox:
             # 4. Get logs (stdout and stderr separately)
             # The Podman logs API returns Docker-style multiplexed stream
             # frames (8-byte header per frame). Read raw bytes and demux.
+            # Finding #9: After a timeout kill, Podman's log buffer may not be
+            # fully flushed — output could be incomplete. This is a Podman
+            # implementation detail, not actionable from our side.
             stdout_resp = await client.get(
                 f"/v5.0.0/containers/{container_id}/logs",
                 params={"stdout": "true", "stderr": "false"},
@@ -518,6 +612,20 @@ class PodmanSandbox:
                     logger.info(
                         "Sandbox container removed",
                         extra={"event": "sandbox_removed", "container_id": container_id[:12]},
+                    )
+                except httpx.HTTPStatusError as exc:
+                    # Finding #10: 404 means already deleted (e.g. hardening
+                    # failure path) — downgrade to debug, not a real failure.
+                    level = logging.DEBUG if exc.response.status_code == 404 else logging.WARNING
+                    logger.log(
+                        level,
+                        "Failed to remove sandbox container: %s",
+                        exc,
+                        extra={
+                            "event": "sandbox_remove_failed",
+                            "container_id": container_id[:12],
+                            "error": str(exc),
+                        },
                     )
                 except Exception as exc:
                     logger.warning(

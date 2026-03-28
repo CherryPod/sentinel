@@ -8,6 +8,7 @@ import pytest
 from starlette.testclient import TestClient
 
 from sentinel.api.auth import PinVerifier
+from sentinel.api.sessions import create_session_token
 from sentinel.channels.web import WebSocketChannel
 from sentinel.core.bus import EventBus
 
@@ -227,25 +228,25 @@ class TestWebSocketEndpointIntegration:
     def test_ws_no_orchestrator_returns_error(self):
         """WS connects but gets error when orchestrator not initialized."""
         from sentinel.api.app import app
+        token = create_session_token(user_id=1, role="owner")
         client = TestClient(app)
-        with client.websocket_connect("/ws") as ws:
-            # Auth (no PIN required)
-            ws.send_text(json.dumps({"type": "auth", "pin": ""}))
-            # Should get auth_ok since no PIN configured
-            msg = ws.receive_json()
-            assert msg["type"] == "auth_ok"
-            # Then error about orchestrator
+        with client.websocket_connect(f"/ws?token={token}") as ws:
+            # First message is auth confirmation
+            auth_msg = ws.receive_json()
+            assert auth_msg["type"] == "auth_ok"
+            # Send a task — orchestrator is None → should get error
+            ws.send_json({"type": "task", "request": "hello"})
             msg = ws.receive_json()
             assert msg["type"] == "error"
 
-    @patch("sentinel.api.routes.websocket._pin_verifier", PinVerifier("1234"))
+    @patch("sentinel.api.routes.websocket._pin_verifier", None)
     @patch("sentinel.api.routes.websocket._orchestrator", None)
     def test_ws_wrong_pin_closes(self):
-        """Wrong PIN → connection closed."""
+        """Missing/invalid token → connection accepted then closed with 4001."""
         from sentinel.api.app import app
         client = TestClient(app)
+        # No query token → first-message auth, send invalid token
         with client.websocket_connect("/ws") as ws:
-            ws.send_text(json.dumps({"type": "auth", "pin": "9999"}))
-            # Should get auth_error then close
-            msg = ws.receive_json()
-            assert msg["type"] == "auth_error"
+            ws.send_json({"type": "auth", "token": "bad-token"})
+            with pytest.raises(Exception):
+                ws.receive_json()

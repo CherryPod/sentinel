@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -58,6 +59,10 @@ class ApprovalManager:
     Dual-mode: PostgreSQL when pool is provided, in-memory dict fallback for tests.
     """
 
+    # Allowlist for approved_by: alphanumeric, underscores, colons, hyphens, 1-64 chars.
+    # Values that don't match (e.g. injection payloads, XSS) are sanitised to "unknown".
+    _APPROVED_BY_PATTERN = re.compile(r"^[a-zA-Z0-9_:\-]{1,64}$")
+
     def __init__(
         self,
         pool: Any = None,
@@ -97,17 +102,16 @@ class ApprovalManager:
             return expired
 
         async with self._pool.acquire() as conn:
+            # Single atomic UPDATE RETURNING — eliminates the race where
+            # submit_approval could approve a row between a SELECT and a
+            # subsequent UPDATE, which would then overwrite it with 'expired'.
             rows = await conn.fetch(
-                "SELECT approval_id, source_key FROM approvals "
-                "WHERE status = 'pending' AND expires_at < NOW()"
+                "UPDATE approvals SET status = 'expired' "
+                "WHERE status = 'pending' AND expires_at < NOW() "
+                "RETURNING approval_id, source_key"
             )
             if not rows:
                 return []
-
-            await conn.execute(
-                "UPDATE approvals SET status = 'expired' "
-                "WHERE status = 'pending' AND expires_at < NOW()"
-            )
 
         expired = [{"approval_id": r["approval_id"], "source_key": r["source_key"]} for r in rows]
         for entry in expired:
@@ -172,6 +176,8 @@ class ApprovalManager:
                 "event": "approval_requested",
                 "approval_id": approval_id,
                 "plan_summary": plan.plan_summary,
+                "source_key": source_key,
+                "user_request": (user_request[:100] + "...") if len(user_request) > 100 else user_request,
             },
         )
         return approval_id
@@ -261,6 +267,16 @@ class ApprovalManager:
         """Submit an approval decision. Returns True if accepted."""
         resolved_user_id = current_user_id.get()
 
+        # Sanitise approved_by — reject anything outside the allowlist pattern.
+        # This prevents injection payloads, XSS strings, or overly long values
+        # from being stored verbatim in the audit trail.
+        if not self._APPROVED_BY_PATTERN.match(approved_by):
+            logger.warning(
+                "Invalid approved_by value sanitised",
+                extra={"event": "approval_invalid_approved_by", "raw": approved_by[:64]},
+            )
+            approved_by = "unknown"
+
         if self._in_memory:
             entry = self._mem.get(approval_id)
             if entry is None or entry.user_id != resolved_user_id:
@@ -292,48 +308,62 @@ class ApprovalManager:
             entry.decided_by = approved_by
         else:
             async with self._pool.acquire() as conn:
-                row = await conn.fetchrow(
-                    "SELECT status, expires_at FROM approvals "
-                    "WHERE approval_id = $1 AND user_id = $2",
-                    approval_id, resolved_user_id,
-                )
-                if row is None:
-                    logger.warning(
-                        "Approval submit — not found",
-                        extra={"event": "approval_submit_not_found", "approval_id": approval_id},
+                async with conn.transaction():
+                    # Atomic UPDATE — only transitions from 'pending' within expiry.
+                    # Eliminates TOCTOU race: concurrent callers cannot both see
+                    # status='pending' because only one UPDATE can match the WHERE.
+                    new_status = "approved" if granted else "denied"
+                    result = await conn.execute(
+                        "UPDATE approvals SET status = $1, decided_at = NOW(), "
+                        "decided_reason = $2, decided_by = $3 "
+                        "WHERE approval_id = $4 AND user_id = $5 "
+                        "AND status = 'pending' AND expires_at >= NOW()",
+                        new_status, reason, approved_by, approval_id, resolved_user_id,
                     )
-                    return False
 
-                status = row["status"]
-                expires_at = row["expires_at"]
+                    rows_affected = int(result.split()[-1])
+                    if rows_affected == 0:
+                        # No row matched — determine why for logging.
+                        row = await conn.fetchrow(
+                            "SELECT status, expires_at FROM approvals "
+                            "WHERE approval_id = $1 AND user_id = $2",
+                            approval_id, resolved_user_id,
+                        )
+                        if row is None:
+                            logger.warning(
+                                "Approval submit — not found",
+                                extra={"event": "approval_submit_not_found",
+                                       "approval_id": approval_id},
+                            )
+                        elif row["expires_at"] < datetime.now(timezone.utc):
+                            await conn.execute(
+                                "UPDATE approvals SET status = 'expired' "
+                                "WHERE approval_id = $1 AND user_id = $2 "
+                                "AND status = 'pending'",
+                                approval_id, resolved_user_id,
+                            )
+                            logger.warning(
+                                "Approval submit — expired",
+                                extra={"event": "approval_submit_expired",
+                                       "approval_id": approval_id},
+                            )
+                        else:
+                            logger.warning(
+                                "Approval submit — duplicate",
+                                extra={"event": "approval_submit_duplicate",
+                                       "approval_id": approval_id},
+                            )
+                        return False
 
-                now = datetime.now(timezone.utc)
-                if expires_at < now:
+                    # Audit log — same transaction as the approval UPDATE.
+                    # Rolls back together if either fails.
+                    decision = "approved" if granted else "denied"
                     await conn.execute(
-                        "UPDATE approvals SET status = 'expired' "
-                        "WHERE approval_id = $1 AND user_id = $2",
-                        approval_id, resolved_user_id,
+                        "INSERT INTO audit_log (user_id, event_type, session_id, details) "
+                        "VALUES ($1, $2, NULL, $3::jsonb)",
+                        resolved_user_id, f"approval_{decision}",
+                        json.dumps({"approval_id": approval_id, "reason": reason}),
                     )
-                    logger.warning(
-                        "Approval submit — expired",
-                        extra={"event": "approval_submit_expired", "approval_id": approval_id},
-                    )
-                    return False
-
-                if status != "pending":
-                    logger.warning(
-                        "Approval submit — duplicate",
-                        extra={"event": "approval_submit_duplicate", "approval_id": approval_id},
-                    )
-                    return False
-
-                new_status = "approved" if granted else "denied"
-                await conn.execute(
-                    "UPDATE approvals SET status = $1, decided_at = NOW(), "
-                    "decided_reason = $2, decided_by = $3 "
-                    "WHERE approval_id = $4 AND user_id = $5",
-                    new_status, reason, approved_by, approval_id, resolved_user_id,
-                )
 
         decision = "approved" if granted else "denied"
         logger.info(
@@ -345,18 +375,6 @@ class ApprovalManager:
                 "reason": reason,
             },
         )
-
-        # Audit log for approval state changes (PG only).
-        # session_id is NULL — approvals are not tied to a specific session.
-        # The approval_id is recorded in the details JSON for traceability.
-        if not self._in_memory:
-            async with self._pool.acquire() as conn:
-                await conn.execute(
-                    "INSERT INTO audit_log (user_id, event_type, session_id, details) "
-                    "VALUES ($1, $2, NULL, $3::jsonb)",
-                    resolved_user_id, f"approval_{decision}",
-                    json.dumps({"approval_id": approval_id, "reason": reason}),
-                )
 
         return True
 
@@ -382,13 +400,20 @@ class ApprovalManager:
                 return Plan.model_validate(plan_json)
             return Plan.model_validate_json(plan_json)
 
-    async def purge_old(self, days: int = 7) -> int:
-        """Delete decided/expired approval entries older than N days."""
+    async def purge_old(self, days: int = 7, user_id: int | None = None) -> int:
+        """Delete decided/expired approval entries older than N days.
+
+        When user_id is provided, only deletes that user's entries.
+        When None, deletes all users' entries (admin maintenance).
+        """
         if self._in_memory:
             cutoff = _now_utc() - timedelta(days=days)
             to_delete = []
             for aid, entry in self._mem.items():
                 if entry.status in ("expired", "approved", "denied"):
+                    # Skip entries that don't belong to the requested user_id.
+                    if user_id is not None and entry.user_id != user_id:
+                        continue
                     try:
                         created = datetime.fromisoformat(entry.created_at.replace("Z", "+00:00"))
                         if created < cutoff:
@@ -399,13 +424,23 @@ class ApprovalManager:
                 del self._mem[aid]
             deleted = len(to_delete)
         else:
-            async with self._pool.acquire() as conn:
-                result = await conn.execute(
+            if user_id is not None:
+                sql = (
                     "DELETE FROM approvals "
                     "WHERE status IN ('expired', 'approved', 'denied') "
-                    "AND created_at < NOW() - INTERVAL '1 day' * $1",
-                    days,
+                    "AND created_at < NOW() - INTERVAL '1 day' * $1 "
+                    "AND user_id = $2"
                 )
+                params = (days, user_id)
+            else:
+                sql = (
+                    "DELETE FROM approvals "
+                    "WHERE status IN ('expired', 'approved', 'denied') "
+                    "AND created_at < NOW() - INTERVAL '1 day' * $1"
+                )
+                params = (days,)
+            async with self._pool.acquire() as conn:
+                result = await conn.execute(sql, *params)
                 deleted = int(result.split()[-1]) if result else 0
 
         if deleted > 0:

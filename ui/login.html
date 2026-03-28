@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="theme-color" content="#2B8585">
+    <title>SENTINEL — Login</title>
+    <style>
+        /* Self-contained styles matching the main Sentinel theme */
+        @font-face {
+            font-family: 'Plus Jakarta Sans';
+            src: url('/fonts/PlusJakartaSans-Variable.woff2') format('woff2');
+            font-weight: 200 800;
+            font-style: normal;
+            font-display: swap;
+        }
+        @font-face {
+            font-family: 'JetBrains Mono';
+            src: url('/fonts/JetBrainsMono-Variable.woff2') format('woff2');
+            font-weight: 300 700;
+            font-style: normal;
+            font-display: swap;
+        }
+
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        html, body {
+            height: 100%;
+            font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, sans-serif;
+            font-size: 14px;
+            background: #F8F6F3;
+            color: #302C26;
+        }
+
+        body {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .login-card {
+            background: #FFFFFF;
+            border: 1px solid rgba(48, 44, 38, 0.06);
+            border-radius: 16px;
+            padding: 40px 32px;
+            text-align: center;
+            min-width: 320px;
+            max-width: 400px;
+            box-shadow: 0 4px 12px rgba(48, 44, 38, 0.08), 0 1px 3px rgba(48, 44, 38, 0.04);
+        }
+
+        .login-brand {
+            font-size: 13px;
+            font-weight: 700;
+            letter-spacing: 3px;
+            text-transform: uppercase;
+            color: #2B8585;
+            margin-bottom: 8px;
+        }
+
+        .login-title {
+            font-size: 20px;
+            font-weight: 600;
+            margin-bottom: 4px;
+            color: #302C26;
+        }
+
+        .login-subtitle {
+            font-size: 13px;
+            color: #635E56;
+            margin-bottom: 28px;
+        }
+
+        .login-field {
+            display: block;
+            width: 100%;
+            padding: 12px 14px;
+            background: #E4E0DA;
+            border: 1px solid #D4CFC7;
+            border-radius: 8px;
+            color: #302C26;
+            font-family: inherit;
+            font-size: 14px;
+            outline: none;
+            margin-bottom: 14px;
+            transition: border-color 0.2s, box-shadow 0.2s;
+        }
+
+        .login-field::placeholder {
+            color: #969089;
+        }
+
+        .login-field:focus {
+            border-color: #2B8585;
+            box-shadow: 0 0 0 3px rgba(43, 133, 133, 0.25);
+        }
+
+        .login-field-pin {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 22px;
+            text-align: center;
+            letter-spacing: 6px;
+        }
+
+        .login-btn {
+            display: block;
+            width: 100%;
+            padding: 12px;
+            margin-top: 6px;
+            background: #2B8585;
+            color: #FFFFFF;
+            border: none;
+            border-radius: 8px;
+            font-family: inherit;
+            font-size: 14px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: background-color 0.15s;
+        }
+
+        .login-btn:hover {
+            background: #1E6868;
+        }
+
+        .login-btn:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+        }
+
+        .login-error {
+            color: #C05050;
+            font-size: 13px;
+            margin-top: 14px;
+            min-height: 18px;
+        }
+    </style>
+</head>
+<body>
+    <div class="login-card">
+        <div class="login-brand">Sentinel</div>
+        <h1 class="login-title">Welcome back</h1>
+        <p class="login-subtitle">Enter your credentials to continue</p>
+        <form id="login-form" autocomplete="on">
+            <input
+                type="text"
+                id="username"
+                class="login-field"
+                placeholder="Username"
+                autocomplete="username"
+                required
+            >
+            <input
+                type="password"
+                id="pin"
+                class="login-field login-field-pin"
+                placeholder="PIN"
+                autocomplete="current-password"
+                required
+            >
+            <button type="submit" class="login-btn" id="login-btn">Sign in</button>
+        </form>
+        <div id="login-error" class="login-error"></div>
+    </div>
+
+    <script src="/login.js"></script>
+</body>
+</html>

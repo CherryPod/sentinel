@@ -10,7 +10,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from sentinel.security.pipeline import ScanPipeline, SecurityViolation
-from sentinel.security.scanner import CommandPatternScanner, CredentialScanner, SensitivePathScanner
+from sentinel.security.scanner import (
+    CommandPatternScanner,
+    CredentialScanner,
+    EncodingNormalizationScanner,
+    SensitivePathScanner,
+    VulnerabilityEchoScanner,
+)
 from sentinel.worker.ollama import OllamaWorker
 from sentinel.security import prompt_guard
 from sentinel.security.provenance import reset_store
@@ -125,12 +131,16 @@ def hostile_pipeline(engine):
     cred_scanner = CredentialScanner(engine.policy.get("credential_patterns", []))
     path_scanner = SensitivePathScanner(engine.policy.get("sensitive_path_patterns", []))
     cmd_scanner = CommandPatternScanner()
+    encoding_scanner = EncodingNormalizationScanner(cred_scanner, path_scanner, cmd_scanner)
+    echo_scanner = VulnerabilityEchoScanner()
     mock_worker = MagicMock(spec=OllamaWorker)
     mock_worker.generate = AsyncMock()
     return ScanPipeline(
         cred_scanner=cred_scanner,
         path_scanner=path_scanner,
         cmd_scanner=cmd_scanner,
+        encoding_scanner=encoding_scanner,
+        echo_scanner=echo_scanner,
         worker=mock_worker,
     ), mock_worker
 

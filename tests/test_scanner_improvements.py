@@ -13,7 +13,13 @@ import pytest
 
 from sentinel.core.models import ScanMatch, ScanResult
 from sentinel.security.pipeline import ScanPipeline, SecurityViolation
-from sentinel.security.scanner import CredentialScanner, SensitivePathScanner
+from sentinel.security.scanner import (
+    CommandPatternScanner,
+    CredentialScanner,
+    EncodingNormalizationScanner,
+    SensitivePathScanner,
+    VulnerabilityEchoScanner,
+)
 from sentinel.worker.ollama import OllamaWorker
 from sentinel.security import prompt_guard
 from sentinel.security.provenance import reset_store
@@ -41,11 +47,13 @@ def mock_worker():
 
 
 @pytest.fixture
-def pipeline(cred_scanner, path_scanner, cmd_scanner, mock_worker):
+def pipeline(cred_scanner, path_scanner, cmd_scanner, encoding_scanner, echo_scanner, mock_worker):
     return ScanPipeline(
         cred_scanner=cred_scanner,
         path_scanner=path_scanner,
         cmd_scanner=cmd_scanner,
+        encoding_scanner=encoding_scanner,
+        echo_scanner=echo_scanner,
         worker=mock_worker,
     )
 
@@ -184,8 +192,12 @@ class TestSensitivePathContext:
         assert result.found is False
 
     def test_path_in_yaml_config_passes(self, path_scanner: SensitivePathScanner):
-        """Paths in YAML config context should not be flagged."""
-        text = "  shadow_file: /etc/shadow"
+        """Paths in multi-key YAML config context should not be flagged.
+
+        Updated for finding #24: single isolated YAML lines are now flagged.
+        Multiple nearby key-value lines are required for the exemption.
+        """
+        text = "  config_dir: /etc/\n  shadow_file: /etc/shadow\n  log_dir: /var/log/\n"
         result = path_scanner.scan_output_text(text)
         assert result.found is False
 
@@ -239,6 +251,80 @@ class TestCredentialServiceNames:
         """Real API keys should never be allowlisted."""
         result = cred_scanner.scan("sk-ant-abc123def456ghi789jkl012")
         assert result.found is True
+
+
+# ── Tightened heuristic exemptions (#22-25) ────────────────────────
+
+
+class TestHeuristicTightening:
+    """Tests for tightened heuristic exemptions (findings #22-25)."""
+
+    def test_dockerfile_far_from_shell_line_not_exempt(self, path_scanner: SensitivePathScanner):
+        """#22: Dockerfile instructions far from shell line don't exempt it.
+
+        /etc/passwd is in _CODE_BLOCK_SAFE, so without locality the Dockerfile
+        at the top would exempt the shell comment line 30+ lines later.
+        """
+        # Dockerfile at top, comment-style shell line 30+ lines later.
+        # The '#' prefix matches _SHELL_PREFIXES, triggering the Dockerfile
+        # exemption check — which should only apply within ±15 lines.
+        dockerfile = "FROM python:3.12\nRUN pip install flask\nCOPY . /app\n"
+        filler = "This is just some text.\n" * 25
+        shell_line = "# cat /etc/passwd"
+        text = dockerfile + filler + shell_line
+        r = path_scanner.scan_output_text(text, strict=False)
+        passwd_matches = [m for m in r.matches if "/etc/passwd" in m.matched_text]
+        assert len(passwd_matches) > 0, "Shell line far from Dockerfile should be flagged"
+
+    def test_dockerfile_near_shell_line_still_exempt(self, path_scanner: SensitivePathScanner):
+        """#22: Dockerfile instructions near shell line still exempt it."""
+        # Comment line (#) matches _SHELL_PREFIXES but is adjacent to Dockerfile
+        text = "FROM python:3.12\nRUN pip install flask\n# cat /etc/passwd\n"
+        r = path_scanner.scan_output_text(text, strict=False)
+        passwd_matches = [m for m in r.matches if "/etc/passwd" in m.matched_text]
+        assert len(passwd_matches) == 0, "Shell line near Dockerfile should still be exempt"
+
+    def test_markdown_list_short_prose_not_exempt(self, path_scanner: SensitivePathScanner):
+        """#23: Short markdown list items (< pattern + 20 chars) should not be exempt."""
+        r = path_scanner.scan_output_text("- /etc/shadow: yes", strict=False)
+        assert r.found is True, "Short markdown list item should be flagged"
+
+    def test_markdown_list_long_prose_still_exempt(self, path_scanner: SensitivePathScanner):
+        """#23: Long explanatory list items (>= pattern + 20 chars) should still be exempt."""
+        r = path_scanner.scan_output_text(
+            "- /etc/shadow \u2014 this file stores the hashed passwords for all user accounts on the system",
+            strict=False,
+        )
+        assert r.found is False, "Long explanatory list item should be suppressed"
+
+    def test_single_yaml_line_not_exempt(self, path_scanner: SensitivePathScanner):
+        """#24: Single isolated YAML key-value line should not be exempt."""
+        # Only one indented key: value line nearby — must not suppress
+        r = path_scanner.scan_output_text("  shadow_file: /etc/shadow", strict=False)
+        assert r.found is True, "Single YAML line should be flagged"
+
+    def test_multi_yaml_lines_still_exempt(self, path_scanner: SensitivePathScanner):
+        """#24: Multiple YAML key-value lines nearby should still be exempt."""
+        text = "  config_dir: /etc/\n  shadow: /etc/shadow\n  passwd: /etc/passwd\n"
+        r = path_scanner.scan_output_text(text, strict=False)
+        shadow_matches = [m for m in r.matches if "/etc/shadow" in m.matched_text]
+        assert len(shadow_matches) == 0, "Multi-line YAML context should be suppressed"
+
+    def test_ignore_listing_narrow_window_still_works(self, path_scanner: SensitivePathScanner):
+        """#25: .env in an ignore listing is still suppressed with tighter ±3 window."""
+        # Tight cluster of ignore entries surrounding .env
+        text = "*.log\n*.tmp\n.env\n*.pyc\n__pycache__/\n"
+        r = path_scanner.scan_output_text(text, strict=False)
+        env_matches = [m for m in r.matches if ".env" in m.matched_text]
+        assert len(env_matches) == 0, ".env in compact ignore listing should be suppressed"
+
+    def test_ignore_listing_sparse_context_flagged(self, path_scanner: SensitivePathScanner):
+        """#25: .env with only 2 nearby ignore entries (below 85% threshold) should be flagged."""
+        # Only 2 ignore-ish lines nearby + a prose line breaks the 85% threshold
+        text = "# configuration\nsome prose line here\n.env\n*.pyc\n"
+        r = path_scanner.scan_output_text(text, strict=False)
+        env_matches = [m for m in r.matches if ".env" in m.matched_text]
+        assert len(env_matches) > 0, ".env in sparse non-listing context should be flagged"
 
 
 # ── S4: Planner prompt amplification guard ─────────────────────────

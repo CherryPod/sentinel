@@ -203,9 +203,10 @@ class TestFileReadTrustTagging:
                 f.write(content)
 
             # Record provenance with a data_id that doesn't exist in the store
-            # (simulates data eviction or corruption)
+            # (simulates data eviction or corruption). Key is (path, user_id) — use
+            # user_id=0 (orphan/default) to match the no-user-context code path.
             from sentinel.security.provenance import _default_store
-            _default_store._file_provenance[path] = ("nonexistent-data-id", content_hash)
+            _default_store._file_provenance[(path, 0)] = ("nonexistent-data-id", content_hash)
 
             with patch.object(executor._engine, "check_file_read") as mock_check:
                 mock_check.return_value = ValidationResult(
@@ -228,9 +229,10 @@ class TestFileReadTrustTagging:
             write_tag = await create_tagged_data(
                 f"File written: {path}", DataSource.TOOL, TrustLevel.TRUSTED,
             )
-            # Directly inject legacy-style record with empty hash
+            # Directly inject legacy-style record with empty hash. Key is (path, user_id)
+            # — use user_id=0 (orphan/default) to match the no-user-context code path.
             from sentinel.security.provenance import _default_store
-            _default_store._file_provenance[path] = (write_tag.id, "")
+            _default_store._file_provenance[(path, 0)] = (write_tag.id, "")
 
             with patch.object(executor._engine, "check_file_read") as mock_check:
                 mock_check.return_value = ValidationResult(

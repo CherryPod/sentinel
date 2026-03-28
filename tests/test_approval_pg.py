@@ -22,6 +22,12 @@ def mock_pool():
     cm.__aenter__ = AsyncMock(return_value=conn)
     cm.__aexit__ = AsyncMock(return_value=False)
     pool.acquire.return_value = cm
+    # submit_approval uses conn.transaction() as async context manager.
+    # conn.transaction() is a sync call that returns an async CM (like asyncpg).
+    tx_cm = MagicMock()
+    tx_cm.__aenter__ = AsyncMock(return_value=None)
+    tx_cm.__aexit__ = AsyncMock(return_value=False)
+    conn.transaction = MagicMock(return_value=tx_cm)
     return pool, conn
 
 
@@ -148,19 +154,18 @@ class TestSubmitApproval:
     @pytest.mark.asyncio
     async def test_approves_pending(self, store, mock_pool):
         _, conn = mock_pool
-        conn.fetchrow.return_value = _make_approval_row()
+        # Atomic UPDATE matched the row (1 row affected)
         conn.execute.return_value = "UPDATE 1"
 
         result = await store.submit_approval("a-123", granted=True, reason="ok")
 
         assert result is True
-        update_calls = [c for c in conn.execute.call_args_list
-                        if "UPDATE approvals SET" in str(c)]
-        assert len(update_calls) == 1
 
     @pytest.mark.asyncio
     async def test_rejects_not_found(self, store, mock_pool):
         _, conn = mock_pool
+        # Atomic UPDATE matched 0 rows, follow-up fetchrow finds nothing
+        conn.execute.return_value = "UPDATE 0"
         conn.fetchrow.return_value = None
 
         result = await store.submit_approval("nonexistent", granted=True)
@@ -170,10 +175,12 @@ class TestSubmitApproval:
     @pytest.mark.asyncio
     async def test_rejects_expired(self, store, mock_pool):
         _, conn = mock_pool
-        conn.fetchrow.return_value = _make_approval_row(
-            expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
-        )
-        conn.execute.return_value = "UPDATE 1"
+        # Atomic UPDATE matched 0 rows (expired), follow-up fetchrow shows why
+        conn.execute.return_value = "UPDATE 0"
+        conn.fetchrow.return_value = {
+            "status": "pending",
+            "expires_at": datetime.now(timezone.utc) - timedelta(minutes=1),
+        }
 
         result = await store.submit_approval("a-123", granted=True)
 
@@ -182,7 +189,12 @@ class TestSubmitApproval:
     @pytest.mark.asyncio
     async def test_rejects_duplicate(self, store, mock_pool):
         _, conn = mock_pool
-        conn.fetchrow.return_value = _make_approval_row(status="approved")
+        # Atomic UPDATE matched 0 rows (already decided), follow-up shows status
+        conn.execute.return_value = "UPDATE 0"
+        conn.fetchrow.return_value = {
+            "status": "approved",
+            "expires_at": datetime.now(timezone.utc) + timedelta(minutes=5),
+        }
 
         result = await store.submit_approval("a-123", granted=True)
 

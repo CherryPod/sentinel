@@ -31,6 +31,7 @@ _TABLES_NO_FK = [
                         CHECK (role IN ('owner', 'admin', 'user', 'pending')),
         trust_level     INTEGER CHECK (trust_level BETWEEN 0 AND 4),
         sessions_invalidated_at TIMESTAMPTZ,
+        must_change_pin BOOLEAN NOT NULL DEFAULT FALSE,
         created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
     """,
@@ -200,11 +201,12 @@ _TABLES_FK = [
     # 4.4 File Provenance (depends on provenance)
     """
     CREATE TABLE IF NOT EXISTS file_provenance (
-        file_path       TEXT PRIMARY KEY,
+        file_path       TEXT NOT NULL,
         user_id         INTEGER NOT NULL REFERENCES users(user_id),
         writer_data_id  TEXT NOT NULL REFERENCES provenance(data_id),
         content_sha256  TEXT NOT NULL DEFAULT '',
-        created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY (file_path, user_id)
     );
     """,
     # 4.8 Routine Executions (depends on routines)
@@ -361,6 +363,10 @@ _OTHER_INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_efi_user_id ON episodic_file_index(user_id);",
     # Episodic facts — user_id for privacy filtering
     "CREATE INDEX IF NOT EXISTS idx_ef_user_id ON episodic_facts(user_id);",
+    # Anchor allocator — one anchor map per file per user
+    """CREATE UNIQUE INDEX IF NOT EXISTS idx_anchor_map_unique
+        ON episodic_facts(fact_type, file_path, user_id)
+        WHERE fact_type = 'anchor_map';""",
     # Contacts — user_id lookup
     "CREATE INDEX IF NOT EXISTS idx_contacts_user_id ON contacts(user_id);",
     # Contact channels — contact_id lookup + reverse lookup by channel/identifier
@@ -383,6 +389,10 @@ _OTHER_INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_sp_domain_user ON strategy_patterns(domain, user_id);",
     # File provenance content hash (trust laundering fix) — migration for existing databases
     "ALTER TABLE file_provenance ADD COLUMN IF NOT EXISTS content_sha256 TEXT NOT NULL DEFAULT '';",
+    # Bootstrap flow (multi-user activation) — must_change_pin forces PIN rotation on first login
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS must_change_pin BOOLEAN NOT NULL DEFAULT FALSE;",
+    # Plan-outcome memory — store full plan evolution for cross-task learning
+    "ALTER TABLE episodic_records ADD COLUMN IF NOT EXISTS plan_json JSONB;",
 ]
 
 
@@ -880,6 +890,27 @@ async def create_pg_schema(conn: Any) -> None:
                     f"REFERENCES users(user_id)"
                 )
                 logger.info("Added user_id column to %s", table)
+
+        # 5c. Migrate file_provenance PK from (file_path) to (file_path, user_id)
+        # Idempotent — checks constraint columns before altering
+        pk_cols = await conn.fetch(
+            """
+            SELECT a.attname
+            FROM pg_index i
+            JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
+            WHERE i.indrelid = 'file_provenance'::regclass AND i.indisprimary
+            ORDER BY array_position(i.indkey, a.attnum)
+            """,
+        )
+        pk_col_names = [r["attname"] for r in pk_cols]
+        if pk_col_names == ["file_path"]:
+            await conn.execute(
+                "ALTER TABLE file_provenance DROP CONSTRAINT file_provenance_pkey"
+            )
+            await conn.execute(
+                "ALTER TABLE file_provenance ADD PRIMARY KEY (file_path, user_id)"
+            )
+            logger.info("Migrated file_provenance PK: (file_path) → (file_path, user_id)")
 
         # 6. GIN indexes for tsvector full-text search
         for sql in _FTS_INDEXES:

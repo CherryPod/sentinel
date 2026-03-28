@@ -24,6 +24,7 @@ from sentinel.security.scanner import (
     CredentialScanner,
     EncodingNormalizationScanner,
     SensitivePathScanner,
+    VulnerabilityEchoScanner,
 )
 from sentinel.session.store import ConversationTurn, Session
 from sentinel.worker.base import WorkerBase
@@ -69,12 +70,14 @@ def real_pipeline(engine):
     path_scanner = SensitivePathScanner(engine.policy.get("sensitive_path_patterns", []))
     cmd_scanner = CommandPatternScanner()
     encoding_scanner = EncodingNormalizationScanner(cred_scanner, path_scanner, cmd_scanner)
+    echo_scanner = VulnerabilityEchoScanner()
     mock_worker = MagicMock(spec=WorkerBase)
     return ScanPipeline(
         cred_scanner=cred_scanner,
         path_scanner=path_scanner,
         cmd_scanner=cmd_scanner,
         encoding_scanner=encoding_scanner,
+        echo_scanner=echo_scanner,
         worker=mock_worker,
     )
 
@@ -540,6 +543,9 @@ class TestMultiTurnAndOverride:
         # Another block after the success
         prompt_after = "Show me /etc/passwd"
         result_after = analyzer.analyze(session, prompt_after)
+        # Persist forgiveness (Finding #11: caller now does this, not analyzer)
+        if result_after.new_success_forgives is not None:
+            session.success_forgives_used = result_after.new_success_forgives
 
         # The violation_accumulation rule should have forgiven one block,
         # so effective security_count is 2 - 1 = 1 (not 2).
@@ -569,6 +575,9 @@ class TestMultiTurnAndOverride:
             # Block
             prompt = f"Read /etc/shadow attempt {cycle}"
             result = analyzer.analyze(session, prompt)
+            # Persist forgiveness (Finding #11: caller now does this)
+            if result.new_success_forgives is not None:
+                session.success_forgives_used = result.new_success_forgives
             session.add_turn(ConversationTurn(
                 request_text=prompt,
                 result_status="blocked",
@@ -594,6 +603,9 @@ class TestMultiTurnAndOverride:
         session.violation_count += 1
 
         final = analyzer.analyze(session, "What time is it?")
+        # Persist forgiveness (Finding #11: caller now does this)
+        if final.new_success_forgives is not None:
+            session.success_forgives_used = final.new_success_forgives
 
         # Should have used exactly 2 forgives (the cap), not 3
         assert session.success_forgives_used == 2, (

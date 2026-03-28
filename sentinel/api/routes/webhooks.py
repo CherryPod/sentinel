@@ -34,6 +34,7 @@ from sentinel.channels.webhook import (
     verify_timestamp,
 )
 from sentinel.core.config import settings
+from sentinel.core.context import current_user_id
 
 logger = logging.getLogger("sentinel.api")
 
@@ -105,7 +106,10 @@ async def register_webhook(req: RegisterWebhookRequest, request: Request):
             content={"status": "error", "reason": "Webhook system not initialized"},
         )
 
-    config = await _webhook_registry.register(name=req.name, secret=req.secret)
+    uid = current_user_id.get()
+    config = await _webhook_registry.register(name=req.name, secret=req.secret, user_id=uid)
+    logger.info("Webhook registered: %s by user_id=%d", req.name, uid,
+                extra={"event": "webhook_registered"})
     return {
         "status": "ok",
         "webhook": _webhook_to_dict(config),
@@ -122,7 +126,8 @@ async def list_webhooks():
             content={"status": "error", "reason": "Webhook system not initialized"},
         )
 
-    webhooks = await _webhook_registry.list()
+    uid = current_user_id.get()
+    webhooks = await _webhook_registry.list(user_id=uid)
     return {
         "status": "ok",
         "webhooks": [_webhook_to_dict(w) for w in webhooks],
@@ -139,6 +144,15 @@ async def delete_webhook(webhook_id: str):
             content={"status": "error", "reason": "Webhook system not initialized"},
         )
 
+    # Ownership check: verify webhook belongs to current user before deleting
+    uid = current_user_id.get()
+    config = await _webhook_registry.get(webhook_id)
+    if config is None or getattr(config, 'user_id', None) != uid:
+        return JSONResponse(
+            status_code=404,
+            content={"status": "error", "reason": "Webhook not found"},
+        )
+
     deleted = await _webhook_registry.delete(webhook_id)
     if not deleted:
         return JSONResponse(
@@ -146,6 +160,8 @@ async def delete_webhook(webhook_id: str):
             content={"status": "error", "reason": "Webhook not found"},
         )
 
+    logger.info("Webhook deleted: %s by user_id=%d", webhook_id, uid,
+                extra={"event": "webhook_deleted"})
     return {"status": "ok", "deleted": webhook_id}
 
 
@@ -225,31 +241,38 @@ async def receive_webhook(webhook_id: str, request: Request):
     # If payload contains a "prompt" field, route through orchestrator as a task
     task_triggered = False
     if isinstance(payload, dict) and payload.get("prompt") and _orchestrator is not None:
-        router_instance = ChannelRouter(_orchestrator, _event_bus, _audit, message_router=_message_router)
-        message = IncomingMessage(
-            channel_id=f"webhook:{webhook_id}",
-            source="webhook",
-            content=payload["prompt"],
-            metadata={
-                "source_key": f"webhook:{webhook_id}",
-                "approval_mode": settings.approval_mode,
-                "type": "task",
-            },
-        )
-        # Fire-and-forget: NullChannel discards responses asynchronously
-        dummy_channel = NullChannel()
+        # Set user context from the webhook's owner — webhooks carry a user_id foreign key
+        # so tasks they trigger run in the correct RLS context, not as a shared user_id=1.
+        webhook_user_id = getattr(config, "user_id", 1)
+        ctx_token = current_user_id.set(webhook_user_id)
         try:
-            await router_instance.handle_message(dummy_channel, message)
-            task_triggered = True
-        except Exception as exc:
-            if _audit is not None:
-                _audit.warning(
-                    "Webhook task routing failed",
-                    extra={
-                        "event": "webhook_task_error",
-                        "webhook_id": webhook_id,
-                        "error": str(exc),
-                    },
-                )
+            router_instance = ChannelRouter(_orchestrator, _event_bus, _audit, message_router=_message_router)
+            message = IncomingMessage(
+                channel_id=f"webhook:{webhook_id}",
+                source="webhook",
+                content=payload["prompt"],
+                metadata={
+                    "source_key": f"webhook:{webhook_id}",
+                    "approval_mode": settings.approval_mode,
+                    "type": "task",
+                },
+            )
+            # Fire-and-forget: NullChannel discards responses asynchronously
+            dummy_channel = NullChannel()
+            try:
+                await router_instance.handle_message(dummy_channel, message)
+                task_triggered = True
+            except Exception as exc:
+                if _audit is not None:
+                    _audit.warning(
+                        "Webhook task routing failed",
+                        extra={
+                            "event": "webhook_task_error",
+                            "webhook_id": webhook_id,
+                            "error": str(exc),
+                        },
+                    )
+        finally:
+            current_user_id.reset(ctx_token)
 
     return {"status": "ok", "event_published": True, "task_triggered": task_triggered}

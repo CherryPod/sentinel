@@ -8,6 +8,7 @@ import pytest
 
 from sentinel.channels.web import SSEWriter
 from sentinel.core.bus import EventBus
+from tests.conftest import auth_headers
 
 
 # ── SSEWriter unit tests ─────────────────────────────────────────
@@ -145,7 +146,7 @@ class TestSSEEndpoint:
         from sentinel.api.app import app
 
         client = TestClient(app)
-        resp = client.get("/api/events?task_id=test-123")
+        resp = client.get("/api/events?task_id=test-123", headers=auth_headers())
         assert resp.status_code == 503
 
     @patch("sentinel.api.lifecycle._pin_verifier", None)
@@ -155,7 +156,7 @@ class TestSSEEndpoint:
         from sentinel.api.app import app
 
         client = TestClient(app)
-        resp = client.get("/api/events")
+        resp = client.get("/api/events", headers=auth_headers())
         assert resp.status_code == 422
 
     @patch("sentinel.api.lifecycle._pin_verifier", None)
@@ -184,5 +185,5 @@ class TestSSEEndpoint:
         with patch("sentinel.api.routes.streaming._event_bus", bus), \
              patch("sentinel.api.routes.streaming.SSEWriter", QuickSSEWriter):
             client = TestClient(app)
-            resp = client.get("/api/events?task_id=test-123")
+            resp = client.get("/api/events?task_id=test-123", headers=auth_headers())
             assert resp.status_code == 200

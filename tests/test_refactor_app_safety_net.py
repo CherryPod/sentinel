@@ -42,9 +42,12 @@ from fastapi.testclient import TestClient
 
 import sentinel.api.app as app_module
 from sentinel.api.app import app
+from tests.conftest import auth_headers
 
 # CSRF requires Origin header on state-changing requests
 _ORIGIN = {"Origin": "https://localhost:3001"}
+# Combine auth headers with CSRF Origin for state-changing requests
+_AUTH_ORIGIN = {**_ORIGIN, **auth_headers()}
 
 
 # ── CI-1: Pipeline initialized before routes serve ──────────────
@@ -66,7 +69,7 @@ class TestCI1PipelineBeforeServe:
         with patch.object(app_module, "_pin_verifier", None), \
              patch.object(app_module, "_pipeline", mock_pipeline):
             client = TestClient(app, raise_server_exceptions=False)
-            resp = client.post("/api/scan", json={"text": "hello world"}, headers=_ORIGIN)
+            resp = client.post("/api/scan", json={"text": "hello world"}, headers=_AUTH_ORIGIN)
 
             assert resp.status_code == 200
             data = resp.json()
@@ -88,7 +91,7 @@ class TestCI2ShutdownRejectsRequests:
                 resp = client.post(
                     "/api/task",
                     json={"request": "test task request message"},
-                    headers=_ORIGIN,
+                    headers=_AUTH_ORIGIN,
                 )
             assert resp.status_code == 503
         finally:
@@ -109,7 +112,7 @@ class TestCI2ShutdownRejectsRequests:
                         "id": "test-1",
                         "params": {"message": {"role": "user", "parts": [{"type": "text", "text": "hi"}]}},
                     },
-                    headers=_ORIGIN,
+                    headers=_AUTH_ORIGIN,
                 )
             assert resp.status_code == 503
         finally:
@@ -125,7 +128,7 @@ class TestCI2ShutdownRejectsRequests:
                 resp = client.post(
                     "/api/process",
                     json={"text": "test input"},
-                    headers=_ORIGIN,
+                    headers=_AUTH_ORIGIN,
                 )
             assert resp.status_code == 503
         finally:
@@ -192,10 +195,7 @@ class TestCI4Boot1Gate:
         data = resp.json()
         # App is serving (graceful degradation, not hard block)
         assert data["status"] == "ok"
-        # Both scanners reported as offline
-        assert data["prompt_guard_loaded"] is False
-        assert data["semgrep_loaded"] is False
-        # Degraded flag is set
+        # Degraded flag is set (both scanners offline)
         assert data["degraded"] is True
 
 

@@ -23,6 +23,7 @@ from fastapi.staticfiles import StaticFiles
 
 from sentinel.core.approval import ApprovalManager
 from sentinel.core.bus import EventBus
+from sentinel.core.context import spawn_task
 from sentinel.core.db import run_db_maintenance
 from sentinel.audit.logger import setup_audit_logger
 from sentinel.core.config import settings
@@ -34,7 +35,13 @@ from sentinel.planner.planner import ClaudePlanner, PlannerError
 from sentinel.security.policy_engine import PolicyEngine
 from sentinel.security import semgrep_scanner, prompt_guard
 from sentinel.security.provenance import ProvenanceStore, set_default_store
-from sentinel.security.scanner import CommandPatternScanner, CredentialScanner, SensitivePathScanner
+from sentinel.security.scanner import (
+    CommandPatternScanner,
+    CredentialScanner,
+    EncodingNormalizationScanner,
+    SensitivePathScanner,
+    VulnerabilityEchoScanner,
+)
 from sentinel.memory.chunks import MemoryStore
 from sentinel.memory.embeddings import EmbeddingClient
 from sentinel.memory.episodic import EpisodicStore
@@ -108,6 +115,18 @@ _shutting_down: bool = False
 _background_tasks: set[asyncio.Task] = set()
 
 
+async def _periodic_revocation_cleanup():
+    """Run periodic cleanup of expired revocation entries."""
+    from sentinel.api.revocation import get_revocation_set
+
+    while True:
+        await asyncio.sleep(900)  # 15 minutes
+        try:
+            get_revocation_set().cleanup()
+        except Exception:
+            logger.warning("Revocation cleanup failed", exc_info=True)
+
+
 def _sync_to_app_module(**kwargs) -> None:
     """Push global values back to sentinel.api.app for backward compat.
 
@@ -133,8 +152,13 @@ def _log_task_exception(task: asyncio.Task) -> None:
 
 
 def _track_task(coro, *, name: str | None = None) -> asyncio.Task:
-    """Create an asyncio task and register it for shutdown tracking."""
-    task = asyncio.create_task(coro, name=name)
+    """Create an asyncio task and register it for shutdown tracking.
+
+    Uses spawn_task() so user-scoped context (current_user_id, etc.) is
+    propagated to the child task. Call sites include per-user orchestration
+    work so the correct user ID must be visible inside the task.
+    """
+    task = spawn_task(coro, name=name)
     _background_tasks.add(task)
     task.add_done_callback(_background_tasks.discard)
     task.add_done_callback(_log_task_exception)
@@ -240,7 +264,7 @@ async def _init_database(app: FastAPI, settings, audit) -> tuple:
     contact_store = ContactStore(pg_pool)
     app.state.contact_store = contact_store
     init_contact_stores(contact_store, routine_store)
-    init_auth_store(contact_store)
+    init_auth_store(contact_store, admin_pool=admin_pool)
     webhook_registry = WebhookRegistry(pg_pool)
     app.state.webhook_registry = webhook_registry
 
@@ -328,11 +352,18 @@ async def _init_security(app: FastAPI, settings, audit):
             },
         )
 
+    _echo_scanner = VulnerabilityEchoScanner()
+    _encoding_scanner = EncodingNormalizationScanner(
+        _cred_scanner, _path_scanner, _cmd_scanner
+    )
+
     # Initialize scan pipeline (Phase 2)
     _pipeline = ScanPipeline(
         cred_scanner=_cred_scanner,
         path_scanner=_path_scanner,
         cmd_scanner=_cmd_scanner,
+        encoding_scanner=_encoding_scanner,
+        echo_scanner=_echo_scanner,
     )
     app.state.pipeline = _pipeline
 
@@ -381,36 +412,67 @@ async def _init_orchestrator(app: FastAPI, settings, audit, pipeline, engine,
     _embedding_client = None
     _event_bus = None
 
-    # Ollama health check (BOOT-2) — verify worker LLM is reachable at startup
-    try:
-        import httpx
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.get(f"{settings.ollama_url}/api/tags")
-            if resp.status_code == 200:
-                models = resp.json().get("models", [])
-                model_names = [m.get("name", "?") for m in models]
-                _ollama_reachable = True
-                app.state.ollama_reachable = True
-                audit.info(
-                    "Ollama reachable, %d model(s) loaded: %s",
-                    len(model_names), ", ".join(model_names) or "(none)",
-                    extra={
-                        "event": "ollama_health_ok",
-                        "model_count": len(model_names),
-                        "models": model_names,
-                    },
-                )
-            else:
-                audit.warning(
-                    "Ollama health check returned HTTP %d",
-                    resp.status_code,
-                    extra={"event": "ollama_health_http_error", "status": resp.status_code},
-                )
-    except Exception as exc:
-        audit.warning(
-            "Ollama unreachable at startup: %s — worker requests will fail until Ollama is available",
-            exc,
-            extra={"event": "ollama_health_failed", "error": str(exc)},
+    # Ollama health check (BOOT-2) — verify worker LLM is reachable at startup.
+    # Retries 3x with 5s backoff, then FAILS STARTUP if unreachable.
+    _ollama_reachable = False
+    _ollama_max_retries = 3
+    _ollama_retry_delay = 5.0
+
+    for attempt in range(1, _ollama_max_retries + 1):
+        try:
+            import httpx
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                resp = await client.get(f"{settings.ollama_url}/api/tags")
+                if resp.status_code == 200:
+                    models = resp.json().get("models", [])
+                    model_names = [m.get("name", "?") for m in models]
+                    _ollama_reachable = True
+                    app.state.ollama_reachable = True
+                    configured_model = settings.ollama_model
+                    model_loaded = any(configured_model in name for name in model_names)
+                    audit.info(
+                        "Ollama reachable, %d model(s): %s",
+                        len(model_names), ", ".join(model_names) or "(none)",
+                        extra={
+                            "event": "ollama_health_ok",
+                            "attempt": attempt,
+                            "model_count": len(model_names),
+                            "models": model_names,
+                            "configured_model": configured_model,
+                            "configured_model_loaded": model_loaded,
+                        },
+                    )
+                    if not model_loaded:
+                        audit.warning(
+                            "Configured model '%s' not in Ollama — first request triggers load",
+                            configured_model,
+                            extra={"event": "ollama_model_not_loaded",
+                                   "configured_model": configured_model,
+                                   "available_models": model_names},
+                        )
+                    break
+                else:
+                    audit.warning(
+                        "Ollama health HTTP %d (attempt %d/%d)",
+                        resp.status_code, attempt, _ollama_max_retries,
+                        extra={"event": "ollama_health_http_error",
+                               "status": resp.status_code, "attempt": attempt},
+                    )
+        except Exception as exc:
+            audit.warning(
+                "Ollama unreachable (attempt %d/%d): %s",
+                attempt, _ollama_max_retries, exc,
+                extra={"event": "ollama_health_retry",
+                       "attempt": attempt, "error": str(exc)},
+            )
+        if attempt < _ollama_max_retries:
+            await asyncio.sleep(_ollama_retry_delay)
+
+    if not _ollama_reachable:
+        raise RuntimeError(
+            f"Ollama unreachable after {_ollama_max_retries} attempts "
+            f"(URL: {settings.ollama_url}). Cannot start — worker requests "
+            f"would fail. Check sentinel-ollama container."
         )
 
     # Initialize conversation analyzer (Phase 5) — session store created above
@@ -726,7 +788,7 @@ async def _init_channels(app: FastAPI, settings, audit, orchestrator, message_ro
         )
         app.state.routine_engine = _routine_engine
         await _routine_engine.start()
-        await _routine_engine.seed_defaults()
+        await _routine_engine.seed_defaults(user_id=1)  # Seed for default user
         # Wire routine engine into orchestrator (breaks circular dep:
         # RoutineEngine needs Orchestrator, Orchestrator needs RoutineEngine)
         orchestrator.set_routine_engine(_routine_engine)
@@ -984,6 +1046,7 @@ async def _init_channels(app: FastAPI, settings, audit, orchestrator, message_ro
         orchestrator=orchestrator,
         routine_engine=_routine_engine,
         get_metrics_fn=get_metrics_fn,
+        contact_store=contact_store,
     )
     security_routes.init(
         engine=engine,
@@ -1005,6 +1068,7 @@ async def _init_channels(app: FastAPI, settings, audit, orchestrator, message_ro
     routine_routes.init(
         routine_store=routine_store,
         routine_engine=_routine_engine,
+        scan_pipeline=pipeline,
     )
     webhook_routes.init(
         webhook_registry=webhook_registry,
@@ -1019,6 +1083,8 @@ async def _init_channels(app: FastAPI, settings, audit, orchestrator, message_ro
         event_bus=event_bus,
         heartbeat_manager=_heartbeat_manager,
         audit=audit,
+        orchestrator=orchestrator,
+        contact_store=contact_store,
     )
     websocket_routes.init(
         orchestrator=orchestrator,
@@ -1056,14 +1122,11 @@ async def _init_channels(app: FastAPI, settings, audit, orchestrator, message_ro
                 },
             )
 
-    # Serve user-created websites from /workspace/sites/
-    _sites_dir = Path(settings.workspace_path) / "sites"
-    _sites_dir.mkdir(exist_ok=True)
-    app.mount(
-        "/sites",
-        StaticFiles(directory=str(_sites_dir), html=True),
-        name="sites",
-    )
+    # Serve user-created websites from per-user workspace dirs.
+    # Sites live at /workspace/{user_id}/sites/{site_id}/ but are served at
+    # /sites/{site_id}/ for clean shareable URLs. The route handler searches
+    # across all user directories so any user's site is reachable.
+    _register_sites_route(app)
 
     # Mount static files LAST — the "/" catch-all must come after every
     # other route (API, WebSocket, MCP, red-team).  Routes added during
@@ -1083,6 +1146,60 @@ async def _init_channels(app: FastAPI, settings, audit, orchestrator, message_ro
     return redirect_server
 
 
+def _register_sites_route(app: FastAPI):
+    """Register a dynamic route for serving user-created sites.
+
+    Sites live at /workspace/{user_id}/sites/{site_id}/ but are served at
+    /sites/{site_id}/{path} for clean shareable URLs. The handler searches
+    across all user workspace directories so any user's site is reachable
+    without knowing which user created it.
+    """
+    import mimetypes
+
+    from fastapi import Request
+    from fastapi.responses import FileResponse, Response
+
+    workspace_base = Path(settings.workspace_path)
+
+    @app.get("/sites/{site_id}/{file_path:path}")
+    @app.get("/sites/{site_id}")
+    async def serve_site(request: Request, site_id: str, file_path: str = ""):
+        # Reject path traversal attempts
+        if ".." in site_id or ".." in file_path:
+            return Response(status_code=400, content="Invalid path")
+
+        # Search all user workspace dirs for this site
+        if not workspace_base.is_dir():
+            return Response(status_code=404, content="Site not found")
+
+        target_file = None
+        for user_dir in workspace_base.iterdir():
+            if not user_dir.is_dir() or not user_dir.name.isdigit():
+                continue
+            site_dir = user_dir / "sites" / site_id
+            if not site_dir.is_dir():
+                continue
+            # Resolve the requested file (default to index.html)
+            if file_path:
+                candidate = site_dir / file_path
+            else:
+                candidate = site_dir / "index.html"
+            if candidate.is_file():
+                # Ensure resolved path is within the site dir (symlink guard)
+                try:
+                    candidate.resolve().relative_to(site_dir.resolve())
+                except ValueError:
+                    return Response(status_code=400, content="Invalid path")
+                target_file = candidate
+                break
+
+        if target_file is None:
+            return Response(status_code=404, content="Site not found")
+
+        content_type = mimetypes.guess_type(str(target_file))[0] or "application/octet-stream"
+        return FileResponse(str(target_file), media_type=content_type)
+
+
 async def _shutdown(app: FastAPI, audit, redirect_server=None):
     """Execute the 11-step shutdown sequence.
 
@@ -1090,6 +1207,9 @@ async def _shutdown(app: FastAPI, audit, redirect_server=None):
     for components that may not have been initialized.
     Order is critical — see inline comments for rationale.
     """
+    # Guard against audit=None (partial startup failure) — fall back to logger
+    if audit is None:
+        audit = logger
     global _shutting_down
 
     # 1. Set shutdown flag — reject new requests immediately
@@ -1214,65 +1334,129 @@ async def _shutdown(app: FastAPI, audit, redirect_server=None):
     audit.info("Shutting down sentinel-controller", extra={"event": "shutdown"})
 
 
+async def _bootstrap_owner(admin_pool) -> None:
+    """Seed user 1 (owner) on first run if no users exist.
+
+    Reads the PIN from SENTINEL_PIN_FILE (default: /run/secrets/sentinel_pin),
+    hashes it with PinVerifier, and inserts the owner row with must_change_pin=TRUE
+    so the first login immediately prompts a PIN change.
+
+    Uses admin_pool (sentinel_owner role) because there is no authenticated user
+    context at startup — RLS would block the INSERT via the app pool.
+    """
+    async with admin_pool.acquire() as conn:
+        count = await conn.fetchval("SELECT COUNT(*) FROM users")
+        if count > 0:
+            return  # Already bootstrapped — skip
+
+    pin_path = settings.pin_file
+    if not __import__("os").path.exists(pin_path):
+        logging.getLogger("sentinel.audit").warning(
+            "No PIN file at %s — cannot bootstrap owner", pin_path,
+            extra={"event": "bootstrap_skipped", "reason": "no_pin_file"},
+        )
+        return
+
+    with open(pin_path) as f:
+        raw_pin = f.read().strip()
+
+    # Hash immediately — plaintext is never stored (H-002)
+    pin_hash = PinVerifier(raw_pin).to_stored()
+    del raw_pin
+
+    async with admin_pool.acquire() as conn:
+        await conn.execute(
+            """INSERT INTO users
+               (display_name, pin_hash, role, trust_level, is_active, must_change_pin)
+               VALUES ($1, $2, 'owner', 4, TRUE, TRUE)""",
+            settings.bootstrap_username, pin_hash,
+        )
+        logging.getLogger("sentinel.audit").info(
+            "Bootstrapped owner user: %s (must_change_pin=true)", settings.bootstrap_username,
+            extra={"event": "owner_bootstrapped", "display_name": settings.bootstrap_username},
+        )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    audit = setup_audit_logger(
-        log_dir=settings.log_dir,
-        log_level=settings.log_level,
-    )
-    app.state.audit = audit
-    app.state.shutting_down = False
-    app.state.ws_failure_tracker = websocket_routes._ws_failure_tracker
-    audit.info("Starting sentinel-controller", extra={"event": "startup"})
+    # Declare before try so they're visible in finally for cleanup
+    audit = None
+    redirect_server = None
+    try:
+        audit = setup_audit_logger(
+            log_dir=settings.log_dir,
+            log_level=settings.log_level,
+        )
+        app.state.audit = audit
+        app.state.shutting_down = False
+        app.state.ws_failure_tracker = websocket_routes._ws_failure_tracker
+        audit.info("Starting sentinel-controller", extra={"event": "startup"})
 
-    # Database
-    (pg_pool, admin_pool, session_store, memory_store, episodic_store,
-     domain_summary_store, strategy_store, routine_store, contact_store,
-     webhook_registry, hybrid_search_fn,
-     get_metrics_fn) = await _init_database(app, settings, audit)
+        # Database
+        (pg_pool, admin_pool, session_store, memory_store, episodic_store,
+         domain_summary_store, strategy_store, routine_store, contact_store,
+         webhook_registry, hybrid_search_fn,
+         get_metrics_fn) = await _init_database(app, settings, audit)
 
-    # Security pipeline + scanners
-    pipeline, engine, pin_verifier, prompt_guard_loaded, semgrep_loaded = await _init_security(app, settings, audit)
+        # Bootstrap owner on first run — no-op if users already exist
+        await _bootstrap_owner(admin_pool)
 
-    # Orchestrator, integrations, optional services
-    (orchestrator, message_router, event_bus, sidecar, sandbox,
-     embedding_client, planner_available, ollama_reachable,
-     mcp_server, classifier, fast_path_executor) = await _init_orchestrator(
-        app, settings, audit, pipeline, engine, pg_pool,
-        session_store, memory_store, episodic_store, routine_store,
-        contact_store, _track_task)
+        # Security pipeline + scanners
+        pipeline, engine, pin_verifier, prompt_guard_loaded, semgrep_loaded = await _init_security(app, settings, audit)
 
-    # Channels, routines, heartbeat, route wiring
-    # RLS context for startup seeding (routines table INSERT requires valid user_id)
-    from sentinel.core.context import current_user_id
-    _startup_token = current_user_id.set(1)
-    redirect_server = await _init_channels(
-        app, settings, audit, orchestrator, message_router,
-        event_bus, pipeline, engine, pin_verifier, pg_pool,
-        session_store, memory_store, routine_store, contact_store,
-        webhook_registry, embedding_client, sidecar, sandbox,
-        prompt_guard_loaded, semgrep_loaded, ollama_reachable, planner_available,
-        hybrid_search_fn, get_metrics_fn, _track_task,
-        classifier=classifier, fast_path_executor=fast_path_executor,
-    )
-    current_user_id.reset(_startup_token)
+        # Orchestrator, integrations, optional services
+        (orchestrator, message_router, event_bus, sidecar, sandbox,
+         embedding_client, planner_available, ollama_reachable,
+         mcp_server, classifier, fast_path_executor) = await _init_orchestrator(
+            app, settings, audit, pipeline, engine, pg_pool,
+            session_store, memory_store, episodic_store, routine_store,
+            contact_store, _track_task)
 
-    # Wire episodic store for enriched step-level memory chunks
-    # (must be after _init_channels where orchestrator is fully wired,
-    # and in lifespan() where episodic_store is in scope)
-    orchestrator.set_episodic_store(episodic_store)
+        # Channels, routines, heartbeat, route wiring
+        # RLS context for startup seeding (routines table INSERT requires valid user_id)
+        from sentinel.core.context import current_user_id
+        _startup_token = current_user_id.set(1)
+        redirect_server = await _init_channels(
+            app, settings, audit, orchestrator, message_router,
+            event_bus, pipeline, engine, pin_verifier, pg_pool,
+            session_store, memory_store, routine_store, contact_store,
+            webhook_registry, embedding_client, sidecar, sandbox,
+            prompt_guard_loaded, semgrep_loaded, ollama_reachable, planner_available,
+            hybrid_search_fn, get_metrics_fn, _track_task,
+            classifier=classifier, fast_path_executor=fast_path_executor,
+        )
+        current_user_id.reset(_startup_token)
 
-    # Wire domain summary store for hierarchical context injection
-    orchestrator.set_domain_summary_store(domain_summary_store)
+        # Wire episodic store for enriched step-level memory chunks
+        # (must be after _init_channels where orchestrator is fully wired,
+        # and in lifespan() where episodic_store is in scope)
+        orchestrator.set_episodic_store(episodic_store)
+        # Wire episodic store into executor so anchor maps persist to episodic memory
+        _te = getattr(orchestrator, '_tool_executor', None)
+        if _te is not None:
+            _te.set_episodic_store(episodic_store)
 
-    # Wire strategy pattern store for strategy tracking
-    orchestrator.set_strategy_store(strategy_store)
+        # Wire domain summary store for hierarchical context injection
+        orchestrator.set_domain_summary_store(domain_summary_store)
 
-    # Initialize FlashRank reranker for episodic retrieval re-ranking
-    # (~4MB ONNX model, CPU-only, graceful degradation if unavailable)
-    reranker = Reranker()
-    orchestrator.set_reranker(reranker)
+        # Wire strategy pattern store for strategy tracking
+        orchestrator.set_strategy_store(strategy_store)
 
-    yield
+        # Initialize FlashRank reranker for episodic retrieval re-ranking
+        # (~4MB ONNX model, CPU-only, graceful degradation if unavailable)
+        reranker = Reranker()
+        orchestrator.set_reranker(reranker)
 
-    await _shutdown(app, audit, redirect_server=redirect_server)
+        # Schedule periodic revocation cleanup (finding #11 — cleanup was never called)
+        # Infrastructure task — bare create_task() is correct (no user context needed)
+        _cleanup_task = asyncio.create_task(_periodic_revocation_cleanup())
+        _background_tasks.add(_cleanup_task)
+        _cleanup_task.add_done_callback(_background_tasks.discard)
+
+        yield  # App runs here
+
+    except Exception:
+        logger.exception("Fatal error during startup — cleaning up")
+        raise
+    finally:
+        await _shutdown(app, audit, redirect_server=redirect_server)

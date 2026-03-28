@@ -129,7 +129,7 @@ class TestSignalMessageReceive:
     async def test_signal_message_receive(self):
         """Signal message flows through to orchestrator.handle_task via ChannelRouter."""
         bus = EventBus()
-        cfg = SignalConfig(account="+0000000000")
+        cfg = SignalConfig(account="+0000000000", allowed_senders=["+1234567890"])
         channel = SignalChannel(cfg, event_bus=bus)
 
         reader = FakeSocketReader()
@@ -260,7 +260,7 @@ class TestSignalRateLimiting:
     """Rate limit enforcement: N messages per 60s window per sender."""
 
     async def test_signal_rate_limiting(self):
-        cfg = SignalConfig(rate_limit=3)
+        cfg = SignalConfig(rate_limit=3, allowed_senders=["+1111111111", "+2222222222"])
         channel = SignalChannel(cfg)
 
         reader = FakeSocketReader()

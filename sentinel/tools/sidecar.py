@@ -222,7 +222,8 @@ class SidecarClient:
 
         logger.info("Sidecar started", extra={"event": "sidecar_ready"})
 
-        # Hand remaining stderr to the background drain task
+        # Infrastructure: no user context needed — stderr drain is a process-
+        # level monitoring task that is not scoped to any particular user.
         self._stderr_task = asyncio.create_task(
             self._drain_stderr(self._process)
         )

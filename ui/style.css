@@ -479,10 +479,6 @@ body {
 
 /* ── Chat View ─────────────────────────────────────────────── */
 
-#view-chat {
-    /* Chat takes full height — messages area + input bar */
-}
-
 #messages {
     flex: 1;
     overflow-y: auto;
@@ -817,7 +813,6 @@ body {
 }
 
 .memory-card-actions {
-    display: flex;
     gap: 8px;
     margin-top: 8px;
     display: none;
@@ -1155,6 +1150,23 @@ body {
 .log-error .log-level, .log-critical .log-level { color: var(--red); }
 .log-debug .log-level { color: var(--text-muted); }
 
+.log-task-id {
+    flex-shrink: 0;
+    font-size: 10px;
+    font-family: monospace;
+    padding: 1px 5px;
+    border-radius: 3px;
+    background: var(--bg-secondary);
+    color: var(--accent);
+    cursor: pointer;
+    user-select: none;
+}
+
+.log-task-id:hover {
+    background: var(--accent);
+    color: #fff;
+}
+
 .log-msg {
     flex: 1;
     min-width: 0;
@@ -1434,6 +1446,343 @@ body {
     background: rgba(43, 133, 133, 0.5);
 }
 
+/* ── Settings Panel ────────────────────────────────────────── */
+
+.settings-overlay {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    background: rgba(0, 0, 0, 0.6);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 2500;
+}
+
+.settings-panel {
+    background: var(--bg-card);
+    border: 1px solid var(--border-card);
+    border-radius: 16px;
+    width: 90%;
+    max-width: 560px;
+    max-height: 85vh;
+    display: flex;
+    flex-direction: column;
+    box-shadow: var(--shadow-lg);
+    overflow: hidden;
+}
+
+.settings-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 16px 20px;
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+}
+
+.settings-header h2 {
+    font-size: 16px;
+    font-weight: 600;
+}
+
+.settings-close {
+    background: none;
+    border: none;
+    font-size: 22px;
+    color: var(--text-muted);
+    cursor: pointer;
+    padding: 4px 8px;
+    border-radius: 6px;
+    line-height: 1;
+    transition: color 0.15s, background 0.15s;
+}
+
+.settings-close:hover {
+    color: var(--text-primary);
+    background: var(--bg-tertiary);
+}
+
+.settings-tabs {
+    display: flex;
+    gap: 0;
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+}
+
+.settings-tab {
+    flex: 1;
+    padding: 10px 16px;
+    background: none;
+    border: none;
+    border-bottom: 2px solid transparent;
+    color: var(--text-muted);
+    font-family: inherit;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: color 0.15s, border-color 0.15s;
+}
+
+.settings-tab:hover {
+    color: var(--text-primary);
+}
+
+.settings-tab.active {
+    color: var(--accent);
+    border-bottom-color: var(--accent);
+}
+
+.settings-content {
+    padding: 20px;
+    overflow-y: auto;
+    flex: 1;
+}
+
+.settings-section {
+    margin-bottom: 16px;
+}
+
+.settings-label {
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text-muted);
+    margin-bottom: 4px;
+}
+
+.settings-value {
+    font-size: 14px;
+    color: var(--text-primary);
+}
+
+.settings-input {
+    width: 100%;
+    padding: 8px 10px;
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    color: var(--text-primary);
+    font-family: inherit;
+    font-size: 14px;
+    outline: none;
+    transition: border-color 0.2s, box-shadow 0.2s;
+    margin-bottom: 8px;
+}
+
+.settings-input:focus {
+    border-color: var(--accent);
+    box-shadow: var(--shadow-focus);
+}
+
+.settings-input::placeholder {
+    color: var(--text-muted);
+}
+
+.settings-btn-primary {
+    padding: 8px 16px;
+    background: var(--accent-bold);
+    color: #fff;
+    border: none;
+    border-radius: 8px;
+    font-family: inherit;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: opacity 0.2s;
+}
+
+.settings-btn-primary:hover { opacity: 0.85; }
+.settings-btn-primary:disabled { opacity: 0.4; cursor: not-allowed; }
+
+.settings-btn-secondary {
+    padding: 8px 16px;
+    background: var(--bg-tertiary);
+    color: var(--text-secondary);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    font-family: inherit;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background 0.15s;
+}
+
+.settings-btn-secondary:hover { background: var(--bg-hover); }
+
+.settings-result {
+    font-size: 13px;
+    margin-top: 8px;
+    min-height: 18px;
+}
+
+.settings-result.success { color: var(--green); }
+.settings-result.error { color: var(--red); }
+
+.settings-placeholder {
+    text-align: center;
+    padding: 32px 16px;
+    color: var(--text-muted);
+    font-size: 14px;
+}
+
+.settings-placeholder .settings-hint {
+    font-size: 12px;
+    margin-top: 8px;
+}
+
+/* PIN change form within profile tab */
+.pin-change-form {
+    max-width: 300px;
+}
+
+/* User management sub-tabs */
+.user-mgmt-subtabs {
+    display: flex;
+    gap: 0;
+    margin-bottom: 16px;
+    border-bottom: 1px solid var(--border);
+}
+
+.subtab {
+    padding: 6px 14px;
+    background: none;
+    border: none;
+    border-bottom: 2px solid transparent;
+    color: var(--text-muted);
+    font-family: inherit;
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: color 0.15s, border-color 0.15s;
+}
+
+.subtab:hover { color: var(--text-primary); }
+.subtab.active { color: var(--accent); border-bottom-color: var(--accent); }
+
+/* Users list header with New User button */
+.users-header {
+    display: flex;
+    justify-content: flex-end;
+    margin-bottom: 12px;
+}
+
+/* Users table */
+.users-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+}
+
+.users-table th,
+.users-table td {
+    text-align: left;
+    padding: 8px 10px;
+    border-bottom: 1px solid var(--border);
+}
+
+.users-table th {
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text-muted);
+    background: var(--bg-tertiary);
+}
+
+.users-table td {
+    color: var(--text-primary);
+}
+
+.user-status.active { color: var(--green); }
+.user-status.inactive { color: var(--text-muted); }
+
+.action-btn {
+    padding: 4px 10px;
+    background: none;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text-secondary);
+    font-family: inherit;
+    font-size: 11px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background 0.15s, color 0.15s;
+}
+
+.action-btn:hover {
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
+}
+
+.action-btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+/* Create user form */
+.create-user-form {
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 16px;
+    margin-bottom: 16px;
+}
+
+.create-user-form h3 {
+    font-size: 14px;
+    font-weight: 600;
+    margin-bottom: 12px;
+}
+
+.create-user-form .form-row {
+    margin-bottom: 10px;
+}
+
+.create-user-form .form-row label {
+    display: block;
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text-muted);
+    margin-bottom: 4px;
+}
+
+.create-user-actions {
+    display: flex;
+    gap: 8px;
+    margin-top: 12px;
+}
+
+/* PIN change banner */
+.pin-banner {
+    background: var(--yellow-bg);
+    color: var(--yellow);
+    font-size: 13px;
+    font-weight: 600;
+    padding: 10px 20px;
+    text-align: center;
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+}
+
+/* Username in nav */
+.user-name {
+    display: block;
+    padding: 4px 8px;
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--text-muted);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    margin-bottom: 2px;
+}
+
 /* ── Dark Mode ─────────────────────────────────────────────── */
 
 [data-theme="dark"] {
@@ -1658,6 +2007,7 @@ body {
 .trust-badge.tl-1 { background: var(--green-bg); color: var(--green-text); }
 .trust-badge.tl-2 { background: var(--yellow-bg); color: var(--yellow); }
 .trust-badge.tl-3 { background: var(--yellow-bg); color: var(--orange); }
+.trust-badge.tl-4 { background: var(--success); color: #fff; }
 
 .metric-grid {
     display: grid;

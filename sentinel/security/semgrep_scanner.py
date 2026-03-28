@@ -13,6 +13,7 @@ Public API matches the old codeshield.py for minimal caller changes:
 import asyncio
 import json
 import logging
+import os
 import shutil
 import sys
 import tempfile
@@ -25,7 +26,7 @@ logger = logging.getLogger("sentinel.audit")
 
 # Semgrep writes settings/logs to ~/.semgrep — redirect to /tmp for read-only containers
 _SEMGREP_ENV = {
-    **__import__("os").environ,
+    **os.environ,
     "XDG_CONFIG_HOME": "/tmp",
     "XDG_CACHE_HOME": "/tmp",
     "SEMGREP_SEND_METRICS": "off",
@@ -46,15 +47,19 @@ _WARN_ONLY_RULES: frozenset[str] = frozenset({
 _DEFAULT_RULES_DIR = Path(__file__).resolve().parent.parent.parent / "rules" / "semgrep"
 
 
-def _find_semgrep() -> str:
-    """Find the semgrep binary — checks venv bin dir first, then PATH."""
+def _find_semgrep() -> str | None:
+    """Find the semgrep binary — checks venv bin dir first, then PATH.
+
+    Returns the absolute path string if found, or None if the binary is
+    not available anywhere. Callers must check for None and handle the
+    missing-binary case explicitly (fail-closed).
+    """
     # Check alongside the running Python interpreter (handles venv installs)
     venv_bin = Path(sys.executable).parent / "semgrep"
     if venv_bin.is_file():
         return str(venv_bin)
-    # Fall back to system PATH
-    found = shutil.which("semgrep")
-    return found or "semgrep"
+    # Fall back to system PATH — returns None if not found
+    return shutil.which("semgrep")
 
 # Language → file extension mapping (code_extractor uses similar mapping)
 _LANG_EXTENSION: dict[str, str] = {
@@ -92,6 +97,18 @@ _rules_dir: Path = _DEFAULT_RULES_DIR
 _timeout: int = 30
 _init_lock = threading.Lock()  # B-002: protect module globals during initialization
 
+# Finding #8: Limit concurrent semgrep subprocesses (~100-200MB each)
+_MAX_CONCURRENT = 4  # max concurrent semgrep subprocesses
+_scan_semaphore: asyncio.Semaphore | None = None  # created lazily (needs event loop)
+
+
+def _get_semaphore() -> asyncio.Semaphore:
+    """Get or create the scan semaphore (lazy — needs running event loop)."""
+    global _scan_semaphore
+    if _scan_semaphore is None:
+        _scan_semaphore = asyncio.Semaphore(_MAX_CONCURRENT)
+    return _scan_semaphore
+
 
 def initialize(rules_dir: str | Path | None = None, timeout: int | None = None) -> bool:
     """Initialize the Semgrep scanner.
@@ -127,6 +144,16 @@ def initialize(rules_dir: str | Path | None = None, timeout: int | None = None) 
         try:
             import subprocess
             semgrep_bin = _find_semgrep()
+            # Finding #5: _find_semgrep now returns None when not found.
+            # Guard here so we emit a clear warning instead of passing None
+            # to subprocess.run (which would raise TypeError, not FileNotFoundError).
+            if semgrep_bin is None:
+                logger.warning(
+                    "semgrep CLI not found — Semgrep scanner disabled",
+                    extra={"event": "semgrep_not_found"},
+                )
+                _loaded = False
+                return False
             result = subprocess.run(
                 [semgrep_bin, "--version"],
                 capture_output=True, text=True, timeout=10,
@@ -267,77 +294,96 @@ async def _scan_single(
     if not config_dirs:
         return [], []
 
-    # Write code to temp file with correct extension
-    tmp_dir = None
-    try:
-        tmp_dir = tempfile.mkdtemp(prefix="sentinel-semgrep-")
-        tmp_file = Path(tmp_dir) / f"scan{extension}"
-        tmp_file.write_text(code, encoding="utf-8")
-
-        # Build semgrep command — one --config per rule directory
-        cmd = [_find_semgrep(), "--json", "--quiet", "--metrics", "off"]
-        for config_dir in config_dirs:
-            cmd.extend(["--config", str(config_dir)])
-        cmd.append(str(tmp_file))
-
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=_SEMGREP_ENV,
-        )
+    # Finding #8: Acquire semaphore before spawning subprocess to bound
+    # concurrent semgrep processes (each ~100-200MB RSS)
+    async with _get_semaphore():
+        # Write code to temp file with correct extension
+        tmp_dir = None
         try:
-            stdout, stderr = await asyncio.wait_for(
-                proc.communicate(), timeout=_timeout,
+            tmp_dir = tempfile.mkdtemp(prefix="sentinel-semgrep-")
+            tmp_file = Path(tmp_dir) / f"scan{extension}"
+            tmp_file.write_text(code, encoding="utf-8")
+
+            # Finding #5: Defence-in-depth check — the binary could be
+            # uninstalled after initialize() succeeded. Fail closed rather
+            # than passing None to create_subprocess_exec.
+            semgrep_bin = _find_semgrep()
+            if semgrep_bin is None:
+                return [ScanMatch(
+                    pattern_name="semgrep_not_found",
+                    matched_text="Semgrep binary not available",
+                    position=0,
+                )], []
+
+            # Build semgrep command — one --config per rule directory
+            cmd = [semgrep_bin, "--json", "--quiet", "--metrics", "off"]
+            for config_dir in config_dirs:
+                cmd.extend(["--config", str(config_dir)])
+            cmd.append(str(tmp_file))
+
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=_SEMGREP_ENV,
             )
-        except asyncio.CancelledError:
-            # SYS-5b: Kill subprocess on task cancellation (shutdown drain)
+            try:
+                stdout, stderr = await asyncio.wait_for(
+                    proc.communicate(), timeout=_timeout,
+                )
+            except asyncio.CancelledError:
+                # SYS-5b: Kill subprocess on task cancellation (shutdown drain)
+                try:
+                    proc.kill()
+                except (ProcessLookupError, OSError):
+                    pass
+                raise
+
+            if proc.returncode not in (0, 1):
+                # returncode 0 = no findings, 1 = findings found, anything else = error
+                # B-001: Fail CLOSED — return a blocking match so the pipeline blocks
+                logger.warning(
+                    "Semgrep exited with code %d: %s",
+                    proc.returncode,
+                    stderr.decode("utf-8", errors="replace")[:500],
+                    extra={
+                        "event": "semgrep_exit_error",
+                        "returncode": proc.returncode,
+                    },
+                )
+                return [ScanMatch(
+                    pattern_name="semgrep_scan_error",
+                    matched_text=f"Semgrep exited with error code {proc.returncode}",
+                    position=0,
+                )], []
+
+            return _parse_results(stdout.decode("utf-8", errors="replace"))
+
+        except asyncio.TimeoutError:
+            # B-001: Fail CLOSED — kill the subprocess and return a blocking match
             try:
                 proc.kill()
-            except (ProcessLookupError, OSError):
+                await proc.wait()
+            except (ProcessLookupError, OSError, UnboundLocalError):
                 pass
-            raise
-
-        if proc.returncode not in (0, 1):
-            # returncode 0 = no findings, 1 = findings found, anything else = error
-            # B-001: Fail CLOSED — return a blocking match so the pipeline blocks
             logger.warning(
-                "Semgrep exited with code %d: %s",
-                proc.returncode,
-                stderr.decode("utf-8", errors="replace")[:500],
-                extra={
-                    "event": "semgrep_exit_error",
-                    "returncode": proc.returncode,
-                },
+                "Semgrep scan timed out after %ds",
+                _timeout,
+                extra={"event": "semgrep_timeout", "timeout": _timeout},
             )
             return [ScanMatch(
-                pattern_name="semgrep_scan_error",
-                matched_text=f"Semgrep exited with error code {proc.returncode}",
+                pattern_name="semgrep_timeout",
+                matched_text=f"Semgrep scan timed out after {_timeout}s",
                 position=0,
             )], []
-
-        return _parse_results(stdout.decode("utf-8", errors="replace"))
-
-    except asyncio.TimeoutError:
-        # B-001: Fail CLOSED — return a blocking match on timeout
-        logger.warning(
-            "Semgrep scan timed out after %ds",
-            _timeout,
-            extra={"event": "semgrep_timeout", "timeout": _timeout},
-        )
-        return [ScanMatch(
-            pattern_name="semgrep_timeout",
-            matched_text=f"Semgrep scan timed out after {_timeout}s",
-            position=0,
-        )], []
-    finally:
-        # Clean up temp files.
-        # Safe to use ignore_errors=True here: on CancelledError, the
-        # subprocess is killed (lines 291-293) before this finally block
-        # runs, so no race between semgrep writing and rmtree cleaning.
-        if tmp_dir is not None:
-            import shutil
-            shutil.rmtree(tmp_dir, ignore_errors=True)
+        finally:
+            # Clean up temp files.
+            # Safe to use ignore_errors=True here: on CancelledError, the
+            # subprocess is killed (lines 291-293) before this finally block
+            # runs, so no race between semgrep writing and rmtree cleaning.
+            if tmp_dir is not None:
+                import shutil
+                shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 def _get_config_dirs(language: str) -> list[str]:

@@ -7,6 +7,7 @@ with socket reconnect, and all existing backoff/config/formatting tests.
 
 import asyncio
 import json
+import logging
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -435,7 +436,8 @@ class TestSignalChannelSend:
 class TestSignalChannelReadLoop:
     async def test_incoming_message_queued(self):
         """_read_loop parses signal-cli notifications and queues messages."""
-        cfg = SignalConfig()
+        # Allowlist must include the sender now that empty = deny-all (Finding #1)
+        cfg = SignalConfig(allowed_senders={"+1234567890"})
         channel = SignalChannel(cfg)
         reader = FakeSocketReader()
         channel._reader = reader
@@ -690,3 +692,109 @@ class TestSignalChannelHealthMonitor:
         assert d1 == 1.0
         assert d2 == 2.0
         assert d3 == 4.0
+
+
+# ── Allowlist default-deny tests ──────────────────────────────────
+
+
+class TestAllowlistDefaultDeny:
+    """Finding #1: Empty allowed_senders should mean deny-all, not allow-all."""
+
+    async def test_empty_allowlist_rejects_sender(self):
+        """When allowed_senders is empty (default), all senders are rejected."""
+        config = SignalConfig(
+            account="+15551234567",
+            allowed_senders=set(),
+        )
+        channel = SignalChannel(config=config, event_bus=EventBus())
+        reader = FakeSocketReader()
+        channel._reader = reader
+        channel._writer = MagicMock()
+        channel._running = True
+
+        reader.stop_on_eof(channel)
+        reader.push_line(_make_receive_notification("+15559999999", "hello"))
+        reader.push_eof()
+
+        await channel._read_loop()
+
+        assert channel._message_queue.empty()
+
+    async def test_populated_allowlist_accepts_listed_sender(self):
+        """When allowed_senders is populated, listed senders are accepted."""
+        config = SignalConfig(
+            account="+15551234567",
+            allowed_senders={"+15559999999"},
+        )
+        channel = SignalChannel(config=config, event_bus=EventBus())
+        reader = FakeSocketReader()
+        channel._reader = reader
+        channel._writer = MagicMock()
+        channel._running = True
+
+        reader.stop_on_eof(channel)
+        reader.push_line(_make_receive_notification("+15559999999", "hello"))
+        reader.push_eof()
+
+        await channel._read_loop()
+
+        assert not channel._message_queue.empty()
+
+    async def test_populated_allowlist_rejects_unlisted_sender(self):
+        """When allowed_senders is populated, unlisted senders are rejected."""
+        config = SignalConfig(
+            account="+15551234567",
+            allowed_senders={"+15551111111"},
+        )
+        channel = SignalChannel(config=config, event_bus=EventBus())
+        reader = FakeSocketReader()
+        channel._reader = reader
+        channel._writer = MagicMock()
+        channel._running = True
+
+        reader.stop_on_eof(channel)
+        reader.push_line(_make_receive_notification("+15559999999", "hello"))
+        reader.push_eof()
+
+        await channel._read_loop()
+
+        assert channel._message_queue.empty()
+
+
+# ── PII redaction tests ────────────────────────────────────────────
+
+
+class TestPIIRedaction:
+    """Finding #4: Phone numbers should not appear in full in logs."""
+
+    async def test_rejected_sender_logged_redacted(self, caplog):
+        """Unknown sender phone number is redacted to last 4 digits in logs."""
+        config = SignalConfig(
+            account="+15551234567",
+            allowed_senders={"+15551111111"},
+        )
+        channel = SignalChannel(config=config, event_bus=EventBus())
+        reader = FakeSocketReader()
+        channel._reader = reader
+        channel._writer = MagicMock()
+        channel._running = True
+
+        reader.stop_on_eof(channel)
+        # Sender is not in allowed_senders — should be rejected and logged
+        reader.push_line(_make_receive_notification("+15559876543", "hello"))
+        reader.push_eof()
+
+        with caplog.at_level(logging.INFO, logger="sentinel.audit"):
+            await channel._read_loop()
+
+        # Full phone number must NOT appear in any log record
+        all_log_text = " ".join(r.getMessage() for r in caplog.records) + " ".join(
+            str(r.__dict__) for r in caplog.records
+        )
+        assert "+15559876543" not in all_log_text, (
+            "Full phone number leaked into logs"
+        )
+        # Redacted form MUST appear
+        assert "***6543" in all_log_text, (
+            "Expected redacted form ***6543 not found in logs"
+        )

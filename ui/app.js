@@ -13,7 +13,6 @@
 
     var STORAGE_KEY = 'sentinel-history';
     var SESSION_KEY = 'sentinel-session-id';
-    var PIN_KEY = 'sentinel-pin';
     var TOKEN_KEY = 'sentinel-token';
     var POLL_INTERVAL = 2000;
 
@@ -28,21 +27,38 @@
     var WS_RECONNECT_BASE_MS = 1000;
     var wsTaskResolvers = {};
 
-    // ── PIN management (sessionStorage — cleared on tab close) ─────
-    // BH3-067: PIN is stored as plaintext in sessionStorage. This is vulnerable
-    // to XSS — any script on the same origin can read it. The proper fix is
-    // HttpOnly session cookies, but that requires server-side session management.
-    // Current mitigations: same-origin policy, PIN only lives for the tab lifetime,
-    // and the PIN auth is defence-in-depth (not the primary security boundary).
+    // ── JWT token management (localStorage — persists across tabs) ──
 
-    function getPin() { return sessionStorage.getItem(PIN_KEY); }
-    function setPin(pin) { sessionStorage.setItem(PIN_KEY, pin); }
-    function clearPin() { sessionStorage.removeItem(PIN_KEY); }
-
-    // ── Session token management (localStorage — persists across tabs) ──
     function getToken() { return localStorage.getItem(TOKEN_KEY); }
     function setToken(token) { localStorage.setItem(TOKEN_KEY, token); }
-    function clearToken() { localStorage.removeItem(TOKEN_KEY); }
+    function clearToken() {
+        localStorage.removeItem(TOKEN_KEY);
+        localStorage.removeItem('sentinel-user-id');
+        localStorage.removeItem('sentinel-role');
+        localStorage.removeItem('sentinel-display-name');
+    }
+
+    // ── Auth helpers ────────────────────────────────────────────
+    // Builds Authorization header from stored JWT. Redirects to login if missing.
+    function getAuthHeaders() {
+        var token = getToken();
+        if (!token) {
+            window.location.href = '/login.html';
+            return {};
+        }
+        return { 'Authorization': 'Bearer ' + token };
+    }
+
+    // Handles sliding token refresh and 401 redirects on every API response.
+    function handleAuthResponse(resp) {
+        var newToken = resp.headers.get('X-Refreshed-Token');
+        if (newToken) setToken(newToken);
+        if (resp.status === 401) {
+            clearToken();
+            window.location.href = '/login.html';
+        }
+        return resp;
+    }
 
     // ── Session ID (per-tab) ──────────────────────────────────────
 
@@ -304,7 +320,7 @@
             var attrs = el.attributes;
             for (var k = attrs.length - 1; k >= 0; k--) {
                 var name = attrs[k].name.toLowerCase();
-                if (name.startsWith('on')) {
+                if (name.startsWith('on') || name === 'style') {
                     el.removeAttribute(attrs[k].name);
                 } else if (name === 'href' && DANGEROUS_HREF_RE.test(attrs[k].value)) {
                     el.setAttribute('href', '#');
@@ -472,8 +488,8 @@
         for (var i = 0; i < stepResults.length; i++) {
             var step = stepResults[i];
             var status = step.status || 'unknown';
-            html += '<div class="step-result ' + status + '">';
-            html += '<div class="step-result-header">' + escapeHtml(step.step_id || 'Step') + ' — ' + status + '</div>';
+            html += '<div class="step-result ' + escapeHtml(status) + '">';
+            html += '<div class="step-result-header">' + escapeHtml(step.step_id || 'Step') + ' — ' + escapeHtml(status) + '</div>';
             if (step.content) html += '<div class="step-result-content">' + escapeHtml(step.content) + '</div>';
             if (step.error) html += '<div class="step-result-content" style="color:var(--red)">' + escapeHtml(step.error) + '</div>';
             html += '</div>';
@@ -489,8 +505,8 @@
         for (var i = 0; i < stepResults.length; i++) {
             var step = stepResults[i];
             var status = step.status || 'unknown';
-            html += '<div class="step-result ' + status + '">';
-            html += '<div class="step-result-header">' + escapeHtml(step.step_id || 'Step') + ' — ' + status + '</div>';
+            html += '<div class="step-result ' + escapeHtml(status) + '">';
+            html += '<div class="step-result-header">' + escapeHtml(step.step_id || 'Step') + ' — ' + escapeHtml(status) + '</div>';
             if (step.content) html += '<div class="step-result-content">' + escapeHtml(step.content) + '</div>';
             if (step.error) html += '<div class="step-result-content" style="color:var(--red)">' + escapeHtml(step.error) + '</div>';
             html += '</div>';
@@ -512,65 +528,41 @@
     }
 
     function apiPost(path, body) {
-        var headers = { 'Content-Type': 'application/json' };
-        var token = getToken();
-        if (token) { headers['Authorization'] = 'Bearer ' + token; }
-        var pin = getPin();
-        if (pin && !token) headers['X-Sentinel-Pin'] = pin;
+        var headers = Object.assign({ 'Content-Type': 'application/json' }, getAuthHeaders());
         return fetch('/api/' + path, {
             method: 'POST',
             headers: headers,
             body: JSON.stringify(body),
-        }).then(function (resp) {
-            if (resp.status === 401) {
-                clearPin();
-                showPinOverlay();
-                throw new Error('Authentication required');
-            }
+        }).then(handleAuthResponse).then(function (resp) {
+            if (resp.status === 401) throw new Error('Authentication required');
             return parseJsonResponse(resp);
         });
     }
 
     function apiGet(path) {
-        var headers = {};
-        var token = getToken();
-        if (token) { headers['Authorization'] = 'Bearer ' + token; }
-        var pin = getPin();
-        if (pin && !token) headers['X-Sentinel-Pin'] = pin;
-        return fetch('/api/' + path, { headers: headers }).then(function (resp) {
-            if (resp.status === 401) {
-                clearPin();
-                showPinOverlay();
-                throw new Error('Authentication required');
-            }
+        var headers = getAuthHeaders();
+        return fetch('/api/' + path, { headers: headers }).then(handleAuthResponse).then(function (resp) {
+            if (resp.status === 401) throw new Error('Authentication required');
             return parseJsonResponse(resp);
         });
     }
 
     function apiPatch(path, body) {
-        var headers = { 'Content-Type': 'application/json' };
-        var token = getToken();
-        if (token) { headers['Authorization'] = 'Bearer ' + token; }
-        var pin = getPin();
-        if (pin && !token) headers['X-Sentinel-Pin'] = pin;
+        var headers = Object.assign({ 'Content-Type': 'application/json' }, getAuthHeaders());
         return fetch('/api/' + path, {
             method: 'PATCH',
             headers: headers,
             body: JSON.stringify(body),
-        }).then(function (resp) {
-            if (resp.status === 401) { clearPin(); clearToken(); showPinOverlay(); throw new Error('Auth required'); }
+        }).then(handleAuthResponse).then(function (resp) {
+            if (resp.status === 401) throw new Error('Auth required');
             return parseJsonResponse(resp);
         });
     }
 
     function apiDelete(path) {
-        var headers = {};
-        var token = getToken();
-        if (token) { headers['Authorization'] = 'Bearer ' + token; }
-        var pin = getPin();
-        if (pin && !token) headers['X-Sentinel-Pin'] = pin;
-        return fetch('/api/' + path, { method: 'DELETE', headers: headers }).then(function (resp) {
-            if (resp.status === 401) { clearPin(); clearToken(); showPinOverlay(); throw new Error('Auth required'); }
+        var headers = getAuthHeaders();
+        return fetch('/api/' + path, { method: 'DELETE', headers: headers }).then(handleAuthResponse).then(function (resp) {
+            if (resp.status === 401) throw new Error('Auth required');
             return parseJsonResponse(resp);
         });
     }
@@ -589,7 +581,8 @@
                 var authTimeout = setTimeout(function () { socket.close(); resolve(false); }, 5000);
 
                 socket.onopen = function () {
-                    socket.send(JSON.stringify({ type: 'auth', pin: getPin() || '' }));
+                    // Send JWT as first message instead of query param (avoids token in server logs/URL)
+                    socket.send(JSON.stringify({ type: 'auth', token: getToken() }));
                 };
 
                 socket.onmessage = function (event) {
@@ -672,8 +665,8 @@
                     }
                     var inner = document.getElementById(resolver.incrementalStepsId + '-inner');
                     if (inner) {
-                        var stepHtml = '<div class="step-result ' + stepStatus + '">';
-                        stepHtml += '<div class="step-result-header">' + escapeHtml(data.step_id || 'Step') + ' — ' + stepStatus + '</div>';
+                        var stepHtml = '<div class="step-result ' + escapeHtml(stepStatus) + '">';
+                        stepHtml += '<div class="step-result-header">' + escapeHtml(data.step_id || 'Step') + ' — ' + escapeHtml(stepStatus) + '</div>';
                         if (stepContent) stepHtml += '<div class="step-result-content">' + escapeHtml(stepContent) + '</div>';
                         if (data.error) stepHtml += '<div class="step-result-content" style="color:var(--red)">' + escapeHtml(data.error) + '</div>';
                         stepHtml += '</div>';
@@ -766,7 +759,7 @@
     }
 
     function initTransport() {
-        if (getPin()) {
+        if (getToken()) {
             initWebSocket().then(function (ok) {
                 if (ok) { updateTransportStatus(); return; }
                 transport = 'http';
@@ -783,15 +776,20 @@
     var lastHealthData = null;
 
     function checkHealth() {
-        apiGet('health').then(function (data) {
+        // Health endpoint is exempt from auth on server — don't use apiGet
+        // (which calls getAuthHeaders and redirects to login if no token).
+        var headers = {};
+        var token = getToken();
+        if (token) headers['Authorization'] = 'Bearer ' + token;
+        fetch('/api/health', { headers: headers }).then(function (resp) { return resp.json(); }).then(function (data) {
             lastHealthData = data;
             if (data.status === 'ok') {
                 statusDot.className = 'status-dot healthy';
                 if (!transport) statusText.textContent = 'Online';
                 input.disabled = false;
                 sendBtn.disabled = false;
-                if (data.pin_auth_enabled && !getPin()) {
-                    showPinOverlay();
+                if (!getToken()) {
+                    window.location.href = '/login.html';
                 } else if (currentView === 'chat') {
                     input.focus();
                 }
@@ -918,7 +916,7 @@
             var a = activities[k];
             html += '<div class="activity-item">';
             html += '<span>' + escapeHtml(a.text.substring(0, 60)) + (a.text.length > 60 ? '...' : '') + '</span>';
-            html += '<span class="activity-status ' + a.status + '">' + a.status + '</span>';
+            html += '<span class="activity-status ' + escapeHtml(a.status) + '">' + escapeHtml(a.status) + '</span>';
             html += '</div>';
         }
         container.innerHTML = html;
@@ -1422,7 +1420,7 @@
             for (var i = 0; i < data.executions.length; i++) {
                 var ex = data.executions[i];
                 html += '<div class="execution-row">' +
-                    '<span class="execution-status ' + ex.status + '">' + ex.status + '</span>' +
+                    '<span class="execution-status ' + escapeHtml(ex.status) + '">' + escapeHtml(ex.status) + '</span>' +
                     '<span>' + escapeHtml(ex.triggered_by || '') + '</span>' +
                     '<span>' + formatTime(ex.started_at) + '</span>' +
                 '</div>';
@@ -1609,84 +1607,6 @@
         if (enabled && currentView === 'chat') input.focus();
     }
 
-    function sleep(ms) {
-        return new Promise(function (resolve) { setTimeout(resolve, ms); });
-    }
-
-    // ── PIN overlay ───────────────────────────────────────────────
-
-    function showPinOverlay() {
-        if (document.getElementById('pin-overlay')) return;
-
-        var overlay = document.createElement('div');
-        overlay.id = 'pin-overlay';
-        overlay.className = 'pin-overlay';
-        overlay.innerHTML =
-            '<div class="pin-dialog">' +
-            '<h2>Sentinel Login</h2>' +
-            '<p>Enter your username and PIN</p>' +
-            '<input type="text" id="login-username" autocomplete="username" placeholder="Username">' +
-            '<input type="password" id="pin-input" autocomplete="current-password" placeholder="PIN">' +
-            '<button class="btn btn-primary" id="pin-submit">Login</button>' +
-            '<div id="pin-error" class="pin-error"></div>' +
-            '</div>';
-
-        document.body.appendChild(overlay);
-
-        var usernameInput = document.getElementById('login-username');
-        var pinInput = document.getElementById('pin-input');
-        var pinSubmit = document.getElementById('pin-submit');
-
-        function submitLogin() {
-            var username = usernameInput.value.trim();
-            var pin = pinInput.value.trim();
-            if (!username) {
-                document.getElementById('pin-error').textContent = 'Username is required';
-                return;
-            }
-            if (!pin) {
-                document.getElementById('pin-error').textContent = 'PIN is required';
-                return;
-            }
-
-            // Try token-based login first
-            fetch('/api/auth/login', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json', 'Origin': location.origin },
-                body: JSON.stringify({ username: username, pin: pin }),
-            }).then(function (resp) {
-                if (resp.ok) return resp.json();
-                // Fallback to PIN-only auth (legacy single-user)
-                if (pin.length === 4 && /^\d{4}$/.test(pin)) {
-                    setPin(pin);
-                    overlay.remove();
-                    checkHealth();
-                    initTransport();
-                    return null;
-                }
-                throw new Error('Invalid credentials');
-            }).then(function (data) {
-                if (data && data.token) {
-                    setToken(data.token);
-                    overlay.remove();
-                    checkHealth();
-                    initTransport();
-                }
-            }).catch(function (err) {
-                document.getElementById('pin-error').textContent = err.message || 'Login failed';
-            });
-        }
-
-        pinSubmit.addEventListener('click', submitLogin);
-        pinInput.addEventListener('keydown', function (e) {
-            if (e.key === 'Enter') submitLogin();
-        });
-        usernameInput.addEventListener('keydown', function (e) {
-            if (e.key === 'Enter') pinInput.focus();
-        });
-        usernameInput.focus();
-    }
-
     // ── Log Viewer ───────────────────────────────────────────────
 
     var logEntries = document.getElementById('log-entries');
@@ -1697,70 +1617,133 @@
     var logPauseBtn = document.getElementById('log-pause-btn');
     var logClearBtn = document.getElementById('log-clear-btn');
 
-    var logEventSource = null;
+    var logAbortController = null;
     var logPaused = false;
     var logEntryCount = 0;
     var LOG_MAX_ENTRIES = 500;
+    var logRecentTasks = {}; // task_id → {preview, source, time}
 
     function initLogView() {
-        if (!logPaused && !logEventSource) {
+        if (!logPaused && !logAbortController) {
             connectLogStream();
         }
     }
 
     function connectLogStream() {
-        if (logEventSource) {
-            logEventSource.close();
-            logEventSource = null;
+        if (logAbortController) {
+            logAbortController.abort();
+            logAbortController = null;
         }
 
         var level = logLevelFilter ? logLevelFilter.value : 'INFO';
         var url = '/api/logs/stream?level=' + encodeURIComponent(level);
 
-        logEventSource = new EventSource(url);
+        logAbortController = new AbortController();
+        var signal = logAbortController.signal;
 
-        logEventSource.addEventListener('log', function (e) {
-            if (logPaused) return;
-            try {
-                var entry = JSON.parse(e.data);
-                appendLogEntry(entry);
-            } catch (err) {
-                // Ignore malformed events
+        if (logEmpty) logEmpty.style.display = 'none';
+
+        // Use fetch instead of EventSource so we can send the Authorization header.
+        // EventSource API does not support custom headers — the middleware would 401.
+        fetch(url, {
+            headers: { 'Authorization': 'Bearer ' + getToken() },
+            signal: signal,
+        }).then(function (resp) {
+            if (!resp.ok) {
+                throw new Error('Log stream HTTP ' + resp.status);
             }
-        });
+            var reader = resp.body.getReader();
+            var decoder = new TextDecoder();
+            var buffer = '';
 
-        logEventSource.onerror = function () {
+            function pump() {
+                return reader.read().then(function (result) {
+                    if (result.done) return;
+                    buffer += decoder.decode(result.value, { stream: true });
+                    // Normalise CRLF → LF (sse_starlette sends \r\n)
+                    buffer = buffer.replace(/\r\n/g, '\n');
+                    // Parse SSE lines: "event: log\ndata: {...}\n\n"
+                    var parts = buffer.split('\n\n');
+                    buffer = parts.pop(); // keep incomplete chunk
+                    parts.forEach(function (block) {
+                        if (logPaused) return;
+                        var dataLine = '';
+                        block.split('\n').forEach(function (line) {
+                            if (line.indexOf('data: ') === 0) dataLine = line.substring(6);
+                        });
+                        if (dataLine) {
+                            try {
+                                appendLogEntry(JSON.parse(dataLine));
+                            } catch (err) {
+                                // Ignore malformed events
+                            }
+                        }
+                    });
+                    return pump();
+                });
+            }
+            return pump();
+        }).catch(function (err) {
+            if (err.name === 'AbortError') return;
             if (logEmpty) {
-                logEmpty.textContent = 'Log stream disconnected. Reconnecting...';
+                logEmpty.textContent = 'Log stream disconnected. Click Resume to reconnect.';
                 logEmpty.style.display = '';
             }
-        };
+            logAbortController = null;
+        });
+    }
 
-        logEventSource.onopen = function () {
-            if (logEmpty) logEmpty.style.display = 'none';
-        };
+    function addLogTaskOption(taskId, preview, source) {
+        if (!logTaskFilter || logRecentTasks[taskId]) return;
+        var short = taskId.substring(0, 8);
+        var label = short + ' — ' + (preview || source || 'task').substring(0, 50);
+        logRecentTasks[taskId] = { preview: preview, source: source };
+        var opt = document.createElement('option');
+        opt.value = taskId;
+        opt.textContent = label;
+        // Insert after "All tasks" but before older entries (newest first)
+        if (logTaskFilter.options.length > 1) {
+            logTaskFilter.insertBefore(opt, logTaskFilter.options[1]);
+        } else {
+            logTaskFilter.appendChild(opt);
+        }
     }
 
     function appendLogEntry(entry) {
         if (logEmpty) logEmpty.style.display = 'none';
 
-        // Client-side task ID filter
-        var taskFilter = logTaskFilter ? logTaskFilter.value.trim() : '';
-        if (taskFilter && entry.event && entry.event.indexOf(taskFilter) === -1 &&
-            entry.message && entry.message.indexOf(taskFilter) === -1) {
+        var entryTaskId = entry.task_id || '';
+
+        // Track new tasks from task_received events for the dropdown
+        if (entry.event === 'task_received' && entryTaskId) {
+            addLogTaskOption(entryTaskId, entry.message || '', entry.source || '');
+        }
+
+        // Client-side task filter (now a select dropdown)
+        var taskFilter = logTaskFilter ? logTaskFilter.value : '';
+        if (taskFilter && entryTaskId !== taskFilter) {
             return;
         }
 
         var row = document.createElement('div');
         row.className = 'log-entry log-' + (entry.level || 'INFO').toLowerCase();
+        if (entryTaskId) row.setAttribute('data-task-id', entryTaskId);
 
         var ts = entry.timestamp ? new Date(entry.timestamp * 1000).toLocaleTimeString(
             undefined, { hour: '2-digit', minute: '2-digit', second: '2-digit' }
         ) : '--:--:--';
 
+        // Build task ID badge — clickable to filter
+        var taskBadge = '';
+        if (entryTaskId) {
+            taskBadge = '<span class="log-task-id" title="' + escapeHtml(entryTaskId) +
+                '">' + escapeHtml(entryTaskId.substring(0, 8)) + '</span>';
+        }
+
         row.innerHTML =
             '<span class="log-ts">' + ts + '</span>' +
             '<span class="log-level">' + escapeHtml(entry.level || 'INFO') + '</span>' +
+            taskBadge +
             '<span class="log-msg">' + escapeHtml(entry.message || '') + '</span>' +
             (entry.event ? '<span class="log-event">' + escapeHtml(entry.event) + '</span>' : '');
 
@@ -1779,14 +1762,28 @@
         if (logCount) logCount.textContent = logEntryCount + ' entries';
     }
 
+    // Click on a task ID badge to filter to that task
+    if (logEntries) {
+        logEntries.addEventListener('click', function (e) {
+            var badge = e.target.closest('.log-task-id');
+            if (!badge || !logTaskFilter) return;
+            var fullId = badge.getAttribute('title');
+            if (!fullId) return;
+            // Ensure the task is in the dropdown
+            addLogTaskOption(fullId, '', '');
+            logTaskFilter.value = fullId;
+            filterLogEntries();
+        });
+    }
+
     function toggleLogPause() {
         logPaused = !logPaused;
         if (logPauseBtn) {
             logPauseBtn.textContent = logPaused ? 'Resume' : 'Pause';
         }
-        if (logPaused && logEventSource) {
-            logEventSource.close();
-            logEventSource = null;
+        if (logPaused && logAbortController) {
+            logAbortController.abort();
+            logAbortController = null;
         }
         if (!logPaused) {
             connectLogStream();
@@ -1815,19 +1812,19 @@
         });
     }
     if (logTaskFilter) {
-        logTaskFilter.addEventListener('input', function () {
+        logTaskFilter.addEventListener('change', function () {
             filterLogEntries();
         });
     }
 
     function filterLogEntries() {
-        var filter = logTaskFilter ? logTaskFilter.value.trim().toLowerCase() : '';
+        var filter = logTaskFilter ? logTaskFilter.value : '';
         if (!logEntries) return;
         var rows = logEntries.querySelectorAll('.log-entry');
         var visible = 0;
         for (var i = 0; i < rows.length; i++) {
-            var text = rows[i].textContent.toLowerCase();
-            var show = !filter || text.indexOf(filter) !== -1;
+            var rowTaskId = rows[i].getAttribute('data-task-id') || '';
+            var show = !filter || rowTaskId === filter;
             rows[i].style.display = show ? '' : 'none';
             if (show) visible++;
         }
@@ -1851,7 +1848,8 @@
 
     // ── Clear history (legacy shortcut) ──────────────────────────
 
-    // Shift+click on nav brand clears history
+    // Legacy shortcut: shift+click on nav brand to clear conversation history.
+    // Kept as a power-user feature — no UI affordance, intentionally hidden.
     document.querySelector('.nav-brand').addEventListener('click', function (e) {
         if (e.shiftKey) {
             if (confirm('Clear conversation history?')) {
@@ -1927,4 +1925,12 @@
     checkHealth();
     setTimeout(initTransport, 1000);
     setInterval(checkHealth, 30000);
+
+    // Expose auth helpers for settings.js (loaded after this IIFE)
+    window.SentinelAuth = {
+        getAuthHeaders: getAuthHeaders,
+        handleAuthResponse: handleAuthResponse,
+        getToken: getToken,
+        clearToken: clearToken
+    };
 })();

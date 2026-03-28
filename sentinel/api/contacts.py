@@ -17,7 +17,7 @@ from enum import Enum
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, Field, field_validator
 
 from sentinel.api.role_guard import require_role
 from sentinel.core.context import current_user_id
@@ -42,7 +42,7 @@ class ChannelType(str, Enum):
 
 class UserCreate(BaseModel):
     display_name: str
-    pin: str | None = None
+    pin: str | None = Field(None, max_length=128)
 
     @field_validator("display_name")
     @classmethod
@@ -55,7 +55,7 @@ class UserCreate(BaseModel):
 
 class UserUpdate(BaseModel):
     display_name: str | None = None
-    pin: str | None = None
+    pin: str | None = Field(None, max_length=128)
 
 
 class UserResponse(BaseModel):
@@ -161,6 +161,8 @@ def _user_response(user: dict) -> dict:
     return {
         "user_id": user["user_id"],
         "display_name": user["display_name"],
+        "role": user.get("role", "user"),
+        "trust_level": user.get("trust_level"),
         "is_active": user["is_active"],
         "created_at": user["created_at"],
     }
@@ -172,6 +174,7 @@ def _user_response(user: dict) -> dict:
 @router.get("/users")
 async def list_users(active_only: bool = Query(True)):
     store = _get_contact_store()
+    await require_role("admin", store)
     users = await store.list_users(active_only=active_only)
     return [_user_response(u) for u in users]
 
@@ -179,6 +182,7 @@ async def list_users(active_only: bool = Query(True)):
 @router.get("/users/{user_id}")
 async def get_user(user_id: int):
     store = _get_contact_store()
+    await require_role("admin", store)
     user = await store.get_user(user_id)
     if user is None:
         raise HTTPException(status_code=404, detail="User not found")

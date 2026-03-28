@@ -20,6 +20,7 @@ from fastapi import APIRouter, Query
 from fastapi.responses import JSONResponse
 
 from sentinel.api.models import MemoryStoreRequest
+from sentinel.core.context import current_user_id
 from sentinel.memory.splitter import split_text
 
 logger = logging.getLogger("sentinel.api")
@@ -65,6 +66,8 @@ async def store_memory(req: MemoryStoreRequest):
             content={"status": "error", "reason": "Memory system not initialized"},
         )
 
+    uid = current_user_id.get()
+
     # Split text into chunks
     chunks = split_text(req.text)
     if not chunks:
@@ -89,6 +92,7 @@ async def store_memory(req: MemoryStoreRequest):
                 content=chunk_text,
                 source=req.source,
                 metadata=req.metadata,
+                user_id=uid,
             )
             chunk_ids.append(cid)
         return {
@@ -106,6 +110,7 @@ async def store_memory(req: MemoryStoreRequest):
             embedding=embedding,
             source=req.source,
             metadata=req.metadata,
+            user_id=uid,
         )
         chunk_ids.append(cid)
 
@@ -132,6 +137,8 @@ async def search_memory(
             content={"status": "error", "reason": "Memory system not initialized"},
         )
 
+    uid = current_user_id.get()
+
     # Try to embed the query for vector search; fall back to full-text-only
     query_embedding = None
     if _embedding_client is not None:
@@ -143,6 +150,7 @@ async def search_memory(
     results = await _hybrid_search_fn(
         query=query,
         embedding=query_embedding,
+        user_id=uid,
         k=k,
     )
 
@@ -177,7 +185,8 @@ async def list_memory_chunks(
             content={"status": "error", "reason": "Memory system not initialized"},
         )
 
-    chunks = await _memory_store.list_chunks(limit=limit, offset=offset)
+    uid = current_user_id.get()
+    chunks = await _memory_store.list_chunks(user_id=uid, limit=limit, offset=offset)
     return {
         "status": "ok",
         "chunks": [
@@ -206,7 +215,8 @@ async def get_memory_chunk(chunk_id: str):
             content={"status": "error", "reason": "Memory system not initialized"},
         )
 
-    chunk = await _memory_store.get(chunk_id)
+    uid = current_user_id.get()
+    chunk = await _memory_store.get(chunk_id, user_id=uid)
     if chunk is None:
         return JSONResponse(
             status_code=404,
@@ -239,8 +249,9 @@ async def delete_memory_chunk(chunk_id: str):
             content={"status": "error", "reason": "Memory system not initialized"},
         )
 
+    uid = current_user_id.get()
     try:
-        deleted = await _memory_store.delete(chunk_id)
+        deleted = await _memory_store.delete(chunk_id, user_id=uid)
     except ValueError as exc:
         return JSONResponse(
             status_code=403,

@@ -24,6 +24,7 @@ from fastapi.responses import JSONResponse
 from sse_starlette.sse import EventSourceResponse
 
 from sentinel.channels.web import SSEWriter
+from sentinel.core.context import current_user_id
 
 # ── Router ──────────────────────────────────────────────────────────
 
@@ -34,6 +35,8 @@ router = APIRouter()
 _event_bus: Any = None
 _heartbeat_manager: Any = None
 _audit: Any = None
+_orchestrator: Any = None
+_contact_store: Any = None
 
 
 def init(
@@ -41,12 +44,16 @@ def init(
     event_bus: Any = None,
     heartbeat_manager: Any = None,
     audit: Any = None,
+    orchestrator: Any = None,
+    contact_store: Any = None,
 ) -> None:
     """Inject dependencies — called once from app.py lifespan."""
-    global _event_bus, _heartbeat_manager, _audit
+    global _event_bus, _heartbeat_manager, _audit, _orchestrator, _contact_store
     _event_bus = event_bus
     _heartbeat_manager = heartbeat_manager
     _audit = audit
+    _orchestrator = orchestrator
+    _contact_store = contact_store
 
 
 # ── Accessors ──────────────────────────────────────────────────────
@@ -91,11 +98,13 @@ class LogSSEWriter:
                     "level": record.levelname,
                     "message": record.getMessage(),
                     "event": getattr(record, "event", ""),
+                    "task_id": getattr(record, "task_id", ""),
+                    "source": getattr(record, "source", ""),
                 }
                 try:
                     writer._queue.put_nowait(entry)
                 except asyncio.QueueFull:
-                    pass  # Drop oldest if consumer is too slow
+                    pass  # Drop if consumer is too slow
 
         self._handler = _QueueHandler()
         self._handler.setLevel(self._min_level)
@@ -143,12 +152,22 @@ async def get_heartbeat():
 
 @router.get("/events")
 async def sse_events(request: Request, task_id: str = Query(..., min_length=1)):
-    """SSE stream for real-time task updates. PIN auth enforced by middleware."""
+    """SSE stream for real-time task updates. Auth enforced by middleware."""
     if _event_bus is None:
         return JSONResponse(
             status_code=503,
             content={"status": "error", "reason": "Event bus not initialized"},
         )
+
+    # Cross-user isolation: verify the requesting user owns this task
+    if _orchestrator is not None:
+        owner_id = _orchestrator.get_task_owner(task_id)
+        uid = current_user_id.get()
+        if owner_id is not None and owner_id != uid:
+            return JSONResponse(
+                status_code=403,
+                content={"error": "Not authorised for this task"},
+            )
 
     writer = SSEWriter(_event_bus)
     await writer.subscribe(task_id)
@@ -163,7 +182,12 @@ async def log_stream(
     request: Request,
     level: str = Query("INFO", pattern="^(DEBUG|INFO|WARNING|ERROR|CRITICAL)$"),
 ):
-    """SSE stream of audit log entries. PIN auth enforced by middleware."""
+    """SSE stream of audit log entries. Admin only."""
+    # Cross-user isolation: audit logs contain all users' data — restrict to admin+
+    if _contact_store is not None:
+        from sentinel.api.role_guard import require_role
+        await require_role("admin", _contact_store)
+
     min_level = getattr(logging, level.upper(), logging.INFO)
     writer = LogSSEWriter(min_level=min_level)
     writer.attach()

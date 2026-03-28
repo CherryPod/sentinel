@@ -149,6 +149,8 @@ async def a2a_endpoint(request: Request):
                     status_code=504,
                     content=jsonrpc_error(req_id, INTERNAL_ERROR, task_result.reason or "Task timed out"),
                 )
+            logger.info("A2A task received: %s", req_id,
+                        extra={"event": "a2a_task_received"})
             return JSONResponse(content=jsonrpc_success(req_id, a2a_task))
         except ValueError as exc:
             return JSONResponse(

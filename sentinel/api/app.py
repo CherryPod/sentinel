@@ -11,8 +11,8 @@ sync values back to this module via _sync_to_app_module().
 from fastapi import APIRouter, FastAPI, Request
 from fastapi.responses import JSONResponse
 from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
 
-from .auth import PinAuthMiddleware
 from .middleware import (
     CSRFMiddleware,
     RequestCorrelationMiddleware,
@@ -71,22 +71,21 @@ _track_task = lifecycle._track_task
 
 app = FastAPI(title="Sentinel Controller", lifespan=lifespan)
 app.state.limiter = limiter
+# SlowAPIMiddleware enforces @limiter.limit() decorators — without this, all
+# rate limit decorators are silently ignored (no-ops).
+app.add_middleware(SlowAPIMiddleware)
 
-# Middleware stack (outermost first): SecurityHeaders → RequestSizeLimit → CSRF → PinAuth → UserContext
+# Middleware stack (outermost first): SecurityHeaders → RequestSizeLimit → CSRF → UserContext
 # Starlette adds middleware as a stack: last added = outermost = runs first.
-# The lambda reads lifecycle._pin_verifier at call time — NOT the re-exported
-# copy in this module — so it sees the value set by _init_security() at runtime.
-# In tests, patch.object(app_module, "_pin_verifier", None) is still effective
-# because lifespan doesn't run (TestClient with no PG), so lifecycle._pin_verifier
-# stays None and the middleware correctly skips auth.
-app.add_middleware(PinAuthMiddleware, pin_verifier_getter=lambda: lifecycle._pin_verifier)
+# UserContextMiddleware is JWT-only (no PIN fallback). It reads contact_store
+# from request.app.state at dispatch time (wired by lifecycle.py during lifespan).
 app.add_middleware(
     CSRFMiddleware,
     allowed_origins=[o.strip() for o in settings.allowed_origins.split(",") if o.strip()],
 )
 app.add_middleware(RequestSizeLimitMiddleware, max_bytes=settings.max_request_bytes)
 app.add_middleware(SecurityHeadersMiddleware)
-app.add_middleware(UserContextMiddleware, contact_store=None)  # Wired by lifespan
+app.add_middleware(UserContextMiddleware)
 app.add_middleware(RequestCorrelationMiddleware)
 
 

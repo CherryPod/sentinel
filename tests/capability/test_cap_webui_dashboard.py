@@ -8,6 +8,7 @@ import pytest
 from unittest.mock import MagicMock, patch
 
 from starlette.testclient import TestClient
+from tests.conftest import auth_headers
 
 
 class TestDashboardHealth:
@@ -87,7 +88,7 @@ class TestDashboardSession:
 
         with patch("sentinel.api.routes.task._session_store", session_store):
             client = TestClient(app)
-            resp = client.get(f"/api/session/{session.session_id}")
+            resp = client.get(f"/api/session/{session.session_id}", headers=auth_headers())
             assert resp.status_code == 200
             data = resp.json()
 
@@ -106,7 +107,7 @@ class TestDashboardSession:
 
         with patch("sentinel.api.routes.task._session_store", session_store):
             client = TestClient(app)
-            resp = client.get("/api/session/nonexistent-id")
-            assert resp.status_code == 200  # endpoint returns 200 with error field
+            resp = client.get("/api/session/nonexistent-id", headers=auth_headers())
+            assert resp.status_code == 404  # session not found returns 404
             data = resp.json()
             assert "error" in data

@@ -36,6 +36,7 @@ from sentinel.security.scanner import (
     CredentialScanner,
     EncodingNormalizationScanner,
     SensitivePathScanner,
+    VulnerabilityEchoScanner,
 )
 from sentinel.session.store import SessionStore
 from sentinel.tools.executor import ToolError, ToolExecutor
@@ -112,7 +113,8 @@ async def test_worker_model_down(mock_planner, mock_pipeline):
     assert result.status == "error"
     assert len(result.step_results) == 1  # step 2 never ran
     assert result.step_results[0].status == "error"
-    assert "LLM task failed" in result.step_results[0].error
+    # Error is sanitised via genericise_error() — exact text depends on exception
+    assert result.step_results[0].error is not None
 
 
 # ---------------------------------------------------------------------------
@@ -142,12 +144,15 @@ async def test_pipeline_scanner_crash(mock_planner):
         found=False, matches=[], scanner_name="encoding_normalization_scanner",
     )
 
+    echo = MagicMock(spec=VulnerabilityEchoScanner)
+
     pipeline = ScanPipeline(
         cred_scanner=cred,
         path_scanner=path,
         cmd_scanner=cmd,
-        worker=MagicMock(),
         encoding_scanner=enc,
+        echo_scanner=echo,
+        worker=MagicMock(),
     )
 
     orch = Orchestrator(planner=mock_planner, pipeline=pipeline)
@@ -188,12 +193,15 @@ async def test_pipeline_partial_scanner_degradation(mock_planner):
     enc = MagicMock(spec=EncodingNormalizationScanner)
     enc.scan.side_effect = RuntimeError("Decoder stack overflow")
 
+    echo = MagicMock(spec=VulnerabilityEchoScanner)
+
     pipeline = ScanPipeline(
         cred_scanner=cred,
         path_scanner=path,
         cmd_scanner=cmd,
-        worker=MagicMock(),
         encoding_scanner=enc,
+        echo_scanner=echo,
+        worker=MagicMock(),
     )
 
     orch = Orchestrator(planner=mock_planner, pipeline=pipeline)

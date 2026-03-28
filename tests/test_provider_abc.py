@@ -231,9 +231,18 @@ class TestTypeNarrowing:
             async def generate(self, prompt, system_prompt=None, model=None, marker="^"):
                 return "dummy"
 
+        from sentinel.security.scanner import CommandPatternScanner, EncodingNormalizationScanner, VulnerabilityEchoScanner
+        cred = CredentialScanner([])
+        path = SensitivePathScanner([])
+        cmd = CommandPatternScanner()
+        enc = EncodingNormalizationScanner(cred, path, cmd)
+        echo = VulnerabilityEchoScanner()
         pipeline = ScanPipeline(
-            cred_scanner=CredentialScanner([]),
-            path_scanner=SensitivePathScanner([]),
+            cred_scanner=cred,
+            path_scanner=path,
+            cmd_scanner=cmd,
+            encoding_scanner=enc,
+            echo_scanner=echo,
             worker=DummyWorker(),
         )
         assert pipeline._worker is not None
@@ -261,11 +270,21 @@ class TestTypeNarrowing:
                 return [[0.0] * 768 for _ in texts]
 
         from sentinel.security.pipeline import ScanPipeline
-        from sentinel.security.scanner import CredentialScanner, SensitivePathScanner
-
+        from sentinel.security.scanner import (
+            CommandPatternScanner, CredentialScanner, EncodingNormalizationScanner,
+            SensitivePathScanner, VulnerabilityEchoScanner,
+        )
+        cred = CredentialScanner([])
+        path = SensitivePathScanner([])
+        cmd = CommandPatternScanner()
+        enc = EncodingNormalizationScanner(cred, path, cmd)
+        echo = VulnerabilityEchoScanner()
         pipeline = ScanPipeline(
-            cred_scanner=CredentialScanner([]),
-            path_scanner=SensitivePathScanner([]),
+            cred_scanner=cred,
+            path_scanner=path,
+            cmd_scanner=cmd,
+            encoding_scanner=enc,
+            echo_scanner=echo,
         )
 
         orch = Orchestrator(

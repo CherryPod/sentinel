@@ -165,3 +165,86 @@ class TestUpdateContentInMemory:
         )
         assert child.trust_level == TrustLevel.UNTRUSTED
         assert not await store.is_trust_safe_for_execution(child.id)
+
+
+class TestInMemoryUserIsolation:
+    """Verify in-memory backend respects user_id filtering."""
+
+    @pytest.fixture
+    def store(self):
+        return ProvenanceStore(pool=None)
+
+    @pytest.mark.asyncio
+    async def test_get_tagged_data_filters_by_user(self, store):
+        tagged = await store.create_tagged_data(
+            "content", DataSource.USER, TrustLevel.TRUSTED, user_id=1,
+        )
+        result = await store.get_tagged_data(tagged.id, user_id=2)
+        assert result is None
+        result = await store.get_tagged_data(tagged.id, user_id=1)
+        assert result is not None
+        assert result.id == tagged.id
+
+    @pytest.mark.asyncio
+    async def test_get_tagged_data_no_user_returns_any(self, store):
+        tagged = await store.create_tagged_data(
+            "content", DataSource.USER, TrustLevel.TRUSTED, user_id=1,
+        )
+        result = await store.get_tagged_data(tagged.id)
+        assert result is not None
+
+    @pytest.mark.asyncio
+    async def test_update_content_filters_by_user(self, store):
+        tagged = await store.create_tagged_data(
+            "original", DataSource.USER, TrustLevel.TRUSTED, user_id=1,
+        )
+        result = await store.update_content(tagged.id, "modified", user_id=2)
+        assert result is False
+        item = await store.get_tagged_data(tagged.id)
+        assert item.content == "original"
+        result = await store.update_content(tagged.id, "modified", user_id=1)
+        assert result is True
+
+    @pytest.mark.asyncio
+    async def test_file_provenance_user_isolation(self, store):
+        await store.record_file_write("/workspace/test.txt", "data-1", content="aaa", user_id=1)
+        await store.record_file_write("/workspace/test.txt", "data-2", content="bbb", user_id=2)
+        result1 = await store.get_file_writer("/workspace/test.txt", user_id=1)
+        result2 = await store.get_file_writer("/workspace/test.txt", user_id=2)
+        assert result1 is not None
+        assert result2 is not None
+        assert result1[0] == "data-1"
+        assert result2[0] == "data-2"
+
+    @pytest.mark.asyncio
+    async def test_file_provenance_no_user_returns_any(self, store):
+        await store.record_file_write("/workspace/test.txt", "data-1", content="aaa", user_id=1)
+        result = await store.get_file_writer("/workspace/test.txt")
+        assert result is not None
+
+    @pytest.mark.asyncio
+    async def test_provenance_chain_walks_all_users(self, store):
+        """Regression guard — chain walk must cross user boundaries."""
+        parent = await store.create_tagged_data(
+            "parent", DataSource.USER, TrustLevel.UNTRUSTED, user_id=1,
+        )
+        child = await store.create_tagged_data(
+            "child", DataSource.TOOL, TrustLevel.TRUSTED,
+            parent_ids=[parent.id], user_id=2,
+        )
+        assert child.trust_level == TrustLevel.UNTRUSTED
+        chain = await store.get_provenance_chain(child.id)
+        assert len(chain) == 2
+
+    @pytest.mark.asyncio
+    async def test_provenance_chain_filters_final_result(self, store):
+        parent = await store.create_tagged_data(
+            "parent", DataSource.USER, TrustLevel.TRUSTED, user_id=1,
+        )
+        child = await store.create_tagged_data(
+            "child", DataSource.TOOL, TrustLevel.TRUSTED,
+            parent_ids=[parent.id], user_id=2,
+        )
+        chain = await store.get_provenance_chain(child.id, user_id=2)
+        assert len(chain) == 1
+        assert chain[0].id == child.id

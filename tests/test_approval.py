@@ -364,3 +364,144 @@ class TestApprovalUserIdIsolation:
             assert len(expired) == 1
         finally:
             current_user_id.reset(token)
+
+
+class TestCleanupExpiredAtomicity:
+    """Finding #2: cleanup_expired must not overwrite a just-approved decision."""
+
+    async def test_expired_entry_is_cleaned(self):
+        """Entries past their TTL are marked expired."""
+        mgr = ApprovalManager(pool=None, timeout=1)  # 1 second TTL
+        plan = _make_plan("Expiry test")
+        approval_id = await mgr.request_plan_approval(plan)
+
+        import time
+        time.sleep(1.1)
+
+        expired = await mgr._cleanup_expired()
+        assert any(e["approval_id"] == approval_id for e in expired)
+
+        result = await mgr.check_approval(approval_id)
+        assert result["status"] == "expired"
+
+    async def test_decided_entry_not_cleaned(self):
+        """Already-decided entries are not affected by cleanup."""
+        mgr = ApprovalManager(pool=None, timeout=1)
+        plan = _make_plan("Decision test")
+        approval_id = await mgr.request_plan_approval(plan)
+
+        await mgr.submit_approval(approval_id, granted=True)
+
+        import time
+        time.sleep(1.1)
+
+        expired = await mgr._cleanup_expired()
+        assert not any(e["approval_id"] == approval_id for e in expired)
+
+        result = await mgr.check_approval(approval_id)
+        assert result["status"] == "approved"
+
+
+class TestApprovalLogging:
+    """Approval audit finding #4: log source_key and truncated user_request."""
+
+    async def test_request_logs_source_key_and_request(self, caplog):
+        import logging
+        mgr = ApprovalManager(pool=None, timeout=300)
+        plan = _make_plan("Test plan")
+        with caplog.at_level(logging.INFO, logger="sentinel.audit"):
+            await mgr.request_plan_approval(
+                plan, source_key="signal:abc123", user_request="What's the weather in London?"
+            )
+
+        log_entry = next(
+            r for r in caplog.records
+            if getattr(r, "event", None) == "approval_requested"
+        )
+        assert log_entry.source_key == "signal:abc123"
+        assert "weather" in log_entry.user_request
+
+    async def test_request_truncates_long_user_request(self, caplog):
+        import logging
+        mgr = ApprovalManager(pool=None, timeout=300)
+        plan = _make_plan("Test plan")
+        long_request = "x" * 200
+        with caplog.at_level(logging.INFO, logger="sentinel.audit"):
+            await mgr.request_plan_approval(
+                plan, source_key="ui:sess1", user_request=long_request
+            )
+
+        log_entry = next(
+            r for r in caplog.records
+            if getattr(r, "event", None) == "approval_requested"
+        )
+        assert len(log_entry.user_request) <= 103  # 100 + "..."
+        assert log_entry.user_request.endswith("...")
+
+
+class TestApprovedByValidation:
+    """Verify approved_by is validated/sanitised (finding #8)."""
+
+    async def test_invalid_approved_by_sanitised(self):
+        """Invalid approved_by should be sanitised to 'unknown', not rejected."""
+        mgr = ApprovalManager(pool=None, timeout=300)
+        approval_id = await mgr.request_plan_approval(
+            _make_plan(), source_key="test", user_request="test",
+        )
+        result = await mgr.submit_approval(
+            approval_id, granted=True, approved_by="<script>alert(1)</script>",
+        )
+        assert result is True
+
+    async def test_valid_approved_by_accepted(self):
+        """Valid approved_by values should pass through unchanged."""
+        mgr = ApprovalManager(pool=None, timeout=300)
+        approval_id = await mgr.request_plan_approval(
+            _make_plan(), source_key="test", user_request="test",
+        )
+        result = await mgr.submit_approval(
+            approval_id, granted=True, approved_by="signal:user-123",
+        )
+        assert result is True
+
+    async def test_invalid_approved_by_stored_as_unknown(self):
+        """After sanitisation, decided_by stored as 'unknown' in memory entry."""
+        mgr = ApprovalManager(pool=None, timeout=300)
+        approval_id = await mgr.request_plan_approval(
+            _make_plan(), source_key="test", user_request="test",
+        )
+        await mgr.submit_approval(
+            approval_id, granted=True, approved_by="'; DROP TABLE approvals; --",
+        )
+        entry = mgr._mem[approval_id]
+        assert entry.decided_by == "unknown"
+
+
+class TestSubmitApprovalAtomicity:
+    """Finding #1: Concurrent submit_approval must not double-decide."""
+
+    @pytest.mark.asyncio
+    async def test_second_submit_returns_false(self):
+        """After one submit succeeds, a second submit for the same ID returns False."""
+        mgr = ApprovalManager(pool=None, timeout=300)
+        plan = _make_plan("Atomic test")
+        approval_id = await mgr.request_plan_approval(plan)
+
+        result1 = await mgr.submit_approval(approval_id, granted=True, reason="yes")
+        assert result1 is True
+
+        result2 = await mgr.submit_approval(approval_id, granted=False, reason="no")
+        assert result2 is False
+
+    @pytest.mark.asyncio
+    async def test_first_decision_preserved_after_double_submit(self):
+        """The first decision is the one that sticks."""
+        mgr = ApprovalManager(pool=None, timeout=300)
+        plan = _make_plan("Decision test")
+        approval_id = await mgr.request_plan_approval(plan)
+
+        await mgr.submit_approval(approval_id, granted=True, reason="approved first")
+        await mgr.submit_approval(approval_id, granted=False, reason="denied second")
+
+        result = await mgr.check_approval(approval_id)
+        assert result["status"] == "approved"

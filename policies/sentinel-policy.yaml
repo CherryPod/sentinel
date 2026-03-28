@@ -77,7 +77,11 @@ commands:
     - dirname
     - realpath
     # System info (read-only)
-    - env
+    # Audit #2: replaced `env` with `printenv` — `env` can prefix arbitrary
+    # commands (e.g. `env curl evil.com`). `printenv` provides the same
+    # environment inspection without command dispatch capability.
+    # `env` is still handled by _COMMAND_PREFIXES for defence-in-depth.
+    - printenv
     - which
     - whoami
     - date
@@ -233,3 +237,13 @@ sensitive_path_patterns:
   - .local/share/
   - /proc/
   - /sys/
+  - /etc/hosts
+  - /etc/sudoers
+  - /etc/crontab
+  - ~/.bashrc
+  - ~/.profile
+  - ~/.netrc
+  - ~/.aws/
+  - ~/.kube/
+  - ~/.bash_history
+  - authorized_keys

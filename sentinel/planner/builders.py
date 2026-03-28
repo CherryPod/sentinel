@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import re
+from collections import Counter
 from typing import TYPE_CHECKING
 
 from sentinel.core.models import (
@@ -573,6 +574,7 @@ async def build_learning_context(
     cross_session_token_budget: int,
     domain_summary_store=None,
     reranker=None,
+    episodic_store=None,
 ) -> str:
     """Build hierarchical learning context for the planner.
 
@@ -802,12 +804,53 @@ async def build_learning_context(
         # Convert RerankResult back to a duck-typed object with .content
         results = reranked
 
+    # Tier 2: Detailed plan history for the top match.
+    # Look up the episodic record via chunk_id → memory_chunks.metadata → record_id
+    detailed_section = ""
+    if results and episodic_store is not None and memory_store is not None:
+        try:
+            top_chunk_id = results[0].chunk_id
+            # Fetch memory chunk to get metadata.record_id
+            chunk = await memory_store.get(top_chunk_id)
+            if chunk and chunk.metadata and chunk.metadata.get("record_id"):
+                record_id = chunk.metadata["record_id"]
+                record = await episodic_store.get(record_id)
+                if record and record.plan_json:
+                    detailed_section = render_plan_history(
+                        record.plan_json,
+                        task_status=record.task_status,
+                        step_count=record.step_count,
+                        success_count=record.success_count,
+                        task_domain=record.task_domain,
+                    )
+                    logger.info(
+                        "plan_history: detailed rendering for record %s (%d phases)",
+                        record_id, len(record.plan_json.get("phases", [])),
+                        extra={
+                            "event": "plan_history_tier2_rendered",
+                            "record_id": record_id,
+                            "phase_count": len(record.plan_json.get("phases", [])),
+                        },
+                    )
+                else:
+                    logger.debug(
+                        "plan_history: top match %s has no plan_json, tier-2 skipped",
+                        record_id if record else top_chunk_id,
+                        extra={"event": "plan_history_tier2_skip"},
+                    )
+        except Exception as exc:
+            # Tier-2 is enrichment, not critical — don't break learning context
+            logger.debug(
+                "plan_history: tier-2 lookup failed (non-fatal)",
+                extra={"event": "plan_history_tier2_error", "error": str(exc)},
+            )
+
     # Accumulate results up to token budget (~4 chars per token)
     # Summary gets priority — subtract its length from the records budget
     budget = cross_session_token_budget * 4  # chars
     header = "[EPISODIC CONTEXT — previous task execution history:]"
     footer = "[END EPISODIC CONTEXT]"
-    used = len(header) + len(summary_section) + len(canonical_section) + len(footer)
+    used = len(header) + len(summary_section) + len(canonical_section) + len(detailed_section) + len(footer)
 
     record_lines = []
     for r in results:
@@ -820,7 +863,7 @@ async def build_learning_context(
     records_cut = len(results) - len(record_lines)
 
     # If no records fit and no summary, nothing to inject
-    if not record_lines and not summary_section and not canonical_section:
+    if not record_lines and not summary_section and not canonical_section and not detailed_section:
         logger.debug(
             "Learning context empty — no records fit budget",
             extra={
@@ -831,15 +874,45 @@ async def build_learning_context(
         )
         return ""
 
-    # Combine: header, summary (if any), records (if any), footer
+    # Combine: header, summary (if any), detailed (if any), records (if any), footer
     parts = [header]
     if summary_section:
         parts.append(summary_section.rstrip())
     if canonical_section:
         parts.append(canonical_section.rstrip())
+    if detailed_section:
+        parts.append(detailed_section.rstrip())
     parts.extend(record_lines)
     parts.append(footer)
     context = "\n".join(parts)
+
+    # --- Anchor maps ---
+    if episodic_store is not None:
+        try:
+            import json as _json
+            _anchor_facts = await episodic_store.search_facts(
+                query="anchor_map",
+                fact_type="anchor_map",
+                user_id=user_id if user_id else 1,
+                limit=20,
+            )
+            if _anchor_facts:
+                _anchor_lines: list[str] = []
+                for _fact in _anchor_facts:
+                    try:
+                        _data = _json.loads(_fact.content)
+                        _anchor_lines.append(f"\n[ANCHOR MAP: {_fact.file_path}]")
+                        for _a in _data.get("anchors", []):
+                            _end = f" (pair: {_a['name']}-end)" if _a.get("has_end") else ""
+                            _anchor_lines.append(f"  {_a['name']} — {_a['description']}{_end}")
+                        _anchor_lines.append("[END ANCHOR MAP]")
+                    except (ValueError, KeyError):
+                        continue
+                if _anchor_lines:
+                    parts.append("\n".join(_anchor_lines))
+                    context = "\n".join(parts)
+        except Exception:
+            pass  # Non-fatal — planner works without anchor maps
 
     logger.debug(
         "Learning context built",
@@ -848,6 +921,7 @@ async def build_learning_context(
             "domain": domain,
             "has_summary": bool(summary_section),
             "has_canonical": bool(canonical_section),
+            "has_detailed": bool(detailed_section),
             "records_included": len(record_lines),
             "records_cut_by_budget": records_cut,
             "context_chars": len(context),
@@ -856,6 +930,128 @@ async def build_learning_context(
         },
     )
     return context
+
+
+def render_plan_history(
+    plan_json: dict | None,
+    task_status: str = "",
+    step_count: int = 0,
+    success_count: int = 0,
+    task_domain: str | None = None,
+) -> str:
+    """Render detailed plan evolution for the top episodic match (tier-2).
+
+    Produces a structured block showing each plan phase with step-by-step
+    outcomes, worker prompt excerpts, failure fingerprints, and file size
+    deltas. Only called for the highest-scoring episodic match.
+
+    All data is planner-generated or F1 metadata (privacy-safe).
+    """
+    if not plan_json or not plan_json.get("phases"):
+        return ""
+
+    phases = plan_json["phases"]
+    user_req = plan_json.get("user_request_full", "")
+
+    lines: list[str] = []
+    lines.append("[DETAILED PLAN HISTORY -- most relevant past task]")
+
+    # Header
+    domain_str = f" | Domain: {task_domain}" if task_domain else ""
+    lines.append(f'Request: "{user_req[:200]}"')
+    lines.append(
+        f"Overall: {task_status.upper()} ({success_count}/{step_count} steps){domain_str}"
+    )
+
+    # Track all failure fingerprints for the summary line
+    all_fingerprints: list[str] = []
+
+    for i, phase in enumerate(phases, 1):
+        lines.append("")
+        phase_name = phase.get("phase", f"phase_{i}")
+        trigger = phase.get("trigger")
+        trigger_step = phase.get("trigger_step")
+
+        if trigger:
+            lines.append(f"Phase {i} ({phase_name} -- triggered by {trigger_step} {trigger}):")
+        else:
+            lines.append(f"Phase {i} ({phase_name}):")
+
+        # Replan context summary (for continuations)
+        ctx = phase.get("replan_context_summary")
+        if ctx:
+            lines.append(f"  Context: {ctx[:300]}")
+
+        # Plan summary
+        plan_data = phase.get("plan", {})
+        summary = plan_data.get("summary", "")
+        if summary:
+            lines.append(f"  Summary: {summary[:150]}")
+
+        # Steps with outcomes
+        outcomes = phase.get("step_outcomes_summary", {})
+        for step in plan_data.get("steps", []):
+            step_id = step.get("id", "?")
+            step_type = step.get("type", "?")
+            tool = step.get("tool", "")
+            prompt = step.get("prompt", "")
+            output_var = step.get("output_var", "")
+            args = step.get("args", {})
+
+            outcome = outcomes.get(step_id, {})
+            status = outcome.get("status", "?").upper()
+            output_size = outcome.get("output_size")
+
+            # Build step line
+            tool_label = tool or step_type
+            args_hint = ""
+            if tool in ("file_patch", "file_write", "file_read") and args.get("anchor"):
+                args_hint = f" {args['anchor']}"
+            elif tool in ("file_patch",) and args.get("operation"):
+                args_hint = f" {args['operation']}"
+
+            var_str = f" -> {output_var}" if output_var else ""
+            size_str = f" ({output_size} bytes)" if output_size else ""
+
+            # File size delta for file operations
+            fs_before = outcome.get("file_size_before")
+            fs_after = outcome.get("file_size_after")
+            if fs_before is not None and fs_after is not None:
+                size_str = f" ({fs_before}->{fs_after} bytes)"
+
+            step_line = f"  {step_id} [{tool_label}{args_hint}]{var_str}: {status}{size_str}"
+
+            # Worker prompt excerpt for llm_task steps (truncated to ~80 chars)
+            if step_type == "llm_task" and prompt:
+                prompt_excerpt = prompt[:80].replace("\n", " ")
+                if len(prompt) > 80:
+                    prompt_excerpt += "..."
+                step_line = f'  {step_id} [{tool_label}] "{prompt_excerpt}"{var_str}: {status}{size_str}'
+
+            lines.append(step_line)
+
+            # Error detail and fingerprint for failures
+            error = outcome.get("error")
+            if error:
+                lines.append(f"    Error: {error[:120]}")
+            fp = outcome.get("failure_fingerprint")
+            if fp:
+                all_fingerprints.append(fp)
+                lines.append(f"    Failure fingerprint: {fp}")
+
+    # Repeated fingerprint summary
+    lines.append("")
+    fp_counts = Counter(all_fingerprints)
+    repeated = {fp: count for fp, count in fp_counts.items() if count >= 2}
+    if repeated:
+        repeated_str = ", ".join(f"{fp} ({count}x)" for fp, count in repeated.items())
+        lines.append(f"Repeated failure fingerprints: {repeated_str}")
+    else:
+        lines.append("Repeated failure fingerprints: none")
+
+    lines.append("[END DETAILED PLAN HISTORY]")
+
+    return "\n".join(lines)
 
 
 # Backward compatibility alias — orchestrator.py imports this name

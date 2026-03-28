@@ -21,10 +21,12 @@ def _reset_semgrep():
     semgrep_scanner._loaded = False
     semgrep_scanner._rules_dir = semgrep_scanner._DEFAULT_RULES_DIR
     semgrep_scanner._timeout = 30
+    semgrep_scanner._scan_semaphore = None
     yield
     semgrep_scanner._loaded = False
     semgrep_scanner._rules_dir = semgrep_scanner._DEFAULT_RULES_DIR
     semgrep_scanner._timeout = 30
+    semgrep_scanner._scan_semaphore = None
 
 
 # ---------------------------------------------------------------------------
@@ -102,6 +104,30 @@ class TestSemgrepScan:
         assert result.found is True
         assert len(result.matches) == 1
         assert result.matches[0].pattern_name == "semgrep_scan_error"
+
+    @pytest.mark.asyncio
+    async def test_timeout_kills_subprocess(self):
+        """On asyncio.TimeoutError, the semgrep subprocess must be killed (Finding #9)."""
+        semgrep_scanner._loaded = True
+        semgrep_scanner._timeout = 0.01  # Force a near-instant timeout
+
+        proc = AsyncMock()
+        proc.returncode = None
+
+        # communicate() sleeps forever so wait_for() times out and cancels it
+        async def _hang(*args, **kwargs):
+            await asyncio.sleep(9999)
+
+        proc.communicate = _hang
+        proc.kill = MagicMock()        # synchronous kill()
+        proc.wait = AsyncMock()        # async wait() after kill
+
+        with patch("asyncio.create_subprocess_exec", return_value=proc):
+            result = await semgrep_scanner.scan("import os", "python")
+
+        assert result.found is True
+        assert result.matches[0].pattern_name == "semgrep_timeout"
+        proc.kill.assert_called_once()
 
     def test_is_loaded_false_by_default(self):
         assert semgrep_scanner.is_loaded() is False
@@ -295,6 +321,42 @@ class TestSemgrepInitialize:
         result = semgrep_scanner.initialize(rules_dir="/nonexistent/path")
         assert result is False
         assert semgrep_scanner.is_loaded() is False
+
+
+class TestFindSemgrep:
+    """Finding #5: _find_semgrep should return None when binary not found."""
+
+    def test_returns_none_when_not_found(self):
+        """Returns None when semgrep is absent from venv dir and PATH."""
+        with patch("sentinel.security.semgrep_scanner.shutil.which", return_value=None):
+            with patch.object(Path, "is_file", return_value=False):
+                result = semgrep_scanner._find_semgrep()
+        assert result is None
+
+    def test_returns_path_when_in_path(self):
+        """Returns the PATH-resolved binary path when semgrep is on PATH."""
+        with patch("sentinel.security.semgrep_scanner.shutil.which", return_value="/usr/bin/semgrep"):
+            with patch.object(Path, "is_file", return_value=False):
+                result = semgrep_scanner._find_semgrep()
+        assert result == "/usr/bin/semgrep"
+
+    def test_initialize_returns_false_when_binary_missing(self):
+        """initialize() returns False (not an exception) when _find_semgrep returns None."""
+        with patch("sentinel.security.semgrep_scanner._find_semgrep", return_value=None):
+            result = semgrep_scanner.initialize()
+        assert result is False
+        assert semgrep_scanner.is_loaded() is False
+
+    @pytest.mark.asyncio
+    async def test_scan_single_fails_closed_when_binary_missing(self):
+        """_scan_single returns a blocking ScanMatch when _find_semgrep returns None (defence-in-depth)."""
+        semgrep_scanner._loaded = True
+        with patch("sentinel.security.semgrep_scanner._find_semgrep", return_value=None):
+            result = await semgrep_scanner.scan("print('hi')", "python")
+        # Must block, not pass
+        assert result.found is True
+        assert len(result.matches) == 1
+        assert result.matches[0].pattern_name == "semgrep_not_found"
 
 
 # ===========================================================================
@@ -755,3 +817,51 @@ class TestSemgrepWarnOnly:
             "insecure-cookie",
         }
         assert semgrep_scanner._WARN_ONLY_RULES == expected
+
+
+# ===========================================================================
+# Concurrency limit tests — Finding #8
+# ===========================================================================
+
+
+class TestSemgrepConcurrencyLimit:
+    """Finding #8: Concurrent scans must be bounded by _MAX_CONCURRENT."""
+
+    @pytest.mark.asyncio
+    async def test_concurrent_scans_limited(self):
+        """Peak concurrency should not exceed _MAX_CONCURRENT."""
+        semgrep_scanner._loaded = True
+
+        peak = 0
+        current = 0
+
+        async def slow_communicate():
+            nonlocal peak, current
+            current += 1
+            peak = max(peak, current)
+            await asyncio.sleep(0.05)
+            current -= 1
+            return (_make_semgrep_output(), b"")
+
+        def make_slow_proc(*args, **kwargs):
+            proc = AsyncMock()
+            proc.returncode = 0
+            proc.communicate = slow_communicate
+            proc.kill = MagicMock()
+            proc.wait = AsyncMock()
+            return proc
+
+        # Launch multiple concurrent scan() calls via asyncio.gather —
+        # this is the real-world pattern (concurrent orchestrator requests).
+        # scan_blocks iterates sequentially, so a single call won't trigger
+        # concurrency; we need multiple independent scan() calls.
+        tasks = []
+        with patch("sentinel.security.semgrep_scanner.asyncio.create_subprocess_exec",
+                    side_effect=make_slow_proc):
+            for _ in range(8):
+                tasks.append(asyncio.create_task(
+                    semgrep_scanner.scan("print('hi')", "python")
+                ))
+            await asyncio.gather(*tasks)
+
+        assert peak <= semgrep_scanner._MAX_CONCURRENT

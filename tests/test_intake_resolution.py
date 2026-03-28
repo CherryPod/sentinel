@@ -12,11 +12,20 @@ import logging
 import pytest
 
 from sentinel.contacts.store import ContactStore
+from sentinel.core.context import current_user_id
 from sentinel.planner.intake import (
     ContactResolutionResult,
     _parse_source_key,
     resolve_contacts,
 )
+
+
+@pytest.fixture(autouse=True)
+def set_user_context():
+    """Set user context so non-messaging resolve_contacts reads user_id=1."""
+    token = current_user_id.set(1)
+    yield
+    current_user_id.reset(token)
 
 
 # ── Fixtures ───────────────────────────────────────────────────────

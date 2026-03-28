@@ -132,6 +132,7 @@ class ChannelRouter:
                 _consecutive_failures += 1
                 logger.warning(
                     "Channel send failed",
+                    exc_info=True,
                     extra={
                         "event": "channel_send_failed",
                         "channel": channel.channel_type,
@@ -143,6 +144,7 @@ class ChannelRouter:
                 if _consecutive_failures >= _max_failures:
                     logger.error(
                         "Channel circuit breaker tripped — unsubscribing",
+                        exc_info=True,
                         extra={
                             "event": "channel_circuit_breaker",
                             "channel": channel.channel_type,

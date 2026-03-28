@@ -11,6 +11,7 @@ from sentinel.api.auth import PinVerifier
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 from fastapi.testclient import TestClient
+from tests.conftest import auth_headers
 
 # Valid Origin header for CSRF middleware — matches settings.allowed_origins default
 _ORIGIN = {"Origin": "https://localhost:3001"}
@@ -86,23 +87,16 @@ class TestHealthEndpoint:
     @patch("sentinel.api.lifecycle._semgrep_loaded", True)
     @patch("sentinel.api.lifecycle._planner_available", True)
     def test_health_endpoint_returns_all_components(self):
-        """GET /health returns status for all dashboard-required components."""
+        """GET /health returns minimal probe response (trimmed for security)."""
         from sentinel.api.app import app
         client = TestClient(app)
         resp = client.get("/health")
         assert resp.status_code == 200
         data = resp.json()
-        # All required keys for dashboard health cards
+        # Minimal probe response — no config/component details (finding #21)
         assert data["status"] == "ok"
-        assert "policy_loaded" in data
-        assert "prompt_guard_loaded" in data
-        assert "semgrep_loaded" in data
-        assert "planner_available" in data
-        assert "conversation_tracking" in data
-        assert "pin_auth_enabled" in data
-        # Phase A additions
-        assert "sidecar" in data
-        assert "signal" in data
+        assert "version" in data
+        assert "degraded" in data
 
 
 # ── PIN auth tests ──────────────────────────────────────────────
@@ -122,11 +116,9 @@ class TestPinAuth:
         assert resp.status_code == 401
 
     @pytest.mark.capability
-    @patch("sentinel.api.lifecycle._pin_verifier", PinVerifier("1234"))
-    @patch("sentinel.api.app._pin_verifier", PinVerifier("1234"))
     @patch("sentinel.api.routes.task._orchestrator", None)
     def test_pin_auth_accepts_valid_pin(self):
-        """POST /api/task with valid PIN is not rejected with 401.
+        """POST /api/task with valid JWT is not rejected with 401.
 
         The request may still fail (orchestrator not initialized) but
         auth should pass — we check it's NOT a 401.
@@ -136,7 +128,7 @@ class TestPinAuth:
         resp = client.post(
             "/api/task",
             json={"request": "Hello world"},
-            headers={"X-Sentinel-Pin": "1234", **_ORIGIN},
+            headers={**auth_headers(), **_ORIGIN},
         )
         # Should not be 401 (auth passed). May be 200 with error about orchestrator.
         assert resp.status_code != 401

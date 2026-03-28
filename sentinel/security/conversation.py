@@ -16,6 +16,7 @@ from difflib import SequenceMatcher
 
 from sentinel.core.config import settings
 from sentinel.core.context import get_task_id
+from sentinel.security.homoglyph import normalise_homoglyphs
 from sentinel.session.store import Session
 
 logger = logging.getLogger("sentinel.audit")
@@ -31,20 +32,28 @@ CAPABILITY_TIERS = {
     "exfiltrate": 5,
 }
 
-# Keywords that map to capability tiers
-TIER_KEYWORDS: dict[str, list[str]] = {
-    "observe": ["list", "show", "display", "status", "check", "info", "describe", "what is"],
-    "read": ["read", "cat", "view", "open", "get contents", "print file", "head", "tail", "less"],
-    "write": ["write", "create", "edit", "modify", "append", "save", "update file", "overwrite"],
-    "execute": ["run", "execute", "bash", "shell", "script", "command", "invoke", "launch"],
-    "persist": [
-        "cron", "crontab", "systemd", "service", "startup", "autostart", "schedule",
-        "daemon", "boot", "init.d", "rc.local", "persist", "backdoor",
-    ],
-    "exfiltrate": [
-        "curl", "wget", "upload", "send to", "post to", "exfil", "transfer out",
-        "base64 encode", "dns tunnel", "reverse shell", "nc -e", "netcat",
-    ],
+# Keywords that map to capability tiers.
+# Finding #2: Some keywords ("run", "curl", "shell") are common in dev contexts.
+# The 2-tier jump threshold in _check_escalation mitigates most FPs — e.g.
+# observe(0)→execute(3)=+3 tiers fires, but read(1)→execute(3)=+2 tiers is
+# borderline. Adding dev-context awareness would overcomplicate the heuristic
+# for marginal gain. Accepted trade-off.
+# Keywords that map to capability tiers (pre-compiled word-boundary patterns)
+TIER_KEYWORDS: dict[str, list[re.Pattern[str]]] = {
+    "observe": [re.compile(rf"\b{re.escape(kw)}\b", re.IGNORECASE) for kw in
+                ["list", "show", "display", "status", "check", "info", "describe", "what is"]],
+    "read": [re.compile(rf"\b{re.escape(kw)}\b", re.IGNORECASE) for kw in
+             ["read", "cat", "view", "open", "get contents", "print file", "head", "tail", "less"]],
+    "write": [re.compile(rf"\b{re.escape(kw)}\b", re.IGNORECASE) for kw in
+              ["write", "create", "edit", "modify", "append", "save", "update file", "overwrite"]],
+    "execute": [re.compile(rf"\b{re.escape(kw)}\b", re.IGNORECASE) for kw in
+                ["run", "execute", "bash", "shell", "script", "command", "invoke", "launch"]],
+    "persist": [re.compile(rf"\b{re.escape(kw)}\b", re.IGNORECASE) for kw in
+                ["cron", "crontab", "systemd", "service", "startup", "autostart", "schedule",
+                 "daemon", "boot", "init.d", "rc.local", "persist", "backdoor"]],
+    "exfiltrate": [re.compile(rf"\b{re.escape(kw)}\b", re.IGNORECASE) for kw in
+                   ["curl", "wget", "upload", "send to", "post to", "exfil", "transfer out",
+                    "base64 encode", "dns tunnel", "reverse shell", "nc -e", "netcat"]],
 }
 
 # ── Instruction override patterns ──────────────────────────────
@@ -92,53 +101,75 @@ def _sensitive_re(term: str, *, prefix: bool = False, literal: bool = False) -> 
     return re.compile(rf"\b{escaped}\b", re.IGNORECASE)
 
 
+# Finding #5: "token" and "secret" are intentionally broad — word boundary
+# prevents "tokenizer" but not "token count". These only score via
+# _check_sensitive_topic_acceleration (new category after benign turns) and
+# _check_context_building (combined with escalation), limiting FP blast radius.
+SENSITIVE_TOPIC_CATEGORIES: dict[str, list[re.Pattern[str]]] = {
+    "credential": [
+        _sensitive_re("password"),
+        _sensitive_re("secret"),
+        _sensitive_re("credential"),
+        _sensitive_re("api key"),
+        _sensitive_re("token"),
+        _sensitive_re("private key"),
+    ],
+    "system_file": [
+        _sensitive_re("shadow"),
+        _sensitive_re("passwd"),
+        _sensitive_re("/etc/shadow", literal=True),
+        _sensitive_re(".ssh", literal=True),
+        _sensitive_re("authorized_keys"),
+        _sensitive_re("/root/", literal=True),
+        _sensitive_re("/home/", literal=True),
+        _sensitive_re("/var/log/", literal=True),
+        _sensitive_re("bash_history"),
+        _sensitive_re(".bashrc", literal=True),
+        _sensitive_re("sudoers"),
+        _sensitive_re("auth.log"),
+    ],
+    "privilege": [
+        _sensitive_re("root access"),
+        _sensitive_re("sudo"),
+        _sensitive_re("privilege"),
+        _sensitive_re("escalat", prefix=True),
+        _sensitive_re("system access"),
+    ],
+    "attack_tool": [
+        _sensitive_re("reverse shell"),
+        _sensitive_re("backdoor"),
+        _sensitive_re("exploit"),
+        _sensitive_re("payload"),
+        _sensitive_re("malware"),
+    ],
+    "control_tampering": [
+        _sensitive_re("disable security"),
+        _sensitive_re("disable firewall"),
+        _sensitive_re("disable logging"),
+        _sensitive_re("delete logs"),
+        _sensitive_re("clear history"),
+        _sensitive_re("cover tracks"),
+    ],
+}
+
+# Flat list for backward compatibility with _has_sensitive_topic()
 SENSITIVE_TOPIC_PATTERNS: list[re.Pattern[str]] = [
-    # Credential / key terms
-    _sensitive_re("password"),
-    _sensitive_re("secret"),
-    _sensitive_re("credential"),
-    _sensitive_re("api key"),
-    _sensitive_re("token"),
-    _sensitive_re("private key"),
-    # System files
-    _sensitive_re("shadow"),
-    _sensitive_re("passwd"),
-    _sensitive_re("/etc/shadow", literal=True),
-    _sensitive_re(".ssh", literal=True),
-    _sensitive_re("authorized_keys"),
-    # Privilege
-    _sensitive_re("root access"),
-    _sensitive_re("sudo"),
-    _sensitive_re("privilege"),
-    _sensitive_re("escalat", prefix=True),  # escalate, escalation, ...
-    # Attack tools
-    _sensitive_re("reverse shell"),
-    _sensitive_re("backdoor"),
-    _sensitive_re("exploit"),
-    _sensitive_re("payload"),
-    _sensitive_re("malware"),
-    # Security control tampering
-    _sensitive_re("disable security"),
-    _sensitive_re("disable firewall"),
-    _sensitive_re("disable logging"),
-    _sensitive_re("delete logs"),
-    _sensitive_re("clear history"),
-    _sensitive_re("cover tracks"),
-    # Path-related terms from v3 missed catches
-    _sensitive_re("/root/", literal=True),
-    _sensitive_re("/home/", literal=True),
-    _sensitive_re("/var/log/", literal=True),
-    _sensitive_re("bash_history"),
-    _sensitive_re(".bashrc", literal=True),
-    _sensitive_re("sudoers"),
-    _sensitive_re("auth.log"),
-    _sensitive_re("system access"),
+    p for patterns in SENSITIVE_TOPIC_CATEGORIES.values() for p in patterns
 ]
 
 
 def _has_sensitive_topic(text: str) -> bool:
     """Check if text contains any sensitive topic keyword."""
     return any(p.search(text) for p in SENSITIVE_TOPIC_PATTERNS)
+
+
+def _get_sensitive_categories(text: str) -> set[str]:
+    """Return which sensitive topic categories are present in text."""
+    categories = set()
+    for cat, patterns in SENSITIVE_TOPIC_CATEGORIES.items():
+        if any(p.search(text) for p in patterns):
+            categories.add(cat)
+    return categories
 
 # ── Context building indicators ────────────────────────────────
 
@@ -158,6 +189,11 @@ ESCALATION_LANGUAGE = [
 
 # ── Reconnaissance indicators ────────────────────────────────
 
+# Finding #15: Recon patterns match common dev workflows ("list files in
+# the project", "find config files"). The 2-turn threshold prevents
+# single-query FPs, but a normal exploratory session could hit 3+ recon
+# turns and score 3.5. Accepted trade-off — recon detection is a signal
+# that combines with other rules, not a standalone blocker at these scores.
 RECON_PATTERNS = [
     re.compile(r"\b(?:ls|list|dir)\s+", re.IGNORECASE),
     re.compile(r"\blist\s+(?:files|directories|folders)\b", re.IGNORECASE),
@@ -170,12 +206,17 @@ RECON_PATTERNS = [
 
 # ── Topic shift categories ────────────────────────────────────
 
-TOPIC_CATEGORIES = {
-    "code": ["write code", "function", "class", "implement", "refactor", "debug", "algorithm", "variable"],
-    "text": ["write", "essay", "summarize", "translate", "explain", "describe", "poem", "story"],
-    "file": ["file", "directory", "path", "read file", "list files", "contents of"],
-    "system": ["execute", "run", "bash", "shell", "command", "sudo", "process", "kill", "service"],
-    "question": ["what is", "how does", "why", "can you explain", "tell me about", "help me understand"],
+TOPIC_CATEGORIES: dict[str, list[re.Pattern[str]]] = {
+    "code": [re.compile(rf"\b{re.escape(kw)}\b", re.IGNORECASE) for kw in
+             ["write code", "function", "class", "implement", "refactor", "debug", "algorithm", "variable"]],
+    "text": [re.compile(rf"\b{re.escape(kw)}\b", re.IGNORECASE) for kw in
+             ["write", "essay", "summarize", "translate", "explain", "describe", "poem", "story"]],
+    "file": [re.compile(rf"\b{re.escape(kw)}\b", re.IGNORECASE) for kw in
+             ["file", "directory", "path", "read file", "list files", "contents of"]],
+    "system": [re.compile(rf"\b{re.escape(kw)}\b", re.IGNORECASE) for kw in
+               ["execute", "run", "bash", "shell", "command", "sudo", "process", "kill", "service"]],
+    "question": [re.compile(rf"\b{re.escape(kw)}\b", re.IGNORECASE) for kw in
+                 ["what is", "how does", "why", "can you explain", "tell me about", "help me understand"]],
 }
 
 # ── Block category classification ────────────────────────────
@@ -228,6 +269,7 @@ class AnalysisResult:
     total_score: float
     rule_scores: dict[str, float] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
+    new_success_forgives: int | None = None  # Finding #11: caller persists this
 
 
 class ConversationAnalyzer:
@@ -241,12 +283,20 @@ class ConversationAnalyzer:
         self._warn = warn_threshold if warn_threshold is not None else settings.conversation_warn_threshold
         self._block = block_threshold if block_threshold is not None else settings.conversation_block_threshold
 
+    @staticmethod
+    def _normalise_turn_text(text: str) -> str:
+        """Normalise homoglyphs in historical turn text for keyword comparison."""
+        return normalise_homoglyphs(text)
+
     def analyze(self, session: Session, current_request: str) -> AnalysisResult:
         """Analyze a request in the context of its session history.
 
         Returns AnalysisResult with action, score, and warnings.
         First message in a session always returns ALLOW (no history to analyze).
         """
+        # Normalise homoglyphs so Cyrillic lookalikes can't bypass keyword rules
+        current_request = normalise_homoglyphs(current_request)
+
         # First turn — only check stateless rules (instruction_override).
         # History-dependent rules (retry, escalation, etc.) are skipped because
         # there's nothing to compare against.
@@ -299,7 +349,7 @@ class ConversationAnalyzer:
             scores["instruction_override"] = s
             warnings.extend(w)
 
-        s, w = self._check_violation_accumulation(session)
+        s, w, new_forgives = self._check_violation_accumulation(session)
         if s > 0:
             scores["violation_accumulation"] = s
             warnings.extend(w)
@@ -321,7 +371,14 @@ class ConversationAnalyzer:
 
         total = sum(scores.values())
 
-        # Add cumulative risk from prior turns
+        # Add cumulative risk from prior turns.
+        # Finding #7: No ceiling on cumulative_risk — this is by design.
+        # Risk ratchets via accumulate_risk() (max of old and new) and only
+        # decays via time-based Session.apply_decay(). A user triggering
+        # several warnings from FP-prone patterns could have their session
+        # locked through accumulation alone. This is the intended trade-off:
+        # FPs trigger warns (recoverable), true positives accumulate to blocks
+        # (protective). The auto-unlock timeout is the escape valve.
         total += session.cumulative_risk
 
         # Determine action
@@ -337,6 +394,7 @@ class ConversationAnalyzer:
             total_score=total,
             rule_scores=scores,
             warnings=warnings,
+            new_success_forgives=new_forgives,
         )
 
         logger.info(
@@ -349,6 +407,7 @@ class ConversationAnalyzer:
                 "action": action,
                 "total_score": total,
                 "rule_scores": scores,
+                "request_excerpt": current_request[:200] + ("..." if len(current_request) > 200 else ""),
             },
         )
 
@@ -366,13 +425,15 @@ class ConversationAnalyzer:
         """
         score = 0.0
         warnings: list[str] = []
-        current_lower = current_request.lower()
+        # Truncate to 1000 chars — SequenceMatcher is O(n²) and retry detection only needs prefix similarity
+        current_lower = current_request.lower()[:1000]
 
         for turn in session.turns:
             if turn.result_status != "blocked":
                 continue
+            turn_text = self._normalise_turn_text(turn.request_text).lower()[:1000]
             ratio = SequenceMatcher(
-                None, current_lower, turn.request_text.lower(),
+                None, current_lower, turn_text,
             ).ratio()
             if ratio > 0.45:
                 score += 3.0
@@ -425,12 +486,9 @@ class ConversationAnalyzer:
         best_tier = None
         best_value = -1
 
-        for tier, keywords in TIER_KEYWORDS.items():
-            for kw in keywords:
-                # Use word boundary matching to avoid substring false positives
-                # (e.g. "running" should not match "run")
-                pattern = r"\b" + re.escape(kw) + r"\b"
-                if re.search(pattern, text_lower):
+        for tier, patterns in TIER_KEYWORDS.items():
+            for pattern in patterns:
+                if pattern.search(text_lower):
                     tier_value = CAPABILITY_TIERS[tier]
                     if tier_value > best_value:
                         best_tier = tier
@@ -444,7 +502,7 @@ class ConversationAnalyzer:
         max_value = -1
 
         for turn in turns:
-            tier = self._classify_tier(turn.request_text)
+            tier = self._classify_tier(self._normalise_turn_text(turn.request_text))
             if tier is not None:
                 value = CAPABILITY_TIERS[tier]
                 if value > max_value:
@@ -458,26 +516,36 @@ class ConversationAnalyzer:
     def _check_sensitive_topic_acceleration(
         self, session: Session, current_request: str,
     ) -> tuple[float, list[str]]:
-        """Detect first mention of sensitive topics after N benign turns.
+        """Detect first mention of sensitive topic categories after N benign turns.
 
-        Score: 2.0 if after 1+ benign turns, 3.0 if after 4+ benign turns
+        Score: 2.0 if after 1+ benign turns, 3.0 if after 4+ benign turns.
+        Tracks by category (credential, system_file, privilege, attack_tool,
+        control_tampering) so that introducing a NEW category of sensitive
+        topic triggers acceleration even if a different category appeared earlier.
         """
-        # Check if current request contains sensitive topics
-        if not _has_sensitive_topic(current_request):
+        current_categories = _get_sensitive_categories(current_request)
+        if not current_categories:
             return 0.0, []
 
-        # Check if any prior turn also mentioned sensitive topics
+        # Collect categories seen in prior turns
+        prior_categories: set[str] = set()
         for turn in session.turns:
-            if _has_sensitive_topic(turn.request_text):
-                return 0.0, []  # Not the first mention
+            prior_categories |= _get_sensitive_categories(
+                self._normalise_turn_text(turn.request_text)
+            )
+
+        # Check for NEW categories not seen before
+        new_categories = current_categories - prior_categories
+        if not new_categories:
+            return 0.0, []
 
         # Count benign turns (not blocked)
         benign_count = sum(1 for t in session.turns if t.result_status != "blocked")
 
         if benign_count >= 4:
-            return 3.0, [f"Sensitive topic introduced after {benign_count} benign turns"]
+            return 3.0, [f"New sensitive topic category ({', '.join(sorted(new_categories))}) after {benign_count} benign turns"]
         elif benign_count >= 1:
-            return 2.0, [f"Sensitive topic introduced after {benign_count} benign turns"]
+            return 2.0, [f"New sensitive topic category ({', '.join(sorted(new_categories))}) after {benign_count} benign turns"]
 
         return 0.0, []
 
@@ -496,7 +564,7 @@ class ConversationAnalyzer:
         for pattern in INSTRUCTION_OVERRIDE_PATTERNS:
             if pattern.search(current_request):
                 score += 3.0
-                warnings.append(f"Instruction override attempt: '{pattern.pattern}'")
+                warnings.append("Instruction override phrase detected")
 
         return min(score, 5.0), warnings
 
@@ -504,7 +572,7 @@ class ConversationAnalyzer:
 
     def _check_violation_accumulation(
         self, session: Session,
-    ) -> tuple[float, list[str]]:
+    ) -> tuple[float, list[str], int | None]:
         """Score based on prior violations, weighted by category.
 
         Security blocks (scanner detections): 1.5 per violation
@@ -514,9 +582,13 @@ class ConversationAnalyzer:
         This prevents legitimate debugging sessions from cascading into
         session locks when environment/policy blocks (e.g. read-only FS,
         python3 -c blocked by policy) accumulate.
+
+        Returns (score, warnings, new_forgives_total) where new_forgives_total
+        is the updated success_forgives_used value for the caller to persist,
+        or None if no forgiveness was applied.
         """
         if session.violation_count == 0:
-            return 0.0, []
+            return 0.0, [], None
 
         security_count = 0
         policy_count = 0
@@ -533,12 +605,12 @@ class ConversationAnalyzer:
         # Fix-cycle awareness: a successful step after scanner blocks indicates
         # a legitimate retry workflow (e.g. code fixer correcting Qwen output).
         # Forgive one security block per success-after-block pattern in the
-        # turn history, up to MAX_SUCCESS_FORGIVES total across the session.
-        MAX_SUCCESS_FORGIVES = 2
-        # Migration shim for sessions created before this field existed
-        success_forgives_used = getattr(session, "success_forgives_used", 0)
+        # turn history, up to max_success_forgives total across the session.
+        max_forgives = settings.max_success_forgives
+        success_forgives_used = session.success_forgives_used
+        new_forgives_total: int | None = None
 
-        if security_count > 0 and success_forgives_used < MAX_SUCCESS_FORGIVES:
+        if security_count > 0 and success_forgives_used < max_forgives:
             # Count successes that follow at least one prior block
             seen_block = False
             forgive_eligible = 0
@@ -552,12 +624,12 @@ class ConversationAnalyzer:
             # Apply new forgives (subtract already-used from eligible count)
             new_forgives = min(
                 forgive_eligible - success_forgives_used,
-                MAX_SUCCESS_FORGIVES - success_forgives_used,
+                max_forgives - success_forgives_used,
                 security_count,  # Never reduce below 0
             )
             if new_forgives > 0:
                 security_count -= new_forgives
-                session.success_forgives_used = success_forgives_used + new_forgives
+                new_forgives_total = success_forgives_used + new_forgives
 
         score = min(security_count * 1.5 + policy_count * 0.5, 5.0)
         warnings: list[str] = []
@@ -566,8 +638,8 @@ class ConversationAnalyzer:
         if policy_count:
             warnings.append(f"{policy_count} policy block(s)")
         if not warnings:
-            return 0.0, []
-        return score, [f"Session has {'; '.join(warnings)}"]
+            return 0.0, [], new_forgives_total
+        return score, [f"Session has {'; '.join(warnings)}"], new_forgives_total
 
     # ── Rule 6: Context building ───────────────────────────────
 
@@ -615,7 +687,7 @@ class ConversationAnalyzer:
         # Count prior turns that match recon patterns
         recon_count = 0
         for turn in session.turns:
-            if any(p.search(turn.request_text) for p in RECON_PATTERNS):
+            if any(p.search(self._normalise_turn_text(turn.request_text)) for p in RECON_PATTERNS):
                 recon_count += 1
 
         # Check if current request is also recon
@@ -650,7 +722,7 @@ class ConversationAnalyzer:
         # Check if earlier turns were in benign categories
         early_categories = set()
         for turn in session.turns[:3]:  # Look at first 3 turns
-            cat = self._classify_topic(turn.request_text)
+            cat = self._classify_topic(self._normalise_turn_text(turn.request_text))
             if cat:
                 early_categories.add(cat)
 
@@ -663,16 +735,13 @@ class ConversationAnalyzer:
     def _classify_topic(self, text: str) -> str | None:
         """Classify text into a topic category. Returns highest-risk match.
 
-        Uses word-boundary matching to avoid false positives from substring
-        matches (e.g. "shell" in "nutshell", "kill" in "skill").
+        Priority order: system > file > code > text > question.
         """
         text_lower = text.lower()
-        # Check in priority order: system > file > code > text > question
         priority = ["system", "file", "code", "text", "question"]
         for cat in priority:
-            keywords = TOPIC_CATEGORIES[cat]
-            for kw in keywords:
-                pattern = r"\b" + re.escape(kw) + r"\b"
-                if re.search(pattern, text_lower):
+            patterns = TOPIC_CATEGORIES[cat]
+            for pattern in patterns:
+                if pattern.search(text_lower):
                     return cat
         return None

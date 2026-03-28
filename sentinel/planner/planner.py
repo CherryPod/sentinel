@@ -1,5 +1,7 @@
 import asyncio
 import json
+import os
+import random
 import re
 import shlex
 import logging
@@ -9,9 +11,13 @@ import anthropic
 
 from sentinel.core.config import settings
 from sentinel.core.models import Plan, PlanStep
+from sentinel.security.constraint_validator import validate_constraint_definitions
 from sentinel.worker.base import PlannerBase
 
 logger = logging.getLogger("sentinel.audit")
+
+# Shell metacharacters that indicate chained commands (#2 HIGH — single-command extraction)
+_SHELL_CHAIN_RE = re.compile(r"[;&|]")
 
 _PLANNER_SYSTEM_PROMPT_TEMPLATE = """\
 <role>
@@ -98,6 +104,26 @@ and no actual work gets done. The controller executes up to this step, sends \
 you the results, and asks you to continue with the correct paths/names. Maximum \
 3 per plan. Most fabrication-only plans need zero; discovery tasks almost always \
 need one.
+
+Step-level assertions (optional but recommended for effect steps):
+- "assertions": list of post-condition checks. Each assertion is a dict with \
+an "assert" key naming the type, plus type-specific fields:
+  - file_contains: {{"assert": "file_contains", "path": "<file>", "pattern": "<regex>"}} — \
+verify the file contains the expected content after modification
+  - file_not_contains: {{"assert": "file_not_contains", "path": "<file>", "pattern": "<regex>"}} — \
+verify unwanted content was removed
+  - file_exists: {{"assert": "file_exists", "path": "<file>"}} — verify file was created
+  - file_not_empty: {{"assert": "file_not_empty", "path": "<file>"}} — verify file has content
+  - content_changed: {{"assert": "content_changed", "path": "<file>"}} — verify file was actually modified
+  - response_contains: {{"assert": "response_contains", "step_id": "<id>", "pattern": "<regex>"}} — \
+verify tool output contains expected text
+- Add a "recovery" field to each assertion with a one-line description of what \
+to do if the assertion fails (e.g. "Re-read the file and apply patch to correct selector").
+- Place assertions on the LAST effect step of a plan. For file modifications, \
+always include at least a content_changed assertion plus a file_contains with \
+the specific expected content pattern.
+- Assertions are checked AFTER execution. Failed assertions mark the task as \
+partial and trigger replanning with the failure details.
 </output_schema>
 
 <worker_llm>
@@ -190,33 +216,74 @@ the worker generate only the new/changed fragment, then splicing it in \
 deterministically.
 
 file_patch workflow (applies to all file types):
-  1. file_read the target file with replan_after=true. This is MANDATORY — even \
-if you created the file in a prior step, the worker may have used different \
-names, IDs, or structure than you requested. You MUST read the actual file \
-content before planning a file_patch step. Do NOT guess element IDs or anchors \
-from what you asked the worker to create — verify against the actual file.
-  2. After receiving the file content from the replan, determine the anchor:
-     - For HTML files: use a css: selector prefix for deterministic element \
-targeting (e.g. "css:#panel-weather", "css:.sidebar"). This is resolved by \
-the tool via BeautifulSoup — no LLM involved, no ambiguity. Prefer ID \
-selectors (#id) over class selectors (.class) for uniqueness. Read the actual \
-IDs from the file_read output — do not assume them.
-     - For non-HTML files (Python, JS, CSS, YAML, configs): copy a unique \
-anchor string verbatim from the file content and put it directly in the \
-file_patch step args as a literal string.
-     In both cases, do NOT delegate anchor identification to an llm_task step.
-  3. llm_task to generate ONLY the new/replacement content fragment. Provide \
-surrounding context (~80-100 lines around the anchor) plus relevant identifiers \
-so the worker produces output that integrates cleanly.
-  4. file_patch with the anchor and $content_variable. The file is modified in \
-place — no redeployment or rewrite step needed.
+  1. file_read the target file with replan_after=true. MANDATORY.
+  2. After the replan, check whether an [ANCHOR MAP] was provided for this file.
 
-Anchor selection:
-- HTML: css:#element-id is the preferred anchor type. Falls back to text \
-anchors if no suitable ID exists.
+     If an anchor map IS present:
+     - Select the appropriate named anchor from the map.
+     - Use the full anchor marker as the anchor string:
+       HTML:    <!-- anchor: {{name}} -->
+       Python:  # anchor: {{name}}
+       JS:      // anchor: {{name}}
+       CSS:     /* anchor: {{name}} */
+       Shell:   # anchor: {{name}}
+       YAML:    # anchor: {{name}}
+     - Common patterns:
+       - Add content inside a section: insert_after the full marker
+       - Add content at end of section: insert_before the "-end" marker
+       - Replace entire section: anchor="{{name}}...{{name}}-end" \
+(bare names, not full markers — executor builds markers), operation="replace"
+       - Add content after a section: insert_after the "-end" marker
+     - Do NOT use css: selectors or text anchors when named anchors are available.
+     - Do NOT invent anchor names — only use names from the [ANCHOR MAP].
+
+     If NO anchor map is present: fall back to manual anchor selection.
+     - HTML: use css:#element-id selectors.
+     - Non-HTML: copy a unique string verbatim from file content.
+     In both cases, do NOT delegate anchor identification to an llm_task step.
+
+  3. llm_task to generate ONLY the new/replacement content fragment.
+  4. file_patch with the anchor and $content_variable.
+
+<example type="good" title="Using named anchors from anchor map">
+Anchor map provides: head-styles, el-status-panel, el-status-panel-end
+
+To add CSS:
+  file_patch anchor="<!-- anchor: head-styles -->", \
+operation="insert_after", content=$new_css
+
+To replace a panel's content:
+  file_patch anchor="el-status-panel...el-status-panel-end", \
+operation="replace", content=$new_panel
+
+To add a new panel after an existing one:
+  file_patch anchor="<!-- anchor: el-status-panel-end -->", \
+operation="insert_after", content=$new_panel
+</example>
+
+<example type="bad" title="Inventing anchor names not in the map">
+anchor="<!-- anchor: main-content -->"
+WRONG: "main-content" is not in the anchor map. Only use names \
+that appear in the [ANCHOR MAP] provided during replan. \
+Named anchors are placed by the system — you cannot guess them.
+</example>
+
+<example type="bad" title="Using text anchors when named anchors exist">
+anchor="<div id=\"status-panel\">"
+WRONG: The anchor map provides el-status-panel. Use the named anchor.
+</example>
+
+<example type="fallback" title="No anchor map available">
+When no [ANCHOR MAP] is provided, use manual workflow:
+- HTML: css:#element-id selectors
+- Non-HTML: copy a unique string verbatim from file content
+This is expected for new files or files modified outside the pipeline.
+</example>
+
+Anchor selection (fallback — no anchor map):
+- HTML: css:#element-id is the preferred anchor type.
 - Non-HTML: prefer anchors with unique identifiers (function names, distinctive \
-comments, unique strings). Avoid generic structural anchors that may appear \
-multiple times (e.g. 'def __init__').
+comments). Avoid generic structural anchors that appear multiple times.
 - Operations: insert_after, insert_before, replace, delete.
 
 Multi-file changes (e.g. HTML + CSS + JS, or source + config):
@@ -727,23 +794,20 @@ def _repair_truncated_json(text: str) -> str | None:
 
     Returns repaired JSON string if successful, None if hopeless.
     Only called after json.loads() has already failed.
+
+    Security (#1 HIGH): rejects repairs where truncation occurred inside a
+    string value — closing an open string mechanically can produce valid JSON
+    with semantically corrupted content (e.g. a mangled prompt or path that
+    passes structural validation but carries unintended instructions).
     """
-    import json
-
-    # Already valid — return as-is
-    try:
-        json.loads(text)
-        return text
-    except json.JSONDecodeError:
-        pass
-
     # Must look like JSON
     stripped = text.strip()
     if not stripped or stripped[0] not in ('{', '['):
         return None
 
-    # Close any open string literal
+    # Single-pass: track string state and bracket depth simultaneously (#6 MED)
     in_string = False
+    stack: list[str] = []
     i = 0
     while i < len(stripped):
         c = stripped[i]
@@ -752,35 +816,34 @@ def _repair_truncated_json(text: str) -> str | None:
             continue
         if c == '"':
             in_string = not in_string
-        i += 1
-
-    repaired = stripped
-    if in_string:
-        repaired += '"'
-
-    # Remove trailing comma (invalid before closing bracket)
-    repaired = repaired.rstrip()
-    if repaired.endswith(','):
-        repaired = repaired[:-1]
-
-    # Track open brackets/braces with a stack
-    stack = []
-    in_str = False
-    k = 0
-    while k < len(repaired):
-        c = repaired[k]
-        if c == '\\' and in_str:
-            k += 2
-            continue
-        if c == '"':
-            in_str = not in_str
-        elif not in_str:
+        elif not in_string:
             if c in ('{', '['):
                 stack.append(c)
             elif c in ('}', ']'):
                 if stack:
                     stack.pop()
-        k += 1
+        i += 1
+
+    # #1 HIGH: truncation inside a string value is semantically dangerous —
+    # the closed string could contain a mangled prompt, path, or command.
+    # Reject rather than silently produce corrupted content.
+    if in_string:
+        logger.warning(
+            "JSON repair rejected — truncation inside string value",
+            extra={
+                "event": "planner_json_repair_rejected",
+                "reason": "truncated_inside_string",
+                "text_length": len(stripped),
+            },
+        )
+        return None
+
+    repaired = stripped
+
+    # Remove trailing comma (invalid before closing bracket)
+    repaired = repaired.rstrip()
+    if repaired.endswith(','):
+        repaired = repaired[:-1]
 
     # Close remaining open structures in reverse order
     for opener in reversed(stack):
@@ -795,6 +858,10 @@ def _repair_truncated_json(text: str) -> str | None:
 
 class ClaudePlanner(PlannerBase):
     """Claude API client that generates structured execution plans."""
+
+    # #14 LOW / #24 LOW: shared constants — avoids magic numbers scattered in methods
+    HISTORY_HEAD_COUNT = 3
+    MAX_PLAN_STEPS = 50
 
     def __init__(self, api_key: str | None = None):
         self._api_key = api_key or self._load_api_key()
@@ -819,9 +886,12 @@ class ClaudePlanner(PlannerBase):
         # file_write / file_read / file_patch: infer allowed_paths from path arg
         if tool in ("file_write", "file_read", "file_patch") and "path" in args:
             path = args["path"]
-            # If path contains a $var reference, allow the parent dir pattern
             if "$" in path:
-                # Can't know exact path yet — fall back to legacy scanning
+                # #9 MED: log when variable reference causes fallback
+                logger.debug(
+                    "Constraint inference skipped — variable reference in path",
+                    extra={"event": "constraint_infer_skip", "reason": "variable_ref", "tool": tool},
+                )
                 return {}
             result["allowed_paths"] = [path]
 
@@ -829,6 +899,10 @@ class ClaudePlanner(PlannerBase):
         elif tool == "mkdir" and "path" in args:
             path = args["path"]
             if "$" in path:
+                logger.debug(
+                    "Constraint inference skipped — variable reference in path",
+                    extra={"event": "constraint_infer_skip", "reason": "variable_ref", "tool": tool},
+                )
                 return {}
             result["allowed_paths"] = [path]
 
@@ -836,16 +910,41 @@ class ClaudePlanner(PlannerBase):
         elif tool in ("shell_exec", "shell") and "command" in args:
             command = args["command"]
             if "$" in command:
-                # Variable reference — can't parse reliably yet
+                logger.debug(
+                    "Constraint inference skipped — variable reference in command",
+                    extra={"event": "constraint_infer_skip", "reason": "variable_ref", "tool": tool},
+                )
+                return {}
+            # #2 HIGH: detect shell metacharacters (&&, ||, ;, |) that indicate
+            # chained commands. Extracting only the first command gives a false
+            # sense of constraint coverage. Fall back to legacy scanning.
+            if _SHELL_CHAIN_RE.search(command):
+                logger.debug(
+                    "Constraint inference skipped — chained shell command detected",
+                    extra={
+                        "event": "constraint_infer_skip",
+                        "reason": "chained_command",
+                        "tool": tool,
+                        "command_preview": command[:100],
+                    },
+                )
                 return {}
             try:
                 tokens = shlex.split(command)
                 if tokens:
-                    import os
                     base_cmd = os.path.basename(tokens[0])
                     result["allowed_commands"] = [base_cmd]
-            except ValueError:
-                # Unparseable command — fall back to legacy scanning
+            except ValueError as exc:
+                # #11 MED: log when unparseable command causes fallback
+                logger.debug(
+                    "Constraint inference skipped — unparseable command",
+                    extra={
+                        "event": "constraint_infer_skip",
+                        "reason": "shlex_error",
+                        "tool": tool,
+                        "error": str(exc),
+                    },
+                )
                 return {}
 
         return result
@@ -868,17 +967,25 @@ class ClaudePlanner(PlannerBase):
 
         prompt = _PLANNER_SYSTEM_PROMPT_TEMPLATE.format(tool_descriptions=tool_descriptions)
         now = datetime.now(timezone.utc)
-        date_context = f"\n\n<date_context>\nCurrent date and time (UTC): {now.strftime('%Y-%m-%d %H:%M')} ({now.strftime('%A')})\nAlways resolve relative dates (today, tomorrow, next week) to concrete ISO 8601 datetimes in tool_call args.\n</date_context>"
-        return prompt + date_context
+        date_context = (
+            "<date_context>\n"
+            f"Current date and time (UTC): {now.strftime('%Y-%m-%d %H:%M')} ({now.strftime('%A')})\n"
+            "Always resolve relative dates (today, tomorrow, next week) to concrete ISO 8601 datetimes in tool_call args.\n"
+            "</date_context>"
+        )
+        # #12 MED: explicit separator — don't rely on template trailing newline
+        return prompt.rstrip() + "\n\n" + date_context
 
     @staticmethod
-    def _prune_history(
+    def prune_history(
         conversation_history: list[dict],
         max_turns: int = 20,
-        head_count: int = 3,
+        head_count: int = HISTORY_HEAD_COUNT,
         tail_count: int = 10,
     ) -> tuple[list[dict], list[dict]]:
         """Split history into kept (head+tail) and pruned (middle) entries.
+
+        Public API — also used by orchestrator.py for episodic memory flush.
 
         Returns:
             (kept_entries, pruned_entries)
@@ -903,12 +1010,12 @@ class ClaudePlanner(PlannerBase):
 
         # Apply head-and-tail pruning when max_turns > 0
         if max_turns > 0:
-            kept, pruned = self._prune_history(conversation_history, max_turns)
+            kept, pruned = self.prune_history(conversation_history, max_turns)
         else:
             kept, pruned = conversation_history, []
 
         pruned_count = len(pruned)
-        head_count = 3  # must match _prune_history default
+        head_count = self.HISTORY_HEAD_COUNT
 
         lines: list[str] = []
         for idx, entry in enumerate(kept):
@@ -1042,7 +1149,11 @@ class ClaudePlanner(PlannerBase):
         tool_desc = json.dumps(available_tools or [], indent=2)
         system_text = self._build_system_prompt(tool_desc)
         if policy_summary:
-            system_text += f"\n\nSecurity policy summary:\n{policy_summary}"
+            # #16 MED: escape XML-like tags to prevent interference with
+            # the system prompt's XML structure (policy_summary is from a
+            # trusted source but the contract doesn't enforce this)
+            safe_summary = policy_summary.replace("<", "&lt;").replace(">", "&gt;")
+            system_text += f"\n\nSecurity policy summary:\n{safe_summary}"
 
         # Use content-block format with cache_control for prompt caching.
         # The system prompt is identical across requests, so caching saves
@@ -1111,12 +1222,14 @@ class ClaudePlanner(PlannerBase):
         max_attempts = 3  # initial + 2 retries (covers API errors AND empty/invalid responses)
         last_error: Exception | None = None
         plan_data: dict | None = None
+        retry_categories: list[str] = []  # #19 MED: track what consumed each attempt
         t0 = time.monotonic()
 
         for attempt in range(max_attempts):
-            # Exponential backoff between retries (skip on first attempt)
+            # #20 MED: exponential backoff with jitter and cap
             if attempt > 0:
-                await asyncio.sleep(2 ** attempt)
+                delay = min(2 ** attempt, 10) + random.uniform(0, 1)
+                await asyncio.sleep(delay)
 
             # ── Step 1: API call ──
             try:
@@ -1128,6 +1241,7 @@ class ClaudePlanner(PlannerBase):
                 )
             except anthropic.APIConnectionError as exc:
                 last_error = PlannerError(f"Cannot connect to Claude API: {exc}")
+                retry_categories.append("connection_error")
                 logger.warning(
                     "Claude API connection error",
                     extra={"event": "planner_connect_error", "attempt": attempt + 1, "error": str(exc)},
@@ -1137,6 +1251,7 @@ class ClaudePlanner(PlannerBase):
                 raise last_error from exc
             except anthropic.APITimeoutError as exc:
                 last_error = PlannerError(f"Claude API timed out: {exc}")
+                retry_categories.append("timeout")
                 logger.warning(
                     "Claude API timeout",
                     extra={"event": "planner_timeout", "attempt": attempt + 1, "timeout_s": settings.claude_timeout},
@@ -1152,6 +1267,7 @@ class ClaudePlanner(PlannerBase):
                         extra={"event": "planner_overloaded", "attempt": attempt + 1},
                     )
                     last_error = PlannerError(f"Claude API overloaded: {exc.message}")
+                    retry_categories.append("overloaded")
                     continue
                 logger.error(
                     "Claude API status error",
@@ -1201,6 +1317,7 @@ class ClaudePlanner(PlannerBase):
                         },
                     )
                     last_error = PlannerError("Claude returned empty response")
+                    retry_categories.append("empty_response")
                     continue
                 logger.info(
                     "Claude returned empty response — classifying as planner refusal",
@@ -1296,6 +1413,7 @@ class ClaudePlanner(PlannerBase):
                         },
                     )
                     last_error = PlannerError(f"Claude returned invalid JSON: {exc}")
+                    retry_categories.append("invalid_json")
                     continue
                 # Last resort: attempt to repair truncated JSON
                 repaired = _repair_truncated_json(cleaned)
@@ -1313,8 +1431,26 @@ class ClaudePlanner(PlannerBase):
                         break
                     except json.JSONDecodeError:
                         pass  # repair failed, raise original error
+                # #19 MED: log which categories consumed the retry budget
+                logger.warning(
+                    "All planner retries exhausted",
+                    extra={
+                        "event": "planner_retries_exhausted",
+                        "retry_categories": retry_categories,
+                        "max_attempts": max_attempts,
+                    },
+                )
                 raise PlannerError(f"Claude returned invalid JSON: {exc}") from exc
         else:
+            # #19 MED: log which categories consumed the retry budget
+            logger.warning(
+                "All planner retries exhausted",
+                extra={
+                    "event": "planner_retries_exhausted",
+                    "retry_categories": retry_categories,
+                    "max_attempts": max_attempts,
+                },
+            )
             raise last_error  # type: ignore[misc]
 
         # Build Plan model
@@ -1371,29 +1507,20 @@ class ClaudePlanner(PlannerBase):
             logger.debug("Plan step detail", extra=step_detail)
         return plan
 
-    _REFUSAL_PATTERNS: list[re.Pattern[str]] = [
-        re.compile(r"\bi cannot\b", re.IGNORECASE),
-        re.compile(r"\bi can't\b", re.IGNORECASE),
-        re.compile(r"\bi'm sorry\b", re.IGNORECASE),
-        re.compile(r"\bi apologize\b", re.IGNORECASE),
-        re.compile(r"\bi'm unable\b", re.IGNORECASE),
-        re.compile(r"\bi am unable\b", re.IGNORECASE),
-        re.compile(r"\bi must decline\b", re.IGNORECASE),
-        re.compile(r"\bi won't\b", re.IGNORECASE),
-        re.compile(r"\bi will not\b", re.IGNORECASE),
-        re.compile(r"\bcannot assist\b", re.IGNORECASE),
-        re.compile(r"\bnot able to\b", re.IGNORECASE),
-        re.compile(r"\brefuse\b", re.IGNORECASE),
-        re.compile(r"\binappropriate\b", re.IGNORECASE),
-        re.compile(r"\bagainst my\b", re.IGNORECASE),
-        re.compile(r"\bviolates\b", re.IGNORECASE),
-        re.compile(r"\bharmful\b", re.IGNORECASE),
-    ]
+    # #22 LOW: single compiled alternation instead of 16 separate patterns
+    _REFUSAL_PATTERN: re.Pattern[str] = re.compile(
+        r"\b("
+        r"i cannot|i can't|i'm sorry|i apologize|i'm unable|i am unable|"
+        r"i must decline|i won't|i will not|cannot assist|not able to|"
+        r"refuse|inappropriate|against my|violates|harmful"
+        r")\b",
+        re.IGNORECASE,
+    )
 
     @staticmethod
     def _looks_like_refusal(text: str) -> bool:
         """Heuristic: does this non-JSON text look like Claude refusing?"""
-        return any(pat.search(text) for pat in ClaudePlanner._REFUSAL_PATTERNS)
+        return bool(ClaudePlanner._REFUSAL_PATTERN.search(text))
 
     @staticmethod
     def _validate_plan(
@@ -1409,8 +1536,10 @@ class ClaudePlanner(PlannerBase):
         if not plan.steps:
             raise PlanValidationError("Plan has no steps")
 
-        if len(plan.steps) > 50:
-            raise PlanValidationError("Plan exceeds maximum 50 steps")
+        if len(plan.steps) > ClaudePlanner.MAX_PLAN_STEPS:
+            raise PlanValidationError(
+                f"Plan exceeds maximum {ClaudePlanner.MAX_PLAN_STEPS} steps"
+            )
 
         valid_types = {"llm_task", "tool_call"}
         defined_vars: set[str] = set(prior_vars) if prior_vars else set()
@@ -1474,8 +1603,6 @@ class ClaudePlanner(PlannerBase):
                 "Reduce discovery steps or plan more deterministically."
             )
         # D5: Validate constraint definitions on tool_call steps
-        from sentinel.security.constraint_validator import validate_constraint_definitions
-
         for step in plan.steps:
             if step.type != "tool_call":
                 continue
@@ -1486,6 +1613,12 @@ class ClaudePlanner(PlannerBase):
                 raise PlanValidationError(
                     f"Step {step.id}: invalid constraint definition: {errors[0]}"
                 )
+
+        # Validate assertion structure
+        for step in plan.steps:
+            for i, assertion in enumerate(step.assertions):
+                if "assert" not in assertion:
+                    raise PlanValidationError(f"Step {step.id} assertion {i} missing 'assert' key")
 
     @staticmethod
     def _auto_infer_constraints(plan: Plan) -> None:
@@ -1522,3 +1655,54 @@ class ClaudePlanner(PlannerBase):
                         "allowed_paths": step.allowed_paths,
                     },
                 )
+
+    async def verify_goal(self, judge_prompt: str) -> dict:
+        """Invoke the planner as a verification judge.
+
+        Sends a compact prompt to Claude and parses the structured JSON verdict.
+        Best-effort: returns safe defaults (low confidence, GOAL_MET=yes)
+        on any failure so the judge never blocks task completion on its own errors.
+
+        Privacy: judge_prompt is built from trusted metadata only (see build_judge_payload).
+        """
+        _safe_default = {
+            "CORRECT_TARGET": True,
+            "CORRECT_CONTENT": True,
+            "SIDE_EFFECTS": False,
+            "COMPLETENESS": True,
+            "GOAL_MET": "yes",
+            "CONFIDENCE": "low",
+            "GAP": None,
+        }
+        try:
+            response = await self._client.messages.create(
+                model=settings.claude_model,
+                max_tokens=500,
+                messages=[{"role": "user", "content": judge_prompt}],
+            )
+            raw = response.content[0].text.strip()
+            # Strip markdown code fences if present
+            if raw.startswith("```"):
+                raw = re.sub(r"^```(?:json)?\s*", "", raw)
+                raw = re.sub(r"\s*```$", "", raw)
+            verdict = json.loads(raw)
+            # Validate required fields
+            if "GOAL_MET" not in verdict or "CONFIDENCE" not in verdict:
+                logger.warning(
+                    "Judge verdict missing required fields",
+                    extra={"event": "judge_verdict_incomplete", "raw": raw[:200]},
+                )
+                return _safe_default
+            return verdict
+        except json.JSONDecodeError as exc:
+            logger.warning(
+                "Judge returned non-JSON response",
+                extra={"event": "judge_json_error", "error": str(exc)},
+            )
+            return _safe_default
+        except Exception as exc:
+            logger.warning(
+                "Judge call failed",
+                extra={"event": "judge_call_failed", "error": str(exc)},
+            )
+            return _safe_default

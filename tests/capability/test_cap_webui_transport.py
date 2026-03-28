@@ -8,11 +8,13 @@ import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from sentinel.api.auth import PinVerifier
+from sentinel.api.sessions import create_session_token
 
 import pytest
 from starlette.testclient import TestClient
 
 from sentinel.core.bus import EventBus
+from tests.conftest import auth_headers
 
 
 class TestWebSocketTransport:
@@ -23,25 +25,31 @@ class TestWebSocketTransport:
     @patch("sentinel.api.routes.websocket._orchestrator", MagicMock())
     @patch("sentinel.api.routes.websocket._event_bus", EventBus())
     def test_websocket_auth_valid_pin(self):
-        """Valid PIN auth → receives auth_ok response."""
+        """Valid JWT token → WebSocket connects successfully."""
         from sentinel.api.app import app
+        token = create_session_token(user_id=1, role="owner")
         client = TestClient(app)
-        with client.websocket_connect("/ws") as ws:
-            ws.send_text(json.dumps({"type": "auth", "pin": "1234"}))
+        with client.websocket_connect(f"/ws?token={token}") as ws:
+            # JWT auth at connection time — send a task message
+            ws.send_text(json.dumps({"type": "task", "request": "hello"}))
+            # Should get a response (not an auth error)
             msg = ws.receive_json()
-            assert msg["type"] == "auth_ok"
+            assert msg["type"] != "auth_error"
 
     @pytest.mark.capability
     @patch("sentinel.api.routes.websocket._pin_verifier", PinVerifier("1234"))
     @patch("sentinel.api.routes.websocket._orchestrator", None)
     def test_websocket_auth_invalid_pin(self):
-        """Invalid PIN → receives auth_error, connection closed."""
+        """Missing/invalid token → connection accepted then closed with 4001."""
         from sentinel.api.app import app
         client = TestClient(app)
+        # First-message auth: server accepts, waits for auth msg, then closes
         with client.websocket_connect("/ws") as ws:
-            ws.send_text(json.dumps({"type": "auth", "pin": "0000"}))
-            msg = ws.receive_json()
-            assert msg["type"] == "auth_error"
+            # Send invalid auth message
+            ws.send_json({"type": "auth", "token": "bad-token"})
+            # Server should close the connection
+            with pytest.raises(Exception):
+                ws.receive_json()
 
     @pytest.mark.capability
     @patch("sentinel.api.routes.websocket._pin_verifier", None)
@@ -50,13 +58,14 @@ class TestWebSocketTransport:
     def test_websocket_task_submission(self):
         """Task submission via WS — when orchestrator is None, error returned."""
         from sentinel.api.app import app
+        token = create_session_token(user_id=1, role="owner")
         client = TestClient(app)
-        with client.websocket_connect("/ws") as ws:
-            # Auth (no PIN required)
-            ws.send_text(json.dumps({"type": "auth", "pin": ""}))
-            msg = ws.receive_json()
-            assert msg["type"] == "auth_ok"
-            # Orchestrator is None → should get error
+        with client.websocket_connect(f"/ws?token={token}") as ws:
+            # First message is auth confirmation
+            auth_msg = ws.receive_json()
+            assert auth_msg["type"] == "auth_ok"
+            # Send a task — orchestrator is None → should get error
+            ws.send_json({"type": "task", "request": "hello"})
             msg = ws.receive_json()
             assert msg["type"] == "error"
 
@@ -67,12 +76,14 @@ class TestWebSocketTransport:
     def test_websocket_approval_submission(self):
         """Approval via WS — when orchestrator is None, error returned on task attempt."""
         from sentinel.api.app import app
+        token = create_session_token(user_id=1, role="owner")
         client = TestClient(app)
-        with client.websocket_connect("/ws") as ws:
-            ws.send_text(json.dumps({"type": "auth", "pin": ""}))
-            msg = ws.receive_json()
-            assert msg["type"] == "auth_ok"
-            # No orchestrator → error on any action
+        with client.websocket_connect(f"/ws?token={token}") as ws:
+            # First message is auth confirmation
+            auth_msg = ws.receive_json()
+            assert auth_msg["type"] == "auth_ok"
+            # Send a task — no orchestrator → error
+            ws.send_json({"type": "task", "request": "hello"})
             msg = ws.receive_json()
             assert msg["type"] == "error"
 
@@ -113,7 +124,7 @@ class TestSSETransport:
         with patch("sentinel.api.routes.streaming._event_bus", bus), \
              patch("sentinel.api.routes.streaming.SSEWriter", QuickSSEWriter):
             client = TestClient(app)
-            resp = client.get("/api/events?task_id=test-123")
+            resp = client.get("/api/events?task_id=test-123", headers=auth_headers())
             assert resp.status_code == 200
 
     @pytest.mark.capability
@@ -144,7 +155,7 @@ class TestSSETransport:
         with patch("sentinel.api.routes.streaming._event_bus", bus), \
              patch("sentinel.api.routes.streaming.SSEWriter", TrackingSSEWriter):
             client = TestClient(app)
-            resp = client.get("/api/events?task_id=test-789")
+            resp = client.get("/api/events?task_id=test-789", headers=auth_headers())
             assert resp.status_code == 200
             # Each SSE request creates a new writer instance
             assert len(writer_instances) == 1

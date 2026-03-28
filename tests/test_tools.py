@@ -260,7 +260,8 @@ class TestShell:
     @pytest.mark.asyncio
     async def test_allowed_command(self, executor):
         tagged, exec_meta = await executor.execute("shell", {"command": "ls /workspace"})
-        assert tagged.trust_level == TrustLevel.TRUSTED
+        # Direct shell (no sandbox) is UNTRUSTED — it has network + full FS
+        assert tagged.trust_level == TrustLevel.UNTRUSTED
 
     @pytest.mark.asyncio
     async def test_blocked_command(self, executor):
@@ -618,22 +619,16 @@ class TestSandboxDispatch:
             tagged, exec_meta = await executor.execute("shell", {"command": "ls /workspace"})
             mock_exec.assert_called_once()
             assert tagged.source == DataSource.TOOL
-            assert tagged.trust_level == TrustLevel.TRUSTED
+            # Direct shell (no sandbox) is UNTRUSTED — it has network + full FS
+            assert tagged.trust_level == TrustLevel.UNTRUSTED
 
     @pytest.mark.asyncio
-    async def test_direct_shell_when_trust_low(self, engine, mock_sandbox):
-        """Shell commands use async subprocess at TL0/TL1 even with sandbox configured."""
+    async def test_sandbox_used_at_low_trust(self, engine, mock_sandbox):
+        """Shell commands use sandbox even at TL1 when sandbox is available."""
         executor = ToolExecutor(engine, sandbox=mock_sandbox, trust_level=1)
-        with patch("sentinel.tools.executor.asyncio.create_subprocess_exec") as mock_exec:
-            mock_proc = AsyncMock()
-            mock_proc.communicate.return_value = (b"direct output", b"")
-            mock_proc.returncode = 0
-            mock_exec.return_value = mock_proc
-            tagged, exec_meta = await executor.execute("shell", {"command": "ls /workspace"})
-            mock_exec.assert_called_once()
-            mock_sandbox.run.assert_not_awaited()
-            assert tagged.source == DataSource.TOOL
-            assert tagged.trust_level == TrustLevel.TRUSTED
+        tagged, exec_meta = await executor.execute("shell", {"command": "ls /workspace"})
+        mock_sandbox.run.assert_awaited_once()
+        assert tagged.source == DataSource.SANDBOX
 
     @pytest.mark.asyncio
     async def test_policy_blocks_before_sandbox(self, sandbox_executor, mock_sandbox):
@@ -733,18 +728,16 @@ class TestShellSandboxContext:
             spy.assert_called_once_with("ls /workspace", sandbox_context=False)
 
     @pytest.mark.asyncio
-    async def test_low_trust_no_sandbox_context(self, engine):
-        """At TL1 with sandbox configured, sandbox_context is False (sandbox not used at TL<2)."""
+    async def test_low_trust_sandbox_context_true(self, engine):
+        """At TL1 with sandbox configured, sandbox_context is True (sandbox always used when available)."""
         mock_sandbox = AsyncMock()
+        mock_sandbox.run.return_value = MagicMock(
+            stdout="ok", stderr="", exit_code=0, timed_out=False, oom_killed=False,
+        )
         executor = ToolExecutor(engine, sandbox=mock_sandbox, trust_level=1)
 
         with patch.object(
             executor._engine, "check_command", wraps=executor._engine.check_command,
-        ) as spy, patch("sentinel.tools.executor.asyncio.create_subprocess_exec") as mock_exec:
-            mock_proc = AsyncMock()
-            mock_proc.communicate.return_value = (b"ok", b"")
-            mock_proc.returncode = 0
-            mock_exec.return_value = mock_proc
-
+        ) as spy:
             await executor.execute("shell_exec", {"command": "ls /workspace"})
-            spy.assert_called_once_with("ls /workspace", sandbox_context=False)
+            spy.assert_called_once_with("ls /workspace", sandbox_context=True)

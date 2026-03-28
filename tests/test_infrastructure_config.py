@@ -220,13 +220,12 @@ class TestSecretHandling:
                 f"Secret keyword '{kw}' found in sentinel-ollama environment"
             )
 
-    def test_pin_required_is_enabled(self, sentinel_service):
-        """PIN authentication must be required — it is the only auth layer."""
-        env = sentinel_service.get("environment", [])
-        env_str = "\n".join(env) if isinstance(env, list) else str(env)
-        assert "SENTINEL_PIN_REQUIRED=true" in env_str, (
-            "SENTINEL_PIN_REQUIRED must be 'true' — disabling PIN auth removes the only "
-            "authentication layer at the API surface"
+    def test_session_key_secret_exists(self, sentinel_service):
+        """JWT session key secret must be available — it is required for auth."""
+        svc_secrets = sentinel_service.get("secrets", [])
+        assert "session_key" in svc_secrets, (
+            "session_key secret must be available to sentinel service — "
+            "JWT auth requires it for token signing/verification"
         )
 
 

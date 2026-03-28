@@ -78,6 +78,9 @@ async def set_credential(service: str, req: CredentialSet):
     if not data:
         raise HTTPException(status_code=400, detail="No credential data provided")
     await store.set(service, data)
+    uid = current_user_id.get()
+    logger.info("Credential set for service=%s by user_id=%d", service, uid,
+                extra={"event": "credential_set"})
     return {"status": "stored", "service": service}
 
 
@@ -86,6 +89,9 @@ async def delete_credential(service: str):
     """Delete credentials for a service."""
     store = _get_store()
     deleted = await store.delete(service)
+    uid = current_user_id.get()
+    logger.info("Credential deleted for service=%s by user_id=%d", service, uid,
+                extra={"event": "credential_deleted"})
     if not deleted:
         raise HTTPException(status_code=404, detail=f"No credentials for {service}")
     return {"status": "deleted", "service": service}

@@ -90,6 +90,9 @@ class Settings(BaseSettings):
     pin_required: bool = True
     pin_file: str = "/run/secrets/sentinel_pin"
 
+    # Bootstrap — display name for the owner account seeded on first run
+    bootstrap_username: str = "Admin"
+
     # Semgrep scanner (replaces CodeShield)
     require_semgrep: bool = True  # fail-closed: block if Semgrep unavailable
     semgrep_timeout: int = 30     # per-scan timeout in seconds
@@ -99,6 +102,7 @@ class Settings(BaseSettings):
     session_max_count: int = Field(default=1000, ge=1)
     conversation_warn_threshold: float = 3.0
     conversation_block_threshold: float = 5.0
+    max_success_forgives: int = Field(default=2, ge=0)
     conversation_enabled: bool = True
     session_risk_decay_per_minute: float = Field(default=2.0, ge=0)  # Risk decays 2.0 per minute of inactivity
     session_lock_timeout_s: int = Field(default=300, ge=0)  # Auto-unlock locked sessions after 5 minutes
@@ -124,6 +128,10 @@ class Settings(BaseSettings):
     embeddings_model: str = "nomic-embed-text"
     embeddings_timeout: int = 30
     auto_memory: bool = False  # auto-store conversation summaries after tasks (disabled: episodic pipeline provides richer data)
+
+    # Anchor allocator — places deterministic named markers in files for file_patch
+    anchor_allocator_enabled: bool = True
+    anchor_allocator_tier: str = "block"  # "section", "block", or "detail"
 
     # MCP server (Phase 3)
     mcp_enabled: bool = True

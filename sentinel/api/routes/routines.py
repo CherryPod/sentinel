@@ -24,6 +24,7 @@ from fastapi.responses import JSONResponse
 from sentinel.api.models import CreateRoutineRequest, UpdateRoutineRequest
 from sentinel.api.rate_limit import limiter
 from sentinel.core.config import settings
+from sentinel.core.context import current_user_id
 from sentinel.routines.cron import validate_trigger_config
 
 logger = logging.getLogger("sentinel.api")
@@ -37,18 +38,21 @@ router = APIRouter()
 
 _routine_store: Any = None
 _routine_engine: Any = None
+_scan_pipeline: Any = None
 
 
 def init(
     *,
     routine_store: Any = None,
     routine_engine: Any = None,
+    scan_pipeline: Any = None,
     **_kwargs: Any,
 ) -> None:
     """Inject dependencies — called once from app.py lifespan."""
-    global _routine_store, _routine_engine
+    global _routine_store, _routine_engine, _scan_pipeline
     _routine_store = routine_store
     _routine_engine = routine_engine
+    _scan_pipeline = scan_pipeline
 
 
 # ── Accessors ──────────────────────────────────────────────────────
@@ -104,6 +108,9 @@ async def create_routine(req: CreateRoutineRequest, request: Request):
             content={"status": "error", "reason": "Routine system not initialized"},
         )
 
+    # Finding #3: Extract user_id from auth context, not hardcoded
+    user_id = current_user_id.get()  # fallback to 1 for single-user mode
+
     # Validate trigger_config matches trigger_type
     try:
         validate_trigger_config(req.trigger_type, req.trigger_config)
@@ -112,6 +119,40 @@ async def create_routine(req: CreateRoutineRequest, request: Request):
             status_code=400,
             content={"status": "error", "reason": str(exc)},
         )
+
+    # Finding #2: S1 scan on prompt before storage — reject injection payloads
+    # before they can execute autonomously on schedule.
+    if _scan_pipeline is not None:
+        prompt = req.action_config.get("prompt", "")
+        try:
+            scan_result = await _scan_pipeline.scan_input(prompt)
+            if not scan_result.is_clean:
+                violation_details = []
+                for scanner_name, sr in scan_result.violations.items():
+                    patterns = [m.pattern_name for m in sr.matches]
+                    violation_details.append(f"{scanner_name}: {', '.join(patterns)}")
+                reason = "Prompt blocked by security scan — " + "; ".join(violation_details)
+                logger.warning(
+                    "Routine creation blocked by S1 scan",
+                    extra={
+                        "event": "routine_create_blocked",
+                        "violations": list(scan_result.violations.keys()),
+                    },
+                )
+                return JSONResponse(
+                    status_code=400,
+                    content={"status": "error", "reason": reason},
+                )
+        except Exception as exc:
+            # Fail closed — if scanning fails, reject the routine
+            logger.error(
+                "S1 scan failed during routine creation, rejecting (fail-closed)",
+                extra={"event": "routine_create_scan_error", "error": str(exc)},
+            )
+            return JSONResponse(
+                status_code=503,
+                content={"status": "error", "reason": "Security scan unavailable — try again later"},
+            )
 
     # Calculate initial next_run_at for cron/interval triggers
     next_run_at = None
@@ -140,6 +181,7 @@ async def create_routine(req: CreateRoutineRequest, request: Request):
             cooldown_s=req.cooldown_s,
             next_run_at=next_run_at,
             max_per_user=settings.routine_max_per_user,
+            user_id=user_id,
         )
     except ValueError as exc:
         raise HTTPException(status_code=429, detail=str(exc))
@@ -161,7 +203,8 @@ async def list_routines(
             content={"status": "error", "reason": "Routine system not initialized"},
         )
 
-    routines = await store.list(enabled_only=enabled_only, limit=limit, offset=offset)
+    user_id = current_user_id.get()
+    routines = await store.list(user_id=user_id, enabled_only=enabled_only, limit=limit, offset=offset)
     return {
         "status": "ok",
         "routines": [_routine_to_dict(r) for r in routines],
@@ -179,8 +222,10 @@ async def get_routine(routine_id: str):
             content={"status": "error", "reason": "Routine system not initialized"},
         )
 
+    # Finding #3: Ownership check — return 404 (not 403) to avoid leaking existence
+    user_id = current_user_id.get()
     routine = await store.get(routine_id)
-    if routine is None:
+    if routine is None or routine.user_id != user_id:
         return JSONResponse(
             status_code=404,
             content={"status": "error", "reason": "Routine not found"},
@@ -197,6 +242,15 @@ async def update_routine(routine_id: str, req: UpdateRoutineRequest):
         return JSONResponse(
             status_code=503,
             content={"status": "error", "reason": "Routine system not initialized"},
+        )
+
+    # Finding #3: Ownership check
+    user_id = current_user_id.get()
+    existing = await store.get(routine_id)
+    if existing is None or existing.user_id != user_id:
+        return JSONResponse(
+            status_code=404,
+            content={"status": "error", "reason": "Routine not found"},
         )
 
     # Build kwargs from non-None fields
@@ -216,17 +270,10 @@ async def update_routine(routine_id: str, req: UpdateRoutineRequest):
     if req.cooldown_s is not None:
         updates["cooldown_s"] = req.cooldown_s
 
-    # Validate trigger_config if both type and config are being updated
+    # Validate trigger_config if type or config is being updated
     trigger_type = req.trigger_type
     trigger_config = req.trigger_config
     if trigger_type or trigger_config:
-        # Need both to validate — fetch existing if one is missing
-        existing = await store.get(routine_id)
-        if existing is None:
-            return JSONResponse(
-                status_code=404,
-                content={"status": "error", "reason": "Routine not found"},
-            )
         effective_type = trigger_type or existing.trigger_type
         effective_config = trigger_config or existing.trigger_config
         try:
@@ -236,6 +283,32 @@ async def update_routine(routine_id: str, req: UpdateRoutineRequest):
                 status_code=400,
                 content={"status": "error", "reason": str(exc)},
             )
+
+    # Finding #2: S1 scan on prompt update
+    if req.action_config is not None and _scan_pipeline is not None:
+        prompt = req.action_config.get("prompt", "")
+        if prompt:
+            try:
+                scan_result = await _scan_pipeline.scan_input(prompt)
+                if not scan_result.is_clean:
+                    violation_details = []
+                    for scanner_name, sr in scan_result.violations.items():
+                        patterns = [m.pattern_name for m in sr.matches]
+                        violation_details.append(f"{scanner_name}: {', '.join(patterns)}")
+                    reason = "Prompt blocked by security scan — " + "; ".join(violation_details)
+                    return JSONResponse(
+                        status_code=400,
+                        content={"status": "error", "reason": reason},
+                    )
+            except Exception as exc:
+                logger.error(
+                    "S1 scan failed for routine update: %s", exc,
+                    extra={"event": "routine_scan_error", "routine_id": routine_id},
+                )
+                return JSONResponse(
+                    status_code=503,
+                    content={"status": "error", "reason": "Security scan unavailable — try again later"},
+                )
 
     if not updates:
         return JSONResponse(
@@ -263,6 +336,15 @@ async def delete_routine(routine_id: str):
             content={"status": "error", "reason": "Routine system not initialized"},
         )
 
+    # Finding #3: Ownership check before delete
+    user_id = current_user_id.get()
+    routine = await store.get(routine_id)
+    if routine is None or routine.user_id != user_id:
+        return JSONResponse(
+            status_code=404,
+            content={"status": "error", "reason": "Routine not found"},
+        )
+
     deleted = await store.delete(routine_id)
     if not deleted:
         return JSONResponse(
@@ -278,10 +360,25 @@ async def delete_routine(routine_id: str):
 async def trigger_routine(routine_id: str, request: Request):
     """Manually trigger a routine execution."""
     engine = _get_routine_engine()
+    store = _get_routine_store()
     if engine is None:
         return JSONResponse(
             status_code=503,
             content={"status": "error", "reason": "Routine engine not running"},
+        )
+
+    # Finding #3: Ownership check before manual trigger — store must be available
+    if store is None:
+        return JSONResponse(
+            status_code=503,
+            content={"status": "error", "reason": "Routine store not available"},
+        )
+    user_id = current_user_id.get()
+    routine = await store.get(routine_id)
+    if routine is None or routine.user_id != user_id:
+        return JSONResponse(
+            status_code=404,
+            content={"status": "error", "reason": "Routine not found"},
         )
 
     execution_id = await engine.trigger_manual(routine_id)
@@ -309,14 +406,19 @@ async def get_routine_executions(
             content={"status": "error", "reason": "Routine system not initialized"},
         )
 
-    # Verify routine exists
-    if store is not None:
-        routine = await store.get(routine_id)
-        if routine is None:
-            return JSONResponse(
-                status_code=404,
-                content={"status": "error", "reason": "Routine not found"},
-            )
+    # Finding #3: Verify routine exists AND belongs to current user — store must be available
+    if store is None:
+        return JSONResponse(
+            status_code=503,
+            content={"status": "error", "reason": "Routine store not available"},
+        )
+    user_id = current_user_id.get()
+    routine = await store.get(routine_id)
+    if routine is None or routine.user_id != user_id:
+        return JSONResponse(
+            status_code=404,
+            content={"status": "error", "reason": "Routine not found"},
+        )
 
     executions = []
     if engine is not None:

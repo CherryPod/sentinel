@@ -1,4 +1,6 @@
 import inspect
+import logging
+from datetime import datetime, timezone
 
 import pytest
 
@@ -403,3 +405,66 @@ class TestFileProvenanceUserScoping:
         sig = inspect.signature(store.record_file_write)
         assert "user_id" in sig.parameters
         assert sig.parameters["user_id"].default is None
+
+
+class TestProvenanceLogging:
+    """Verify security-critical events are logged."""
+
+    @pytest.fixture
+    def store(self):
+        return ProvenanceStore(pool=None)
+
+    @pytest.mark.asyncio
+    async def test_missing_parent_logs_warning(self, store, caplog):
+        """Creating entry with missing parent should log WARNING."""
+        with caplog.at_level(logging.WARNING, logger="sentinel.audit"):
+            tagged = await store.create_tagged_data(
+                "content", DataSource.TOOL, TrustLevel.TRUSTED,
+                parent_ids=["nonexistent-parent-id"], user_id=1,
+            )
+        assert tagged.trust_level == TrustLevel.UNTRUSTED
+        assert any(
+            getattr(r, "event", None) == "provenance_missing_parent"
+            for r in caplog.records
+        ), "Expected log record with event='provenance_missing_parent'"
+
+    @pytest.mark.asyncio
+    async def test_record_file_write_logs_info(self, store, caplog):
+        """File provenance recording should be logged."""
+        with caplog.at_level(logging.INFO, logger="sentinel.audit"):
+            await store.record_file_write("/workspace/test.txt", "data-1", content="hello", user_id=1)
+        assert any(
+            getattr(r, "event", None) == "file_provenance_write"
+            for r in caplog.records
+        ), "Expected log record with event='file_provenance_write'"
+
+
+class TestRowToTaggedErrorHandling:
+    """Verify _row_to_tagged handles corrupt data gracefully."""
+
+    def test_invalid_trust_level_raises(self):
+        """Unknown trust level should raise ValueError."""
+        from sentinel.security.provenance import _row_to_tagged
+        row = {
+            "data_id": "test", "content": "x", "trust_level": "INVALID_LEVEL",
+            "source": "user", "originated_from": "", "parent_ids": [],
+            "created_at": datetime.now(timezone.utc),
+        }
+        with pytest.raises(ValueError):
+            _row_to_tagged(row)
+
+    def test_non_datetime_created_at_logs_warning(self, caplog):
+        """Non-datetime created_at should log warning, not silently replace."""
+        from sentinel.security.provenance import _row_to_tagged
+        row = {
+            "data_id": "test", "content": "x", "trust_level": "trusted",
+            "source": "user", "originated_from": "", "parent_ids": [],
+            "created_at": "not-a-datetime",
+        }
+        with caplog.at_level(logging.WARNING, logger="sentinel.audit"):
+            result = _row_to_tagged(row)
+        assert result.id == "test"
+        assert any(
+            getattr(r, "event", None) == "provenance_invalid_timestamp"
+            for r in caplog.records
+        ), "Expected log record with event='provenance_invalid_timestamp'"

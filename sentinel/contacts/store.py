@@ -35,7 +35,7 @@ def _dt_to_iso(dt: datetime | None) -> str | None:
 
 # ── Updatable field whitelists ────────────────────────────────────
 
-_USER_UPDATABLE = {"display_name", "pin_hash", "is_active", "role", "trust_level", "sessions_invalidated_at"}
+_USER_UPDATABLE = {"display_name", "pin_hash", "is_active", "role", "trust_level", "sessions_invalidated_at", "must_change_pin"}
 _CONTACT_UPDATABLE = {"display_name", "linked_user_id", "is_user"}
 _CHANNEL_UPDATABLE = {"channel", "identifier", "is_default"}
 

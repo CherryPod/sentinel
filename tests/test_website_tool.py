@@ -1,10 +1,23 @@
 """Tests for the website tool (create/remove/list)."""
 import os
 import pytest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
+from sentinel.core.context import current_user_id
 from sentinel.core.models import PolicyResult, ValidationResult
+from sentinel.core.workspace import get_user_workspace
 from sentinel.tools.executor import ToolExecutor, ToolBlockedError, ToolError
+
+
+@pytest.fixture(autouse=True)
+def set_user_context():
+    """Set user context for workspace path resolution."""
+    token = current_user_id.set(1)
+    yield
+    current_user_id.reset(token)
+
+
+from pathlib import Path
 
 
 def _make_executor(workspace_path):
@@ -14,7 +27,23 @@ def _make_executor(workspace_path):
     engine.check_file_read.return_value = ValidationResult(status=PolicyResult.ALLOWED)
     engine.check_file_write.return_value = ValidationResult(status=PolicyResult.ALLOWED)
     engine._workspace_path = workspace_path
+    engine.workspace_path = workspace_path
     return ToolExecutor(policy_engine=engine)
+
+
+@pytest.fixture(autouse=True)
+def _patch_workspace(tmp_path):
+    """Patch get_user_workspace to return tmp_path directly for tests.
+
+    The executor's _website method calls get_user_workspace() which normally
+    returns /workspace/<user_id>. We patch it to return tmp_path so tests
+    can create/check files in the same location the executor uses.
+    """
+    with patch(
+        "sentinel.tools.executor.get_user_workspace",
+        return_value=Path(tmp_path),
+    ):
+        yield
 
 
 class TestWebsiteList:

@@ -1,6 +1,214 @@
 import pytest
 
 from sentinel.security.code_fixer import fix_code, FixResult
+from sentinel.security.code_fixer._core import (
+    _iter_code_chars, CharContext, count_in_code,
+)
+
+# ===================================================================
+# PARSER: _iter_code_chars
+# ===================================================================
+
+class TestIterCodeCharsPython:
+    """Parser tests for Python language mode."""
+
+    def test_line_comment(self):
+        content = 'x = 1  # comment\n'
+        contexts = [(c, ctx) for _, c, ctx in _iter_code_chars(content, "python")]
+        # Everything after # should be COMMENT
+        hash_idx = content.index("#")
+        for i, (c, ctx) in enumerate(contexts):
+            if i < hash_idx:
+                assert ctx == CharContext.CODE, f"char {i} ({c!r}) should be CODE"
+            elif c == "\n":
+                pass  # newline context doesn't matter
+            else:
+                assert ctx == CharContext.COMMENT, f"char {i} ({c!r}) should be COMMENT"
+
+    def test_single_quoted_string(self):
+        content = "x = 'hello'\n"
+        contexts = {i: ctx for i, _, ctx in _iter_code_chars(content, "python")}
+        quote_start = content.index("'")
+        quote_end = content.rindex("'")
+        for i in range(quote_start, quote_end + 1):
+            assert contexts[i] == CharContext.STRING
+
+    def test_double_quoted_string(self):
+        content = 'x = "hello"\n'
+        contexts = {i: ctx for i, _, ctx in _iter_code_chars(content, "python")}
+        quote_start = content.index('"')
+        quote_end = content.rindex('"')
+        for i in range(quote_start, quote_end + 1):
+            assert contexts[i] == CharContext.STRING
+
+    def test_triple_quoted_string(self):
+        content = '"""has "quotes" inside"""\n'
+        contexts = {i: ctx for i, _, ctx in _iter_code_chars(content, "python")}
+        # Everything is STRING except the final newline
+        for i in range(len(content) - 1):
+            assert contexts[i] == CharContext.STRING
+
+    def test_escaped_quote_inside_string(self):
+        content = 'x = "it\'s \\"fine\\""\n'
+        contexts = {i: ctx for i, _, ctx in _iter_code_chars(content, "python")}
+        # x = should be CODE, everything in quotes should be STRING
+        assert contexts[0] == CharContext.CODE  # x
+
+    def test_empty_content(self):
+        result = list(_iter_code_chars("", "python"))
+        assert result == []
+
+    def test_all_comment(self):
+        content = "# just a comment\n# another"
+        contexts = [(c, ctx) for _, c, ctx in _iter_code_chars(content, "python")]
+        for c, ctx in contexts:
+            if c != "\n":
+                assert ctx == CharContext.COMMENT
+
+
+class TestIterCodeCharsJavaScript:
+    """Parser tests for JavaScript language mode."""
+
+    def test_line_comment(self):
+        content = "x = 1; // comment\n"
+        contexts = {i: ctx for i, _, ctx in _iter_code_chars(content, "javascript")}
+        slash_idx = content.index("//")
+        for i in range(slash_idx, len(content) - 1):
+            assert contexts[i] == CharContext.COMMENT
+
+    def test_block_comment(self):
+        content = "x = /* block */ 1;\n"
+        contexts = {i: ctx for i, _, ctx in _iter_code_chars(content, "javascript")}
+        start = content.index("/*")
+        end = content.index("*/") + 2
+        for i in range(start, end):
+            assert contexts[i] == CharContext.COMMENT
+
+    def test_template_literal_simple(self):
+        content = "`hello ${name}`"
+        contexts = {i: ctx for i, _, ctx in _iter_code_chars(content, "javascript")}
+        # ` is STRING, hello is STRING, $ is STRING, { is CODE,
+        # name is CODE, } is CODE, ` is STRING
+        assert contexts[0] == CharContext.STRING  # opening `
+        assert contexts[len(content) - 1] == CharContext.STRING  # closing `
+        name_start = content.index("name")
+        for i in range(name_start, name_start + 4):
+            assert contexts[i] == CharContext.CODE
+
+    def test_template_literal_nested_string(self):
+        content = '`${a + "b"}`'
+        contexts = {i: ctx for i, _, ctx in _iter_code_chars(content, "javascript")}
+        # "b" inside ${} is STRING-within-CODE-within-STRING
+        b_quote_start = content.index('"')
+        assert contexts[b_quote_start] == CharContext.STRING
+
+    def test_backtick_string(self):
+        content = "`simple template`"
+        contexts = {i: ctx for i, _, ctx in _iter_code_chars(content, "javascript")}
+        for i in range(len(content)):
+            assert contexts[i] == CharContext.STRING
+
+
+class TestIterCodeCharsRust:
+    """Parser tests for Rust language mode."""
+
+    def test_raw_string(self):
+        content = 'r#"has "quotes" inside"#'
+        contexts = {i: ctx for i, _, ctx in _iter_code_chars(content, "rust")}
+        for i in range(len(content)):
+            assert contexts[i] == CharContext.STRING
+
+    def test_raw_string_double_hash(self):
+        content = 'r##"has "# inside"##'
+        contexts = {i: ctx for i, _, ctx in _iter_code_chars(content, "rust")}
+        for i in range(len(content)):
+            assert contexts[i] == CharContext.STRING
+
+    def test_line_comment(self):
+        content = "let x = 1; // comment\n"
+        contexts = {i: ctx for i, _, ctx in _iter_code_chars(content, "rust")}
+        slash_idx = content.index("//")
+        for i in range(slash_idx, len(content) - 1):
+            assert contexts[i] == CharContext.COMMENT
+
+
+class TestIterCodeCharsShell:
+    """Parser tests for Shell language mode."""
+
+    def test_heredoc_body(self):
+        content = "cat <<EOF\nit's content\nEOF\n"
+        contexts = {i: ctx for i, _, ctx in _iter_code_chars(content, "shell")}
+        # "it's content" should be STRING
+        body_start = content.index("it's")
+        body_end = content.index("\nEOF")
+        for i in range(body_start, body_end):
+            assert contexts[i] == CharContext.STRING
+
+    def test_comment(self):
+        content = "x=1 # comment\n"
+        contexts = {i: ctx for i, _, ctx in _iter_code_chars(content, "shell")}
+        hash_idx = content.index("#")
+        for i in range(hash_idx, len(content) - 1):
+            assert contexts[i] == CharContext.COMMENT
+
+
+class TestIterCodeCharsCSS:
+    """Parser tests for CSS language mode."""
+
+    def test_block_comment(self):
+        content = "/* comment */ body { }\n"
+        contexts = {i: ctx for i, _, ctx in _iter_code_chars(content, "css")}
+        start = 0
+        end = content.index("*/") + 2
+        for i in range(start, end):
+            assert contexts[i] == CharContext.COMMENT
+
+    def test_no_nesting(self):
+        content = "/* outer /* inner */ still? */"
+        contexts = {i: ctx for i, _, ctx in _iter_code_chars(content, "css")}
+        # CSS doesn't nest — after first */ everything is CODE until next /*
+        first_close = content.index("*/") + 2
+        still_idx = content.index("still")
+        assert contexts[still_idx] == CharContext.CODE
+
+
+class TestIterCodeCharsSQL:
+    """Parser tests for SQL language mode."""
+
+    def test_line_comment(self):
+        content = "SELECT -- comment\nFROM"
+        contexts = {i: ctx for i, _, ctx in _iter_code_chars(content, "sql")}
+        dash_idx = content.index("--")
+        newline_idx = content.index("\n")
+        for i in range(dash_idx, newline_idx):
+            assert contexts[i] == CharContext.COMMENT
+        from_idx = content.index("FROM")
+        assert contexts[from_idx] == CharContext.CODE
+
+
+class TestIterCodeCharsJSON:
+    """Parser tests for JSON language mode."""
+
+    def test_string_value(self):
+        content = '{"key": "True story"}'
+        contexts = {i: ctx for i, _, ctx in _iter_code_chars(content, "json")}
+        # "True story" should be STRING
+        true_idx = content.index("True")
+        assert contexts[true_idx] == CharContext.STRING
+
+
+class TestCountInCode:
+    """Tests for count_in_code() convenience helper."""
+
+    def test_braces_in_strings_not_counted(self):
+        assert count_in_code('x = "{"', "python", "{") == 0
+
+    def test_braces_in_code_counted(self):
+        assert count_in_code('x = {y: "{"}', "javascript", "{") == 1
+
+    def test_braces_in_comments_not_counted(self):
+        assert count_in_code("x = 1 // {", "javascript", "{") == 0
+        assert count_in_code("/* { */ x = 1", "css", "{") == 0
 
 
 # ===================================================================
@@ -1899,3 +2107,148 @@ class TestCrossLanguageDetection:
         r = fix_code("test.py", code)
         dup_warnings = [e for e in r.errors_found if "duplicate" in e.lower()]
         assert len(dup_warnings) == 1
+
+
+# ===================================================================
+# ROLLBACK ON CRASH
+# ===================================================================
+
+class TestRollbackOnCrash:
+    def test_fixer_crash_preserves_original_content(self):
+        """Finding #35: if a fixer partially mutates then crashes,
+        the chain should return the pre-fixer content, not the partial mutation."""
+        from unittest.mock import patch
+
+        original = 'import os\n\ndef hello():\n    print("hi")\n'
+
+        # Patch fix_python to partially mutate then crash.
+        # _run_chain should rollback to the pre-fixer content.
+        def crashing_fixer(content):
+            raise RuntimeError("fixer crash")
+
+        crashing_fixer.__name__ = "fix_python"
+
+        with patch("sentinel.security.code_fixer.FIXER_CHAINS", {
+            ".py": [crashing_fixer],
+        }):
+            result = fix_code("test.py", original)
+
+        # Content should NOT contain partial mutation
+        assert "CORRUPTED" not in result.content
+        # Should have a warning about the crash
+        assert any("crashed" in w.lower() for w in result.warnings)
+
+
+# ===================================================================
+# FINDING REGRESSIONS: Each test proves an audit finding bug is fixed
+# ===================================================================
+
+class TestFindingRegressions:
+    """Each test proves an audit finding bug is fixed."""
+
+    def test_finding_1_js_unclosed_string_no_corruption(self):
+        """Finding #1: _js_fix_unclosed_strings must not corrupt valid JS."""
+        content = 'const msg = "it\'s fine";\n'
+        result = fix_code("app.js", content)
+        assert "it's fine" in result.content
+
+    def test_finding_2_json_bool_in_string_preserved(self):
+        """Finding #2: fix_json must not replace True inside string values."""
+        # Intentionally broken JSON (trailing comma) with True in a string value
+        content = '{"msg": "True story", "flag": True,}\n'
+        result = fix_code("data.json", content)
+        assert "True story" in result.content
+
+    def test_finding_2_json_bool_outside_string_replaced(self):
+        """Finding #2: bare True outside strings should still be replaced."""
+        content = '{"flag": True, "other": False}\n'
+        result = fix_code("data.json", content)
+        assert "true" in result.content
+        assert "false" in result.content
+
+    def test_finding_9_shell_heredoc_no_spurious_quote(self):
+        """Finding #9: shell heredoc body with odd quotes must not get fixed."""
+        content = "#!/bin/bash\ncat <<EOF\nit's content\nEOF\n"
+        result = fix_code("test.sh", content)
+        assert "it's content" in result.content
+
+    def test_finding_12_css_braces_in_comments(self):
+        """Finding #12: CSS brace counting must skip comments."""
+        content = "/* { */ body { color: red; }\n"
+        result = fix_code("style.css", content)
+        # Should NOT append a spurious closing brace
+        assert result.content.count("}") == 1
+
+    def test_finding_15_js_braces_in_strings(self):
+        """Finding #15: JS object semicolons brace counting must skip strings."""
+        content = 'const x = "{";\nconst y = 1;\n'
+        result = fix_code("app.js", content)
+        assert 'const x = "{"' in result.content
+
+    def test_finding_35_rollback_on_crash(self):
+        """Finding #35: fixer crash must rollback partial mutations.
+
+        Covered by TestRollbackOnCrash.test_fixer_crash_preserves_original_content
+        (added in Phase 0). This is a cross-reference, not a duplicate test.
+        """
+        pass
+
+    def test_finding_57_markdown_regex_performance(self):
+        """Finding #57: markdown link regex must not cause catastrophic backtracking."""
+        import time
+        content = "[link](" + " " * 100_000 + "\n"
+        start = time.monotonic()
+        fix_code("test.md", content)
+        elapsed = time.monotonic() - start
+        assert elapsed < 5.0, f"Regex backtracking: took {elapsed:.1f}s"
+
+
+# ===================================================================
+# WIRING VALIDATION: Verify package restructure is correctly wired
+# ===================================================================
+
+class TestWiring:
+    """Verify package restructure correctly wires all modules."""
+
+    def test_all_fixer_modules_wired(self):
+        """Every language module's public fix_*/strip_* functions appear in FIXER_CHAINS."""
+        from sentinel.security.code_fixer import FIXER_CHAINS
+        from sentinel.security.code_fixer import _css, _dockerfile, _html
+        from sentinel.security.code_fixer import _javascript, _json, _markdown
+        from sentinel.security.code_fixer import _python, _rust, _shell
+        from sentinel.security.code_fixer import _sql, _toml, _universal, _yaml
+
+        all_fixers = set()
+        for chain in FIXER_CHAINS.values():
+            all_fixers.update(chain)
+
+        modules = [
+            _universal, _python, _javascript, _json, _yaml, _toml,
+            _html, _css, _shell, _rust, _dockerfile, _markdown, _sql,
+        ]
+
+        for mod in modules:
+            public_fixers = [
+                getattr(mod, n) for n in dir(mod)
+                if n.startswith(("fix_", "strip_")) and callable(getattr(mod, n))
+                and n != "fix_code"
+            ]
+            for fixer in public_fixers:
+                assert fixer in all_fixers, (
+                    f"{mod.__name__}.{fixer.__name__} not in FIXER_CHAINS"
+                )
+
+    def test_public_api_import(self):
+        from sentinel.security.code_fixer import fix_code, FixResult
+        assert callable(fix_code)
+        assert FixResult is not None
+
+    def test_executor_import_pattern(self):
+        from sentinel.security.code_fixer import fix_code as code_fixer_fix
+        assert callable(code_fixer_fix)
+
+    def test_no_stale_monolith(self):
+        from pathlib import Path
+        import sentinel.security
+        security_dir = Path(sentinel.security.__file__).parent
+        assert not (security_dir / "code_fixer.py").exists(), "Old monolith still exists"

@@ -26,8 +26,11 @@ services:
       - SENTINEL_TRUST_LEVEL=4
       - SENTINEL_VERBOSE_RESULTS=false
       - SENTINEL_BENCHMARK_MODE=false
-      - SENTINEL_PIN_REQUIRED=true
       - SENTINEL_PIN_FILE=/run/secrets/sentinel_pin
+      - SENTINEL_SESSION_KEY_FILE=/run/secrets/session_key
+      - SENTINEL_CREDENTIAL_KEY_FILE=/run/secrets/credential_key
+      - SENTINEL_BOOTSTRAP_USERNAME=Admin
+      - SENTINEL_REQUIRE_SECRETS=true
       - SENTINEL_OLLAMA_URL=http://sentinel-ollama:11434
       - SENTINEL_OLLAMA_MODEL=qwen3:14b
       - SENTINEL_OLLAMA_TIMEOUT=7200
@@ -114,6 +117,8 @@ services:
       - smtp_password
       - imap_password
       - caldav_password
+      - session_key
+      - credential_key
     ports:
       - "3001:8443"
       - "3002:8080"
@@ -197,6 +202,10 @@ secrets:
     file: /home/user/.secrets/mail_password.txt
   grok_api_key:
     file: ./secrets/grok_api_key.txt
+  session_key:
+    file: ./secrets/session_key.txt
+  credential_key:
+    file: ./secrets/credential_key.txt
 
 volumes:
   sentinel-data:

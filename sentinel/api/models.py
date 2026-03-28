@@ -140,6 +140,15 @@ class CreateRoutineRequest(BaseModel):
     def validate_action_config(cls, v: dict) -> dict:
         if "prompt" not in v or not v["prompt"]:
             raise ValueError("action_config must contain a non-empty 'prompt' key")
+        # Finding #9: Validate max_iterations at creation time
+        max_iter = v.get("max_iterations")
+        if max_iter is not None:
+            if not isinstance(max_iter, int) or max_iter < 1 or max_iter > 50:
+                raise ValueError("max_iterations must be an integer between 1 and 50")
+        # Finding #1: Validate approval_mode values
+        approval = v.get("approval_mode")
+        if approval is not None and approval not in ("auto", "full"):
+            raise ValueError("approval_mode must be 'auto' or 'full'")
         return v
 
 
@@ -172,6 +181,15 @@ class UpdateRoutineRequest(BaseModel):
         if v is not None:
             if "prompt" not in v or not v["prompt"]:
                 raise ValueError("action_config must contain a non-empty 'prompt' key")
+            # Finding #9: Validate max_iterations at update time
+            max_iter = v.get("max_iterations")
+            if max_iter is not None:
+                if not isinstance(max_iter, int) or max_iter < 1 or max_iter > 50:
+                    raise ValueError("max_iterations must be an integer between 1 and 50")
+            # Finding #1: Validate approval_mode values
+            approval = v.get("approval_mode")
+            if approval is not None and approval not in ("auto", "full"):
+                raise ValueError("approval_mode must be 'auto' or 'full'")
         return v
 
 

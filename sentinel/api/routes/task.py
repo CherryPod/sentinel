@@ -108,12 +108,26 @@ async def handle_task(req: TaskRequest, request: Request):
 
     orchestrator = _resolve_orchestrator()
     if orchestrator is None:
-        return {"status": "error", "reason": "Orchestrator not initialized"}
+        return JSONResponse(
+            status_code=503,
+            content={"status": "error", "reason": "Orchestrator not initialized"},
+        )
 
-    # Server-side session binding: derive session from client IP, not client-provided ID.
-    # This prevents attackers from rotating session IDs to bypass conversation tracking.
+    # Server-side session binding: derive session from client IP + authenticated user_id.
+    # Including user_id ensures sessions are per-user, not shared across accounts at the
+    # same IP (e.g. office NAT, household). The ContextVar is set by JWTMiddleware before
+    # this handler runs.
+    from sentinel.core.context import current_user_id
     client_ip = request.client.host if request.client else "unknown"
-    source_key = f"{req.source}:{client_ip}"
+    user_id = current_user_id.get()
+
+    logger.info(
+        "Task submitted by user_id=%d from %s: %.200s",
+        user_id, client_ip, req.request,
+        extra={"event": "task_submitted", "user_id": user_id, "source": req.source},
+    )
+
+    source_key = f"{req.source}:{client_ip}:{user_id}"
 
     try:
         message_router = _resolve_message_router()
@@ -190,8 +204,8 @@ async def submit_confirmation(confirmation_id: str, decision: ApprovalDecision):
     Same contract as /approve — returns the tool execution result on confirm,
     or a denied/error status dict.
     """
-    from sentinel.core.context import current_user_id
-
+    # The JWTMiddleware has already set current_user_id in the ContextVar before this
+    # handler runs — no need to set it manually here.
     if _message_router is None:
         return {"status": "error", "reason": "Router not available"}
 
@@ -200,21 +214,17 @@ async def submit_confirmation(confirmation_id: str, decision: ApprovalDecision):
     if gate is None or fast_path is None:
         return {"status": "error", "reason": "Confirmation gate not available"}
 
-    ctx_token = current_user_id.set(1)
-    try:
-        if decision.granted:
-            entry = await gate.confirm(confirmation_id)
-            if entry is None:
-                return {"status": "error", "reason": "Invalid, expired, or duplicate confirmation"}
-            result = await fast_path.execute_confirmed(
-                entry.tool_name, entry.tool_params, entry.task_id,
-            )
-            return result
-        else:
-            await gate.cancel(confirmation_id)
-            return {"status": "denied", "reason": decision.reason or "Cancelled via WebUI"}
-    finally:
-        current_user_id.reset(ctx_token)
+    if decision.granted:
+        entry = await gate.confirm(confirmation_id)
+        if entry is None:
+            return {"status": "error", "reason": "Invalid, expired, or duplicate confirmation"}
+        result = await fast_path.execute_confirmed(
+            entry.tool_name, entry.tool_params, entry.task_id,
+        )
+        return result
+    else:
+        await gate.cancel(confirmation_id)
+        return {"status": "denied", "reason": decision.reason or "Cancelled via WebUI"}
 
 
 # ── Session debug endpoint ────────────────────────────────────────
@@ -225,11 +235,19 @@ async def get_session(session_id: str):
     """Debug endpoint: view session state and conversation history."""
     session_store = _resolve_session_store()
     if session_store is None:
-        return {"error": "Session store not initialized"}
+        return JSONResponse(
+            status_code=503,
+            content={"error": "Session store not initialized"},
+        )
 
+    # SessionStore.get() already scopes by current_user_id via ContextVar —
+    # a user can only retrieve their own sessions (RLS + user_id filter).
     session = await session_store.get(session_id)
     if session is None:
-        return {"error": "Session not found or expired"}
+        return JSONResponse(
+            status_code=404,
+            content={"error": "Session not found or expired"},
+        )
 
     return {
         "session_id": session.session_id,

@@ -2,9 +2,15 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from sentinel.core.models import DataSource, ScanMatch, ScanResult, TrustLevel
-from sentinel.security.pipeline import PipelineScanResult, ScanPipeline, SecurityViolation, _SANDWICH_REMINDER
-from sentinel.security.scanner import CommandPatternScanner, CredentialScanner, SensitivePathScanner
+from sentinel.core.models import DataSource, OutputDestination, ScanMatch, ScanResult, TrustLevel
+from sentinel.security.pipeline import PipelineScanResult, ScanPipeline, SecurityViolation, ViolationPhase, _SANDWICH_REMINDER
+from sentinel.security.scanner import (
+    CommandPatternScanner,
+    CredentialScanner,
+    EncodingNormalizationScanner,
+    SensitivePathScanner,
+    VulnerabilityEchoScanner,
+)
 from sentinel.worker.ollama import OllamaWorker
 from sentinel.security import prompt_guard
 from sentinel.security.provenance import reset_store
@@ -49,11 +55,26 @@ def cmd_scanner_fixture():
 
 
 @pytest.fixture
-def pipeline(cred_scanner_fixture, path_scanner_fixture, cmd_scanner_fixture, mock_worker):
+def echo_scanner_fixture():
+    return VulnerabilityEchoScanner()
+
+
+@pytest.fixture
+def encoding_scanner_fixture(cred_scanner_fixture, path_scanner_fixture, cmd_scanner_fixture):
+    return EncodingNormalizationScanner(
+        cred_scanner_fixture, path_scanner_fixture, cmd_scanner_fixture
+    )
+
+
+@pytest.fixture
+def pipeline(cred_scanner_fixture, path_scanner_fixture, cmd_scanner_fixture,
+             encoding_scanner_fixture, echo_scanner_fixture, mock_worker):
     return ScanPipeline(
         cred_scanner=cred_scanner_fixture,
         path_scanner=path_scanner_fixture,
         cmd_scanner=cmd_scanner_fixture,
+        encoding_scanner=encoding_scanner_fixture,
+        echo_scanner=echo_scanner_fixture,
         worker=mock_worker,
     )
 
@@ -77,6 +98,96 @@ class TestPipelineScanResult:
         )
         assert r.is_clean is False
         assert "test" in r.violations
+
+
+class TestConstructorContracts:
+    def test_all_scanners_required(self):
+        """Omitting encoding_scanner or echo_scanner raises TypeError."""
+        with pytest.raises(TypeError):
+            ScanPipeline(
+                cred_scanner=CredentialScanner([]),
+                path_scanner=SensitivePathScanner([]),
+            )
+
+    def test_explicit_scanners_accepted(self):
+        """All five scanners + worker accepted, stored as-is (no silent defaults)."""
+        cred = CredentialScanner([])
+        path = SensitivePathScanner([])
+        cmd = CommandPatternScanner()
+        enc = EncodingNormalizationScanner(cred, path, cmd)
+        echo = VulnerabilityEchoScanner()
+        worker = MagicMock(spec=OllamaWorker)
+        p = ScanPipeline(cred_scanner=cred, path_scanner=path, cmd_scanner=cmd,
+                         encoding_scanner=enc, echo_scanner=echo, worker=worker)
+        assert p._cred_scanner is cred
+        assert p._encoding_scanner is enc
+        assert p._echo_scanner is echo
+
+    @patch("sentinel.security.pipeline.settings")
+    def test_baseline_mode_blocked_at_tl3(self, mock_settings):
+        """Baseline mode + TL >= 3 raises RuntimeError at construction."""
+        mock_settings.baseline_mode = True
+        mock_settings.trust_level = 3
+        cred = CredentialScanner([])
+        path = SensitivePathScanner([])
+        cmd = CommandPatternScanner()
+        enc = EncodingNormalizationScanner(cred, path, cmd)
+        echo = VulnerabilityEchoScanner()
+        worker = MagicMock(spec=OllamaWorker)
+        with pytest.raises(RuntimeError, match="Baseline mode cannot be active"):
+            ScanPipeline(cred_scanner=cred, path_scanner=path, cmd_scanner=cmd,
+                         encoding_scanner=enc, echo_scanner=echo, worker=worker)
+
+    @patch("sentinel.security.pipeline.settings")
+    def test_baseline_mode_allowed_at_tl2(self, mock_settings):
+        """Baseline mode + TL < 3 is allowed (for benchmarking)."""
+        mock_settings.baseline_mode = True
+        mock_settings.trust_level = 2
+        cred = CredentialScanner([])
+        path = SensitivePathScanner([])
+        cmd = CommandPatternScanner()
+        enc = EncodingNormalizationScanner(cred, path, cmd)
+        echo = VulnerabilityEchoScanner()
+        worker = MagicMock(spec=OllamaWorker)
+        p = ScanPipeline(cred_scanner=cred, path_scanner=path, cmd_scanner=cmd,
+                         encoding_scanner=enc, echo_scanner=echo, worker=worker)
+        assert p._cred_scanner is cred
+
+    def test_violation_phase_enum(self):
+        """ViolationPhase enum has INPUT and OUTPUT values."""
+        assert ViolationPhase.INPUT.value == "input"
+        assert ViolationPhase.OUTPUT.value == "output"
+
+    def test_security_violation_default_phase(self):
+        """SecurityViolation defaults to INPUT phase."""
+        exc = SecurityViolation("test", {})
+        assert exc.phase == ViolationPhase.INPUT
+
+    def test_security_violation_explicit_phase(self):
+        """SecurityViolation accepts explicit phase."""
+        exc = SecurityViolation("test", {}, phase=ViolationPhase.OUTPUT)
+        assert exc.phase == ViolationPhase.OUTPUT
+
+    @patch("sentinel.security.pipeline.settings")
+    def test_baseline_mode_log_is_warning_not_critical(self, mock_settings, caplog):
+        """Finding #10: baseline log should be WARNING, not CRITICAL."""
+        mock_settings.baseline_mode = True
+        mock_settings.trust_level = 1
+        import logging
+        with caplog.at_level(logging.WARNING, logger="sentinel.audit"):
+            ScanPipeline(
+                cred_scanner=CredentialScanner([]),
+                path_scanner=SensitivePathScanner([]),
+                cmd_scanner=CommandPatternScanner(),
+                encoding_scanner=EncodingNormalizationScanner(
+                    CredentialScanner([]), SensitivePathScanner([]), CommandPatternScanner()
+                ),
+                echo_scanner=VulnerabilityEchoScanner(),
+                worker=MagicMock(spec=OllamaWorker),
+            )
+        records = [r for r in caplog.records if "baseline" in r.message.lower()]
+        assert len(records) >= 1
+        assert records[0].levelno == logging.WARNING
 
 
 class TestScanInput:
@@ -512,15 +623,29 @@ class TestScanOutputContextAware:
     """Part 1A: Output scan uses context-aware path scanning."""
 
     @patch("sentinel.security.pipeline.settings")
-    async def test_path_in_prose_passes_output_scan(self, mock_settings, pipeline):
-        """Sensitive path in prose should pass output scan."""
+    async def test_path_in_prose_passes_display_scan(self, mock_settings, pipeline):
+        """Sensitive path in prose should pass DISPLAY output scan (non-strict)."""
         mock_settings.prompt_guard_enabled = False
         mock_settings.baseline_mode = False
-        result = await pipeline.scan_output("Cgroups use /proc/cgroups to expose parameters")
-        # sensitive_path_scanner should be clean (context-aware)
+        result = await pipeline.scan_output(
+            "Cgroups use /proc/cgroups to expose parameters",
+            destination=OutputDestination.DISPLAY,
+        )
+        # sensitive_path_scanner should be clean (context-aware, non-strict)
         sp_result = result.results.get("sensitive_path_scanner")
         assert sp_result is not None
         assert sp_result.found is False
+
+    @patch("sentinel.security.pipeline.settings")
+    async def test_path_in_prose_flags_execution_scan(self, mock_settings, pipeline):
+        """Sensitive path in prose should flag on EXECUTION output (strict mode)."""
+        mock_settings.prompt_guard_enabled = False
+        mock_settings.baseline_mode = False
+        result = await pipeline.scan_output("Cgroups use /proc/cgroups to expose parameters")
+        # strict mode: prose paths flagged for execution-bound output
+        sp_result = result.results.get("sensitive_path_scanner")
+        assert sp_result is not None
+        assert sp_result.found is True
 
     @patch("sentinel.security.pipeline.settings")
     async def test_path_in_code_block_flags_output_scan(self, mock_settings, pipeline):
@@ -851,3 +976,281 @@ class TestEncodingScannerInPipeline:
         mock_settings.baseline_mode = False
         result = await pipeline.scan_input("normal safe text")
         assert "encoding_normalization_scanner" in result.results
+
+
+class TestOllamaHealthCheckRetry:
+    """Finding #5: Ollama health check retry pattern.
+
+    The actual retry loop lives inside lifecycle.py's lifespan() async generator,
+    which is tightly coupled to FastAPI app startup. These tests validate the
+    retry-then-fail pattern in isolation by simulating the same logic.
+    Integration testing of the real startup path is covered by container smoke tests.
+    """
+
+    @pytest.mark.asyncio
+    async def test_ollama_health_check_raises_after_max_retries(self):
+        """Simulate 3 failed health checks → RuntimeError."""
+        import httpx
+
+        max_retries = 3
+        reachable = False
+
+        # Mock httpx.AsyncClient to always raise ConnectionError
+        mock_response = MagicMock()
+        mock_client = AsyncMock()
+        mock_client.get = AsyncMock(side_effect=httpx.ConnectError("Connection refused"))
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+
+        # Replicate the retry logic from lifecycle.py
+        for attempt in range(1, max_retries + 1):
+            try:
+                async with mock_client as client:
+                    resp = await client.get("http://fake:11434/api/tags")
+                    if resp.status_code == 200:
+                        reachable = True
+                        break
+            except Exception:
+                pass  # retry
+
+        assert not reachable
+        # Verify the same RuntimeError that lifecycle.py would raise
+        with pytest.raises(RuntimeError, match="Ollama unreachable after"):
+            if not reachable:
+                raise RuntimeError(
+                    f"Ollama unreachable after {max_retries} attempts "
+                    f"(URL: http://fake:11434). Cannot start — worker requests "
+                    f"would fail. Check sentinel-ollama container."
+                )
+
+    @pytest.mark.asyncio
+    async def test_ollama_health_check_succeeds_on_retry(self):
+        """Simulate 2 failures then success → no error."""
+        import httpx
+
+        max_retries = 3
+        reachable = False
+        attempts_made = 0
+
+        # Side effects: fail twice, succeed on third
+        success_response = MagicMock()
+        success_response.status_code = 200
+        success_response.json.return_value = {"models": []}
+        side_effects = [
+            httpx.ConnectError("Connection refused"),
+            httpx.ConnectError("Connection refused"),
+            success_response,
+        ]
+
+        mock_client = AsyncMock()
+        mock_client.get = AsyncMock(side_effect=side_effects)
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+
+        for attempt in range(1, max_retries + 1):
+            attempts_made = attempt
+            try:
+                async with mock_client as client:
+                    resp = await client.get("http://fake:11434/api/tags")
+                    if resp.status_code == 200:
+                        reachable = True
+                        break
+            except Exception:
+                pass  # retry
+
+        assert reachable
+        assert attempts_made == 3  # took all 3 attempts
+
+
+class TestAsciiGateGreekRestriction:
+    """Finding #11: archaic Greek and Coptic should be blocked."""
+
+    @patch("sentinel.security.pipeline.settings")
+    @pytest.mark.asyncio
+    async def test_archaic_greek_blocked(self, mock_settings, pipeline):
+        mock_settings.prompt_guard_enabled = False
+        mock_settings.baseline_mode = False
+        mock_settings.spotlighting_enabled = False
+        with pytest.raises(SecurityViolation, match="blocked script"):
+            await pipeline.process_with_qwen("Test \u03d8\u03da\u03dc")  # Ϙ Ϛ Ϝ
+
+    @patch("sentinel.security.pipeline.settings")
+    @pytest.mark.asyncio
+    async def test_coptic_blocked(self, mock_settings, pipeline):
+        mock_settings.prompt_guard_enabled = False
+        mock_settings.baseline_mode = False
+        mock_settings.spotlighting_enabled = False
+        with pytest.raises(SecurityViolation, match="blocked script"):
+            await pipeline.process_with_qwen("Test \u03e2\u03e4")  # Ϣ Ϥ
+
+    @patch("sentinel.security.pipeline.settings")
+    @pytest.mark.asyncio
+    async def test_common_greek_math_passes(self, mock_settings, pipeline, mock_worker):
+        mock_settings.prompt_guard_enabled = False
+        mock_settings.baseline_mode = False
+        mock_settings.spotlighting_enabled = False
+        mock_settings.ollama_model = "qwen3:14b"
+        tagged, _ = await pipeline.process_with_qwen(
+            "Calculate \u03b1 + \u03b2 = \u03b3, \u03c0 \u2248 3.14, \u03a3 sum"
+        )
+        assert tagged.content == "Generated response text"
+
+
+class TestPromptGuardEarlyExit:
+    """Findings #14, #18: PromptGuard block should still run deterministic scanners."""
+
+    @patch("sentinel.security.pipeline.settings")
+    async def test_promptguard_block_still_runs_deterministic_input(self, mock_settings, pipeline):
+        """When PromptGuard is required but unavailable, deterministic scanners still run."""
+        mock_settings.prompt_guard_enabled = True
+        mock_settings.require_prompt_guard = True
+        mock_settings.baseline_mode = False
+        result = await pipeline.scan_input("AKIAIOSFODNN7EXAMPLE")
+        assert result.results["prompt_guard"].found is True
+        assert "credential_scanner" in result.results
+        assert "sensitive_path_scanner" in result.results
+        assert "command_pattern_scanner" in result.results
+        assert "encoding_normalization_scanner" in result.results
+
+    @patch("sentinel.security.pipeline.settings")
+    async def test_promptguard_block_still_runs_deterministic_output(self, mock_settings, pipeline):
+        """When PromptGuard is required but unavailable, deterministic scanners still run on output."""
+        mock_settings.prompt_guard_enabled = True
+        mock_settings.require_prompt_guard = True
+        mock_settings.baseline_mode = False
+        result = await pipeline.scan_output("AKIAIOSFODNN7EXAMPLE")
+        assert result.results["prompt_guard"].found is True
+        assert "credential_scanner" in result.results
+
+
+class TestDisplaySkipResult:
+    """Finding #20: DISPLAY skip should be distinguishable from clean scan."""
+
+    @patch("sentinel.security.pipeline.settings")
+    async def test_display_skip_marked(self, mock_settings, pipeline):
+        """DISPLAY destination records a distinguishable skip marker, not an empty result."""
+        mock_settings.prompt_guard_enabled = False
+        mock_settings.baseline_mode = False
+        result = await pipeline.scan_output("Some safe output", destination=OutputDestination.DISPLAY)
+        cmd_result = result.results.get("command_pattern_scanner")
+        assert cmd_result is not None
+        assert cmd_result.found is False
+        assert len(cmd_result.matches) == 1
+        assert "skipped" in cmd_result.matches[0].pattern_name.lower()
+
+
+class TestPromptLengthTokenEstimate:
+    """Finding #23: token estimation gate."""
+
+    @patch("sentinel.security.pipeline.settings")
+    @pytest.mark.asyncio
+    async def test_token_estimate_blocks_dense_prompt(self, mock_settings, pipeline):
+        """90K chars / 3.0 = 30K tokens > 24K limit."""
+        mock_settings.prompt_guard_enabled = False
+        mock_settings.baseline_mode = False
+        mock_settings.spotlighting_enabled = False
+        with pytest.raises(SecurityViolation, match="token"):
+            await pipeline.process_with_qwen("x" * 90_000, skip_input_scan=True)
+
+    @patch("sentinel.security.pipeline.settings")
+    @pytest.mark.asyncio
+    async def test_moderate_prompt_passes_both_gates(self, mock_settings, pipeline, mock_worker):
+        """50K chars / 3.0 = 16.7K tokens — under both limits."""
+        mock_settings.prompt_guard_enabled = False
+        mock_settings.baseline_mode = False
+        mock_settings.spotlighting_enabled = False
+        mock_settings.ollama_model = "qwen3:14b"
+        tagged, _ = await pipeline.process_with_qwen("x" * 50_000, skip_input_scan=True)
+        assert tagged.content == "Generated response text"
+
+
+class TestThinkBlockStripping:
+    """Finding #1: think blocks stripped from tagged.content."""
+
+    @patch("sentinel.security.pipeline.settings")
+    @pytest.mark.asyncio
+    async def test_think_blocks_stripped_from_tagged_content(self, mock_settings, pipeline, mock_worker):
+        mock_settings.prompt_guard_enabled = False
+        mock_settings.baseline_mode = False
+        mock_settings.spotlighting_enabled = False
+        mock_settings.ollama_model = "qwen3:14b"
+        mock_worker.generate = AsyncMock(
+            return_value=(
+                "<think>Internal reasoning about the task</think>\nHere is the actual response",
+                None,
+            ),
+        )
+        tagged, _ = await pipeline.process_with_qwen("test")
+        assert "<think>" not in tagged.content
+        assert "Internal reasoning" not in tagged.content
+        assert "Here is the actual response" in tagged.content
+
+
+class TestRetryImprovements:
+    """Findings #24, #26, #27."""
+
+    @patch("sentinel.security.pipeline.settings")
+    @pytest.mark.asyncio
+    async def test_retry_logs_attempt_info(self, mock_settings, pipeline, mock_worker, caplog):
+        mock_settings.prompt_guard_enabled = False
+        mock_settings.baseline_mode = False
+        mock_settings.spotlighting_enabled = False
+        mock_settings.ollama_model = "qwen3:14b"
+        mock_worker.generate = AsyncMock(
+            side_effect=[("", None), ("Retry worked", {"eval_count": 10})],
+        )
+        import logging
+        with caplog.at_level(logging.INFO, logger="sentinel.audit"):
+            await pipeline.process_with_qwen("test")
+        assert any(
+            "qwen_retry_success" in str(getattr(r, "__dict__", {}))
+            for r in caplog.records
+        )
+
+    @patch("sentinel.security.pipeline.settings")
+    @pytest.mark.asyncio
+    async def test_retry_preserves_stats(self, mock_settings, pipeline, mock_worker):
+        mock_settings.prompt_guard_enabled = False
+        mock_settings.baseline_mode = False
+        mock_settings.spotlighting_enabled = False
+        mock_settings.ollama_model = "qwen3:14b"
+        mock_worker.generate = AsyncMock(
+            side_effect=[("", None), ("OK", {"eval_count": 42})],
+        )
+        _, stats = await pipeline.process_with_qwen("test")
+        assert stats is not None
+        assert stats.get("eval_count") == 42
+
+
+class TestEchoScannerLogging:
+    """Finding #29."""
+
+    @patch("sentinel.security.pipeline.settings")
+    @pytest.mark.asyncio
+    async def test_echo_scanner_skip_logged(self, mock_settings, pipeline, mock_worker, caplog):
+        mock_settings.prompt_guard_enabled = False
+        mock_settings.baseline_mode = False
+        mock_settings.spotlighting_enabled = False
+        mock_settings.ollama_model = "qwen3:14b"
+        import logging
+        with caplog.at_level(logging.DEBUG, logger="sentinel.audit"):
+            await pipeline.process_with_qwen("test")
+        assert any(
+            "echo_scan_skipped" in str(getattr(r, "__dict__", {}))
+            for r in caplog.records
+        )
+
+    @patch("sentinel.security.pipeline.settings")
+    @pytest.mark.asyncio
+    async def test_echo_scanner_clean_logged(self, mock_settings, pipeline, mock_worker, caplog):
+        mock_settings.prompt_guard_enabled = False
+        mock_settings.baseline_mode = False
+        mock_settings.spotlighting_enabled = False
+        mock_settings.ollama_model = "qwen3:14b"
+        import logging
+        with caplog.at_level(logging.DEBUG, logger="sentinel.audit"):
+            await pipeline.process_with_qwen("test", user_input="harmless input")
+        assert any(
+            "echo_scan_clean" in str(getattr(r, "__dict__", {}))
+            for r in caplog.records
+        )

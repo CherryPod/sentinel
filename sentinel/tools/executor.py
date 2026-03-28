@@ -6,17 +6,21 @@ import os
 import re
 import shlex
 import shutil
-import subprocess
 import time
 
 from sentinel.core.models import DataSource, PolicyResult, TaggedData, TrustLevel
-from sentinel.core.context import get_task_id
+from sentinel.core.config import settings
+from sentinel.core.context import current_user_id, get_task_id
+from sentinel.core.workspace import get_user_workspace
 from sentinel.security.code_extractor import extract_code_blocks
 from sentinel.security.policy_engine import PolicyEngine
 from sentinel.security.provenance import create_tagged_data, get_file_writer, get_tagged_data, record_file_write
 
 from sentinel.security import semgrep_scanner
 from sentinel.security.code_fixer import fix_code as code_fixer_fix
+from sentinel.tools.anchor_allocator import allocate_anchors
+from sentinel.tools.anchor_allocator._core import build_marker
+from sentinel.tools.anchor_allocator._memory import clear_anchor_map
 from sentinel.tools.sidecar import SidecarClient, SidecarResponse
 
 logger = logging.getLogger("sentinel.audit")
@@ -26,6 +30,10 @@ logger = logging.getLogger("sentinel.audit")
 PODMAN_BUILD_TIMEOUT = 300
 PODMAN_RUN_TIMEOUT = 60
 PODMAN_STOP_TIMEOUT = 30
+
+# Maximum file size for file_read and pre-read diff in file_write (1 MiB).
+# Prevents OOM on large files. Referenced by _file_read and _file_write.
+FILE_READ_MAX_BYTES = 1_048_576
 
 # Tools that can be dispatched to the WASM sidecar when enabled
 WASM_TOOLS = frozenset({"file_read", "file_write", "shell_exec", "http_fetch"})
@@ -81,6 +89,7 @@ _CODE_EXTENSIONS = frozenset({
     # Config/data formats — Qwen wraps these in fences/RESPONSE tags too
     ".yaml", ".yml", ".json", ".xml", ".html", ".css", ".sql",
     ".dockerfile", ".containerfile", ".cfg", ".ini", ".conf", ".php",
+    ".svg",
 })
 
 
@@ -98,6 +107,27 @@ class ToolBlockedError(ToolError):
     """Tool execution blocked by policy."""
 
 
+class _CredentialOverlay:
+    """Proxy that overlays per-user credentials onto base settings.
+
+    Looks up attribute names in field_map -> creds dict. Falls through
+    to base settings for anything not in the map or not in creds.
+    Replaces the per-service inner classes (_UserCalDavConfig, _UserEmailConfig).
+    """
+
+    def __init__(self, creds: dict, base, field_map: dict[str, str]):
+        self._creds = creds
+        self._base = base
+        self._field_map = field_map
+
+    def __getattr__(self, name: str):
+        if name in self._field_map:
+            cred_key = self._field_map[name]
+            if cred_key in self._creds:
+                return self._creds[cred_key]
+        return getattr(self._base, name)
+
+
 class ToolExecutor:
     """Executes tool actions with policy validation before every operation.
 
@@ -110,8 +140,8 @@ class ToolExecutor:
         self,
         policy_engine: PolicyEngine,
         sidecar: SidecarClient | None = None,
-        google_oauth=None,
-        sandbox=None,
+        google_oauth: object | None = None,
+        sandbox: "PodmanSandbox | None" = None,
         trust_level: int = 0,
     ):
         self._engine = policy_engine
@@ -122,15 +152,135 @@ class ToolExecutor:
         self._signal_channel = None
         self._telegram_channel = None
         self._credential_store = None
+        self._episodic_store = None
         self._session_file_reads: set[str] = set()
 
-    def set_channels(self, signal_channel=None, telegram_channel=None):
+        # Handler dispatch — built once, not on every execute() call.
+        self._handlers = {
+            "file_write": self._file_write,
+            "file_read": self._file_read,
+            "file_patch": self._file_patch,
+            "mkdir": self._mkdir,
+            "shell": self._shell,
+            "shell_exec": self._shell,
+            "podman_build": self._podman_build,
+            "podman_run": self._podman_run,
+            "podman_stop": self._podman_stop,
+            "web_search": self._web_search,
+            "email_search": self._email_search,
+            "email_read": self._email_read,
+            "email_send": self._email_send,
+            "email_draft": self._email_draft,
+            "calendar_list_events": self._calendar_list_events,
+            "calendar_create_event": self._calendar_create_event,
+            "calendar_update_event": self._calendar_update_event,
+            "calendar_delete_event": self._calendar_delete_event,
+            "signal_send": self._signal_send,
+            "telegram_send": self._telegram_send,
+            "x_search": self._x_search,
+            "website": self._website,
+        }
+
+    def reset_session_state(self):
+        """Clear per-session tracking state between tasks.
+
+        Prevents cross-request leakage of file read tracking
+        (Finding #14: _session_file_reads grows unboundedly).
+        """
+        self._session_file_reads.clear()
+
+    # Tools whose "path" arg should be rewritten to per-user workspace dirs.
+    _PATH_REWRITE_TOOLS = frozenset({
+        "file_write", "file_read", "file_patch", "mkdir", "shell", "shell_exec",
+    })
+
+    def _rewrite_workspace_paths(self, tool_name: str, args: dict) -> dict:
+        """Rewrite /workspace/ paths to /workspace/{user_id}/ for multi-user isolation.
+
+        The planner uses /workspace/ as a virtual root. This method transparently
+        inserts the current user's ID so the planner never decides which user
+        directory to target.
+
+        For file tools: rewrites the "path" arg.
+        For shell tools: rewrites /workspace/ references in the "command" string.
+        Returns a shallow copy if any rewrite occurred, original args otherwise.
+        """
+        if tool_name not in self._PATH_REWRITE_TOOLS:
+            return args
+
+        user_id = current_user_id.get()
+        if user_id == 0:
+            # No user context (infrastructure task) — pass through unchanged
+            return args
+
+        workspace_prefix = settings.workspace_path.rstrip("/") + "/"  # "/workspace/"
+        user_prefix = f"{workspace_prefix}{user_id}/"                 # "/workspace/1/"
+
+        if tool_name in ("shell", "shell_exec"):
+            command = args.get("command", "")
+            # Rewrite /workspace/ refs that aren't already user-scoped.
+            # Negative lookahead: don't rewrite if already /workspace/{digit}/
+            rewritten = re.sub(
+                rf"{re.escape(workspace_prefix)}(?!\d+/)",
+                user_prefix,
+                command,
+            )
+            if rewritten != command:
+                args = {**args, "command": rewritten}
+                logger.debug(
+                    "Rewrote workspace path in shell command",
+                    extra={"event": "workspace_path_rewrite", "tool": tool_name},
+                )
+            return args
+
+        # File tools: rewrite "path" arg
+        path = args.get("path", "")
+        if not path.startswith(workspace_prefix):
+            return args
+        # Already user-scoped? (e.g. /workspace/1/sites/...) — skip
+        remainder = path[len(workspace_prefix):]
+        if remainder and remainder.split("/", 1)[0].isdigit():
+            return args
+
+        rewritten_path = user_prefix + remainder
+        args = {**args, "path": rewritten_path}
+        logger.debug(
+            "Rewrote workspace path for multi-user isolation",
+            extra={
+                "event": "workspace_path_rewrite",
+                "tool": tool_name,
+                "original": path,
+                "rewritten": rewritten_path,
+            },
+        )
+        return args
+
+    def set_channels(self, signal_channel: object | None = None, telegram_channel: object | None = None):
         """Wire messaging channels for signal_send / telegram_send tools."""
+        if self._signal_channel is not None and signal_channel is not None:
+            logger.warning(
+                "Overwriting existing signal channel — possible lifecycle bug",
+                extra={"event": "channel_overwrite", "channel": "signal"},
+            )
+        if self._telegram_channel is not None and telegram_channel is not None:
+            logger.warning(
+                "Overwriting existing telegram channel — possible lifecycle bug",
+                extra={"event": "channel_overwrite", "channel": "telegram"},
+            )
         self._signal_channel = signal_channel
         self._telegram_channel = telegram_channel
 
-    def set_credential_store(self, credential_store):
+    def set_episodic_store(self, episodic_store: object | None):
+        """Wire episodic store for anchor map persistence."""
+        self._episodic_store = episodic_store
+
+    def set_credential_store(self, credential_store: object | None):
         """Wire per-user credential store for email/calendar tools."""
+        if self._credential_store is not None and credential_store is not None:
+            logger.warning(
+                "Overwriting existing credential store — possible lifecycle bug",
+                extra={"event": "credential_store_overwrite"},
+            )
         self._credential_store = credential_store
 
     async def _resolve_credentials(self, service: str) -> dict | None:
@@ -155,20 +305,11 @@ class ToolExecutor:
                 )
             return settings
 
-        class _UserCalDavConfig:
-            def __init__(self, creds, base):
-                self._creds = creds
-                self._base = base
-            def __getattr__(self, name):
-                _MAP = {
-                    "caldav_url": "url", "caldav_username": "username",
-                    "caldav_password": "password",
-                }
-                if name in _MAP and _MAP[name] in self._creds:
-                    return self._creds[_MAP[name]]
-                return getattr(self._base, name)
-
-        return _UserCalDavConfig(user_caldav, settings)
+        return _CredentialOverlay(user_caldav, settings, {
+            "caldav_url": "url",
+            "caldav_username": "username",
+            "caldav_password": "password",
+        })
 
     async def _get_email_config(self):
         """Return a config object with per-user IMAP/SMTP credentials overlaid.
@@ -187,29 +328,14 @@ class ToolExecutor:
                 )
             return settings
 
-        # Build a settings overlay with per-user IMAP/SMTP credentials
-        class _UserEmailConfig:
-            """Overlay that reads IMAP/SMTP from per-user creds, rest from settings."""
-            def __init__(self, creds, base):
-                self._creds = creds
-                self._base = base
-            def __getattr__(self, name):
-                # Map IMAP credential fields
-                _IMAP_MAP = {
-                    "imap_host": "host", "imap_port": "port",
-                    "imap_username": "username", "imap_password": "password",
-                    "imap_use_ssl": "use_ssl",
-                    "smtp_host": "smtp_host", "smtp_port": "smtp_port",
-                    "smtp_username": "smtp_username", "smtp_password": "smtp_password",
-                    "smtp_use_tls": "smtp_use_tls", "smtp_from_address": "from_address",
-                }
-                if name in _IMAP_MAP:
-                    cred_key = _IMAP_MAP[name]
-                    if cred_key in self._creds:
-                        return self._creds[cred_key]
-                return getattr(self._base, name)
-
-        return _UserEmailConfig(user_imap, settings)
+        return _CredentialOverlay(user_imap, settings, {
+            "imap_host": "host", "imap_port": "port",
+            "imap_username": "username", "imap_password": "password",
+            "imap_use_ssl": "use_ssl",
+            "smtp_host": "smtp_host", "smtp_port": "smtp_port",
+            "smtp_username": "smtp_username", "smtp_password": "smtp_password",
+            "smtp_use_tls": "smtp_use_tls", "smtp_from_address": "from_address",
+        })
 
     def get_tool_descriptions(self) -> list[dict]:
         return [
@@ -477,34 +603,17 @@ class ToolExecutor:
             },
         )
 
+        # Multi-user workspace path translation: the planner uses /workspace/
+        # as a virtual root but files actually live at /workspace/{user_id}/.
+        # Rewrite args here so all downstream handlers (Python + sidecar) see
+        # the real per-user path. The planner never decides the user directory.
+        args = self._rewrite_workspace_paths(tool_name, args)
+
         # NOTE: See U4/SIMP-1 — 18 tool handlers follow 3 repetitive patterns
         # (~600 lines of structural duplication in backend dispatch). Deduplication
         # deferred: the handler-per-tool pattern is more readable than a generic
         # dispatch framework for the current tool count.
-        handler = {
-            "file_write": self._file_write,
-            "file_read": self._file_read,
-            "file_patch": self._file_patch,
-            "mkdir": self._mkdir,
-            "shell": self._shell,
-            "shell_exec": self._shell,  # Alias: planner uses shell_exec at TL4
-            "podman_build": self._podman_build,
-            "podman_run": self._podman_run,
-            "podman_stop": self._podman_stop,
-            "web_search": self._web_search,
-            "email_search": self._email_search,
-            "email_read": self._email_read,
-            "email_send": self._email_send,
-            "email_draft": self._email_draft,
-            "calendar_list_events": self._calendar_list_events,
-            "calendar_create_event": self._calendar_create_event,
-            "calendar_update_event": self._calendar_update_event,
-            "calendar_delete_event": self._calendar_delete_event,
-            "signal_send": self._signal_send,
-            "telegram_send": self._telegram_send,
-            "x_search": self._x_search,
-            "website": self._website,
-        }.get(tool_name)
+        handler = self._handlers.get(tool_name)
 
         # Dispatch to sidecar for WASM-capable tools.
         # Falls back to Python handler if sidecar execution fails AND a
@@ -737,7 +846,10 @@ class ToolExecutor:
         if not query:
             raise ToolError("Search query is required")
 
-        max_results = min(int(args.get("max_results", 20)), settings.gmail_max_search_results)
+        try:
+            max_results = min(int(args.get("max_results", 20)), settings.gmail_max_search_results)
+        except (ValueError, TypeError):
+            raise ToolError("'max_results' must be a valid integer")
 
         token = await self._google_oauth.get_access_token()
         try:
@@ -873,7 +985,13 @@ class ToolExecutor:
         if not query:
             query = "*"  # List all recent emails
 
-        max_results = min(int(args.get("max_results", 20)), settings.gmail_max_search_results)
+        # NOTE: Uses gmail_max_search_results for IMAP too — the setting name
+        # is Gmail-specific but the value applies to all email backends.
+        # Tracked as Finding #33 in audit_executor_20260323.md.
+        try:
+            max_results = min(int(args.get("max_results", 20)), settings.gmail_max_search_results)
+        except (ValueError, TypeError):
+            raise ToolError("'max_results' must be a valid integer")
 
         try:
             results = await search_emails(config, query, max_results=max_results)
@@ -1012,7 +1130,10 @@ class ToolExecutor:
         calendar_id = args.get("calendar_id", "primary")
         time_min = args.get("time_min")
         time_max = args.get("time_max")
-        max_results = min(int(args.get("max_results", 50)), settings.calendar_max_results)
+        try:
+            max_results = min(int(args.get("max_results", 50)), settings.calendar_max_results)
+        except (ValueError, TypeError):
+            raise ToolError("'max_results' must be a valid integer")
 
         token = await self._google_oauth.get_access_token()
         try:
@@ -1156,7 +1277,10 @@ class ToolExecutor:
         config = await self._get_caldav_config()
         time_min = args.get("time_min")
         time_max = args.get("time_max")
-        max_results = min(int(args.get("max_results", 50)), settings.calendar_max_results)
+        try:
+            max_results = min(int(args.get("max_results", 50)), settings.calendar_max_results)
+        except (ValueError, TypeError):
+            raise ToolError("'max_results' must be a valid integer")
 
         try:
             events = await list_events(
@@ -1270,11 +1394,19 @@ class ToolExecutor:
 
         message = args.get("message", "").strip()
         if not message:
+            logger.warning(
+                "signal_send rejected: empty message",
+                extra={"event": "tool_signal_send_rejected", "reason": "empty_message"},
+            )
             raise ToolError("'message' is required")
 
         # Recipient is pre-resolved by tool dispatch (contact registry)
         recipient = (args.get("recipient") or "").strip()
         if not recipient:
+            logger.warning(
+                "signal_send rejected: no recipient",
+                extra={"event": "tool_signal_send_rejected", "reason": "no_recipient"},
+            )
             raise ToolError("No recipient — contact resolution failed or no default contact configured")
 
         out = OutgoingMessage(
@@ -1310,11 +1442,19 @@ class ToolExecutor:
 
         message = args.get("message", "").strip()
         if not message:
+            logger.warning(
+                "telegram_send rejected: empty message",
+                extra={"event": "tool_telegram_send_rejected", "reason": "empty_message"},
+            )
             raise ToolError("'message' is required")
 
         # Recipient is pre-resolved by tool dispatch (contact registry)
         chat_id = (args.get("recipient") or "").strip()
         if not chat_id:
+            logger.warning(
+                "telegram_send rejected: no recipient",
+                extra={"event": "tool_telegram_send_rejected", "reason": "no_recipient"},
+            )
             raise ToolError("No recipient — contact resolution failed or no default contact configured")
 
         out = OutgoingMessage(
@@ -1538,17 +1678,58 @@ class ToolExecutor:
                 )
                 fix_result = None
 
+        # --- Anchor allocator ---
+        from sentinel.core.config import settings as _aa_settings
+        _aa_user_id = current_user_id.get()
+        if _aa_settings.anchor_allocator_enabled and ext.lower() in _CODE_EXTENSIONS:
+            _structural_fail = (
+                fix_result is not None
+                and any("structural_integrity_failure" in e for e in fix_result.errors_found)
+            )
+            if _structural_fail:
+                _ep_store = getattr(self, '_episodic_store', None)
+                if _ep_store:
+                    try:
+                        await clear_anchor_map(path, _ep_store, _aa_user_id)
+                    except Exception:
+                        pass
+                logger.warning(
+                    "File structurally invalid — anchor allocation skipped",
+                    extra={"event": "anchor_allocator_skipped_integrity", "path": path},
+                )
+            else:
+                try:
+                    _anchor_result = await allocate_anchors(
+                        path=path,
+                        content=content,
+                        episodic_store=getattr(self, '_episodic_store', None),
+                        user_id=_aa_user_id,
+                        tier=_aa_settings.anchor_allocator_tier,
+                    )
+                    if _anchor_result.changed:
+                        content = _anchor_result.content
+                    if _anchor_result.parse_failed:
+                        logger.warning(
+                            "Anchor allocation parse failed",
+                            extra={"event": "anchor_allocation_failed", "path": path,
+                                   "error": _anchor_result.error},
+                        )
+                except Exception:
+                    logger.warning(
+                        "Anchor allocator crash — writing content without anchors",
+                        extra={"event": "anchor_allocator_error", "path": path},
+                        exc_info=True,
+                    )
+
         # F1: Pre-read existing file for diff_stats metadata.
-        # Cap to FILE_READ_MAX_BYTES to match _file_read's 1 MiB limit —
-        # prevents OOM on large pre-existing files.
-        FILE_READ_MAX_BYTES = 1_048_576
+        # Cap to FILE_READ_MAX_BYTES (module constant) — prevents OOM.
         _before_content = None
         _before_size = None
         try:
             file_size = os.path.getsize(path)
             _before_size = file_size
             if file_size <= FILE_READ_MAX_BYTES:
-                with open(path) as f:
+                with open(path, encoding="utf-8") as f:
                     _before_content = f.read()
             else:
                 # File too large for diff — record size but skip content
@@ -1590,7 +1771,7 @@ class ToolExecutor:
                             },
                         )
 
-            with open(path, "w") as f:
+            with open(path, "w", encoding="utf-8") as f:
                 f.write(content)
         except OSError as exc:
             logger.error(
@@ -1642,7 +1823,7 @@ class ToolExecutor:
             )
         return tagged, exec_meta
 
-    async def _file_patch(self, args: dict) -> tuple:
+    async def _file_patch(self, args: dict) -> tuple[TaggedData, dict | None]:
         """Apply an incremental modification to an existing file.
 
         Deterministic string operation — no LLM involved. The anchor and
@@ -1662,7 +1843,8 @@ class ToolExecutor:
         if not anchor:
             raise ToolError("anchor is required")
 
-        if operation != "delete" and not content:
+        # replace with empty content is equivalent to delete — allow it
+        if operation not in ("delete", "replace") and not content:
             raise ToolError(f"Operation {operation!r} requires content")
 
         # ── Policy gate ──────────────────────────────────────────────
@@ -1859,11 +2041,55 @@ class ToolExecutor:
                 exec_meta["css_selector"] = selector
                 exec_meta["css_resolved_length"] = len(anchor)
 
+        # ── Range anchor syntax (name...name-end) ────────────────────
+        if "..." in anchor and not anchor.startswith("css:") and "css_position" not in exec_meta:
+            start_name, end_name = anchor.split("...", 1)
+            start_marker = build_marker(path, start_name.strip())
+            end_marker = build_marker(path, end_name.strip())
+
+            if start_marker is None or end_marker is None:
+                raise ToolError(
+                    f"Range anchors not supported for {os.path.splitext(path)[1]} files"
+                )
+
+            start_count = current.count(start_marker)
+            end_count = current.count(end_marker)
+
+            if start_count != 1:
+                raise ToolError(
+                    f"Range anchor start '{start_name.strip()}' found {start_count} times "
+                    f"(expected 1) in {path}"
+                )
+            if end_count != 1:
+                raise ToolError(
+                    f"Range anchor end '{end_name.strip()}' found {end_count} times "
+                    f"(expected 1) in {path}"
+                )
+
+            start_idx = current.index(start_marker)
+            end_idx = current.index(end_marker) + len(end_marker)
+
+            if start_idx >= end_idx:
+                raise ToolError(f"Range anchor start must come before end in {path}")
+
+            anchor = current[start_idx:end_idx]
+            exec_meta["range_anchor"] = True
+            exec_meta["range_start"] = start_name.strip()
+            exec_meta["range_end"] = end_name.strip()
+            logger.debug(
+                "Range anchor resolved",
+                extra={
+                    "event": "range_anchor_resolved",
+                    "start": start_name.strip(), "end": end_name.strip(),
+                    "span_length": end_idx - start_idx,
+                },
+            )
+
         # ── Find text anchor ─────────────────────────────────────────
         # If CSS selector already resolved the position, skip text matching.
         # The CSS path guarantees a unique element match via BeautifulSoup;
         # the text representation may not be unique but the position is.
-        if "css_position" not in exec_meta:
+        if "css_position" not in exec_meta and not exec_meta.get("range_anchor"):
             count = current.count(anchor)
             if count == 0:
                 logger.debug(
@@ -1954,24 +2180,39 @@ class ToolExecutor:
                         if len(blocks) == 1 and blocks[0].code.strip():
                             content = blocks[0].code
 
-                # Code fixer
-                fix_result = code_fixer_fix(path, content)
-                if fix_result and not fix_result.skipped:
-                    content = fix_result.content
-                    exec_meta["code_fixer_changed"] = fix_result.changed
-                    exec_meta["code_fixer_fixes"] = fix_result.fixes_applied
-                    exec_meta["code_fixer_errors"] = fix_result.errors_found
-                    exec_meta["code_fixer_warnings"] = fix_result.warnings
-                    if fix_result.changed:
-                        logger.debug(
-                            "file_patch code fixer applied",
-                            extra={
-                                "event": "file_patch_code_fixer",
-                                "path": path,
-                                "fixes": fix_result.fixes_applied,
-                            },
-                        )
-                else:
+                # Code fixer — crash must never block a patch (matches
+                # _file_write policy). Log and continue with original content.
+                try:
+                    fix_result = code_fixer_fix(path, content)
+                    if fix_result and not fix_result.skipped:
+                        content = fix_result.content
+                        exec_meta["code_fixer_changed"] = fix_result.changed
+                        exec_meta["code_fixer_fixes"] = fix_result.fixes_applied
+                        exec_meta["code_fixer_errors"] = fix_result.errors_found
+                        exec_meta["code_fixer_warnings"] = fix_result.warnings
+                        if fix_result.changed:
+                            logger.debug(
+                                "file_patch code fixer applied",
+                                extra={
+                                    "event": "file_patch_code_fixer",
+                                    "path": path,
+                                    "fixes": fix_result.fixes_applied,
+                                },
+                            )
+                    else:
+                        exec_meta["code_fixer_changed"] = False
+                        exec_meta["code_fixer_fixes"] = []
+                        exec_meta["code_fixer_errors"] = []
+                        exec_meta["code_fixer_warnings"] = []
+                except Exception:
+                    logger.warning(
+                        "Code fixer crash in file_patch — using original content",
+                        extra={
+                            "event": "code_fixer_error_patch",
+                            "path": path,
+                        },
+                        exc_info=True,
+                    )
                     exec_meta["code_fixer_changed"] = False
                     exec_meta["code_fixer_fixes"] = []
                     exec_meta["code_fixer_errors"] = []
@@ -1981,6 +2222,56 @@ class ToolExecutor:
                 exec_meta["code_fixer_fixes"] = []
                 exec_meta["code_fixer_errors"] = []
                 exec_meta["code_fixer_warnings"] = []
+
+        # --- Anchor allocator (file_patch) ---
+        # Skip for delete operations (content is None) and when allocator is disabled
+        from sentinel.core.config import settings as _aa_settings_patch
+        _aa_patch_user_id = current_user_id.get()
+        if _aa_settings_patch.anchor_allocator_enabled and content:
+            _structural_fail = any(
+                "structural_integrity_failure" in e
+                for e in exec_meta.get("code_fixer_errors", [])
+            )
+            if _structural_fail:
+                _ep_store = getattr(self, '_episodic_store', None)
+                if _ep_store:
+                    try:
+                        await clear_anchor_map(path, _ep_store, _aa_patch_user_id)
+                    except Exception:
+                        pass
+                logger.warning(
+                    "File structurally invalid — anchor allocation skipped (file_patch)",
+                    extra={"event": "anchor_allocator_skipped_integrity_patch", "path": path},
+                )
+                exec_meta["anchor_allocator_changed"] = False
+                exec_meta["anchor_count"] = 0
+            else:
+                try:
+                    _anchor_result = await allocate_anchors(
+                        path=path,
+                        content=content,
+                        episodic_store=getattr(self, '_episodic_store', None),
+                        user_id=_aa_patch_user_id,
+                        tier=_aa_settings_patch.anchor_allocator_tier,
+                    )
+                    if _anchor_result.changed:
+                        content = _anchor_result.content
+                    exec_meta["anchor_allocator_changed"] = _anchor_result.changed
+                    exec_meta["anchor_count"] = len(_anchor_result.anchors)
+                    if _anchor_result.parse_failed:
+                        logger.warning(
+                            "Anchor allocation parse failed (file_patch)",
+                            extra={"event": "anchor_allocation_failed_patch",
+                                   "path": path, "error": _anchor_result.error},
+                        )
+                except Exception:
+                    logger.warning(
+                        "Anchor allocator crash in file_patch",
+                        extra={"event": "anchor_allocator_error_patch", "path": path},
+                        exc_info=True,
+                    )
+                    exec_meta["anchor_allocator_changed"] = False
+                    exec_meta["anchor_count"] = 0
 
         # ── Apply operation ──────────────────────────────────────────
         # Use CSS-resolved position if available, otherwise find by text.
@@ -2012,6 +2303,67 @@ class ToolExecutor:
             patched = current[:idx] + content + current[idx + len(anchor):]
         elif operation == "delete":
             patched = current[:idx] + current[idx + len(anchor):]
+
+        # ── Full-file code fixer (post-patch) ────────────────────────
+        # Runs the same fixer chain as file_write() on the FULL patched
+        # file. Catches cross-language issues that only appear in the
+        # context of the complete file (e.g., CSS dumped outside <style>
+        # after a patch inserts content at the wrong position).
+        # The fragment-level fixer (above) catches syntax issues in the
+        # new content; this catches structural issues in the result.
+        _fixer_names_full = {
+            "Dockerfile", "Containerfile", "Makefile",
+            "GNUmakefile", "makefile",
+        }
+        _basename_full = os.path.basename(path)
+        full_fix_result = None
+        if ext.lower() in _CODE_EXTENSIONS or _basename_full in _fixer_names_full:
+            try:
+                full_fix_result = code_fixer_fix(path, patched)
+                if full_fix_result.changed:
+                    patched = full_fix_result.content
+                    logger.debug(
+                        "file_patch full-file code fixer applied",
+                        extra={
+                            "event": "file_patch_full_fixer",
+                            "path": path,
+                            "fixes": full_fix_result.fixes_applied,
+                            "errors": full_fix_result.errors_found,
+                        },
+                    )
+                elif full_fix_result.errors_found:
+                    logger.debug(
+                        "file_patch full-file fixer found errors",
+                        extra={
+                            "event": "file_patch_full_fixer_errors",
+                            "path": path,
+                            "errors": full_fix_result.errors_found,
+                        },
+                    )
+                exec_meta["full_file_fixer_changed"] = full_fix_result.changed
+                exec_meta["full_file_fixer_fixes"] = full_fix_result.fixes_applied
+                exec_meta["full_file_fixer_errors"] = full_fix_result.errors_found
+                exec_meta["full_file_fixer_warnings"] = full_fix_result.warnings
+            except Exception:
+                logger.warning(
+                    "Full-file code fixer crash in file_patch — "
+                    "using patched content",
+                    extra={
+                        "event": "file_patch_full_fixer_crash",
+                        "path": path,
+                    },
+                    exc_info=True,
+                )
+                full_fix_result = None
+                exec_meta["full_file_fixer_changed"] = False
+                exec_meta["full_file_fixer_fixes"] = []
+                exec_meta["full_file_fixer_errors"] = []
+                exec_meta["full_file_fixer_warnings"] = []
+        else:
+            exec_meta["full_file_fixer_changed"] = False
+            exec_meta["full_file_fixer_fixes"] = []
+            exec_meta["full_file_fixer_errors"] = []
+            exec_meta["full_file_fixer_warnings"] = []
 
         # ── Write result ─────────────────────────────────────────────
         try:
@@ -2069,8 +2421,7 @@ class ToolExecutor:
             extra={"event": "file_read_allowed", "path": path},
         )
 
-        # Cap file size to prevent OOM on large files (1 MB)
-        FILE_READ_MAX_BYTES = 1_048_576
+        # Cap file size to prevent OOM on large files (module constant)
         try:
             file_size = os.path.getsize(path)
         except OSError as exc:
@@ -2086,7 +2437,7 @@ class ToolExecutor:
             )
 
         try:
-            with open(path) as f:
+            with open(path, encoding="utf-8") as f:
                 content = f.read()
         except OSError as exc:
             logger.error(
@@ -2189,7 +2540,7 @@ class ToolExecutor:
         # Sandbox is the security boundary at TL2+ — exempt inline-execution
         # patterns (python3 -c) that are safe within the sandbox's
         # network=none / read-only-root / dropped-caps constraints.
-        sandbox_active = self._sandbox is not None and self._trust_level >= 2
+        sandbox_active = self._sandbox is not None
         result = self._engine.check_command(command, sandbox_context=sandbox_active)
         if result.status != PolicyResult.ALLOWED:
             logger.warning(
@@ -2203,11 +2554,13 @@ class ToolExecutor:
             extra={"event": "shell_allowed", "command": command},
         )
 
-        # E5: Route to sandbox at TL2+ when sandbox is available
-        if self._sandbox is not None and self._trust_level >= 2:
+        # E5: Route to sandbox when available (regardless of trust level)
+        if self._sandbox is not None:
             return await self._execute_in_sandbox(command, args)
 
-        # Existing direct-shell path (TL0/TL1 or sandbox disabled)
+        # Fallback: direct shell when sandbox is genuinely unavailable.
+        # Output is UNTRUSTED — this path has network access and full
+        # container FS, unlike the sandbox (no network, read-only root).
         # E-004: Timeouts — shell from config, podman ops are fixed constants
         # (container-internal operations: podman_build=300s, podman_run=60s, podman_stop=30s).
         from sentinel.core.config import settings
@@ -2252,7 +2605,7 @@ class ToolExecutor:
         return await create_tagged_data(
             content=output,
             source=DataSource.TOOL,
-            trust_level=TrustLevel.TRUSTED,
+            trust_level=TrustLevel.UNTRUSTED,
             originated_from=f"shell:{command}",
         ), exec_meta
 
@@ -2272,7 +2625,7 @@ class ToolExecutor:
         # Format output similar to direct shell, but with sandbox-specific info
         if sandbox_result.timed_out:
             output = sandbox_result.stdout
-            output += f"\n[sandbox timed out after {self._sandbox._default_timeout}s]"
+            output += f"\n[sandbox timed out after {self._sandbox.default_timeout}s]"
             if sandbox_result.stderr:
                 output += f"\n{sandbox_result.stderr}"
         elif sandbox_result.oom_killed:
@@ -2470,7 +2823,8 @@ class ToolExecutor:
     async def _website(self, args: dict) -> tuple[TaggedData, dict | None]:
         action = args.get("action", "")
         site_id = args.get("site_id", "")
-        sites_root = os.path.join(self._engine._workspace_path, "sites")
+        # Per-user workspace: sites live under /workspace/<user_id>/sites/
+        sites_root = str(get_user_workspace() / "sites")
 
         if action == "list":
             return await self._website_list(sites_root)
@@ -2550,18 +2904,7 @@ class ToolExecutor:
             for filename, content in files.items():
                 filepath = os.path.join(site_dir, filename)
 
-                logger.debug(
-                    "Website file pre-write (before code fixer)",
-                    extra={
-                        "event": "website_file_pre_write",
-                        "filepath": filepath,
-                        "content_length": len(content) if content else 0,
-                        "content_full": content,
-                        "has_entities": ("&lt;" in (content or "") or "&gt;" in (content or "")),
-                    },
-                )
-
-                # Code fixer: same logic as _file_write (line ~1384)
+                # Code fixer: same logic as _file_write
                 _, ext = os.path.splitext(filename)
                 fixer_names = {"Dockerfile", "Containerfile", "Makefile", "GNUmakefile", "makefile"}
                 if ext.lower() in _CODE_EXTENSIONS or filename in fixer_names:
@@ -2578,21 +2921,94 @@ class ToolExecutor:
                                 },
                             )
                     except Exception:
-                        pass  # fail-safe: fixer crash writes original content
+                        # Fixer crash must never block a write — log and continue
+                        # with original content. Matches _file_write pattern.
+                        logger.warning(
+                            "Code fixer crash in website create — using original content",
+                            extra={
+                                "event": "code_fixer_error_website",
+                                "path": filepath,
+                            },
+                            exc_info=True,
+                        )
 
-                logger.debug(
-                    "Website file final write",
-                    extra={
-                        "event": "website_file_write",
-                        "filepath": filepath,
-                        "content_length": len(content) if content else 0,
-                        "content_full": content,
-                        "has_entities": ("&lt;" in (content or "") or "&gt;" in (content or "")),
-                    },
-                )
+                # Anchor allocator — matches _file_write pattern
+                from sentinel.core.config import settings as _aa_ws
+                if _aa_ws.anchor_allocator_enabled:
+                    try:
+                        _ws_user_id = current_user_id.get()
+                        _anchor_result = await allocate_anchors(
+                            path=filepath,
+                            content=content,
+                            episodic_store=getattr(self, '_episodic_store', None),
+                            user_id=_ws_user_id,
+                            tier=_aa_ws.anchor_allocator_tier,
+                        )
+                        if _anchor_result.changed:
+                            content = _anchor_result.content
+                        if _anchor_result.parse_failed:
+                            logger.warning(
+                                "Anchor allocation failed (website create)",
+                                extra={"event": "anchor_allocation_failed_website",
+                                       "path": filepath, "error": _anchor_result.error},
+                            )
+                    except Exception:
+                        logger.warning(
+                            "Anchor allocator crash in website create",
+                            extra={"event": "anchor_allocator_error_website",
+                                   "path": filepath},
+                            exc_info=True,
+                        )
 
-                with open(filepath, "w") as f:
+                # D4: Pre-write Semgrep scan at TL3+ — defence-in-depth.
+                # Matches _file_write pattern (lines 1355-1387). Without this,
+                # worker-generated HTML/JS/CSS bypasses pattern detection and
+                # is written to an auth-exempt served directory.
+                if self._trust_level >= 3 and semgrep_scanner.is_loaded():
+                    lang_hint = _detect_language_from_path(filepath)
+                    try:
+                        sg_result = await semgrep_scanner.scan_blocks(
+                            [(content, lang_hint)]
+                        )
+                        if sg_result.found:
+                            match_names = [m.pattern_name for m in sg_result.matches]
+                            logger.warning(
+                                "Website file blocked by pre-write Semgrep scan",
+                                extra={
+                                    "event": "website_semgrep_blocked",
+                                    "path": filepath,
+                                    "matches": match_names,
+                                },
+                            )
+                            # Clean up entire site dir — partial sites are worse
+                            # than no site (broken references, missing assets).
+                            shutil.rmtree(site_dir, ignore_errors=True)
+                            raise ToolBlockedError(
+                                f"Semgrep pre-write scan blocked website file {filename}: "
+                                f"{len(sg_result.matches)} issue(s) detected"
+                            )
+                    except ToolBlockedError:
+                        raise
+                    except Exception as exc:
+                        # Fail-closed: if Semgrep crashes, block the write.
+                        logger.error(
+                            "Pre-write Semgrep scan failed for website — "
+                            "blocking write (fail-closed)",
+                            extra={
+                                "event": "website_semgrep_error",
+                                "path": filepath,
+                                "error": str(exc),
+                            },
+                        )
+                        shutil.rmtree(site_dir, ignore_errors=True)
+                        raise ToolBlockedError(
+                            f"Pre-write scan failed (fail-closed): {exc}"
+                        ) from exc
+
+                with open(filepath, "w", encoding="utf-8") as f:
                     f.write(content)
+        except (ToolBlockedError, ToolError):
+            raise  # Don't wrap our own errors
         except OSError as exc:
             # Clean up partially-written site directory
             shutil.rmtree(site_dir, ignore_errors=True)
@@ -2600,6 +3016,8 @@ class ToolExecutor:
 
         title = args.get("title", site_id)
         file_count = len(files)
+        # TODO(config): derive from application config instead of hardcoding.
+        # Tracked as Finding #32 in audit_executor_20260323.md.
         url = f"https://localhost:3001/sites/{site_id}/"
 
         logger.info(
