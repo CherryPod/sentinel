@@ -1,0 +1,159 @@
+/* ── Design Tokens ────────────────────────────────────────────
+   Single source of truth for all visual primitives.
+   Components reference these tokens — never use raw values.
+   Dark mode overrides live in themes/dark.css.
+   ──────────────────────────────────────────────────────────── */
+
+:root {
+    /* ── Background (warm off-white system) ─────────────────── */
+    --bg-primary: #F8F6F3;
+    --bg-secondary: #EFECE7;
+    --bg-tertiary: #E4E0DA;
+    --bg-card: #FFF;
+    --overlay-bg: rgb(0 0 0 / 50%);
+
+    /* ── Borders ────────────────────────────────────────────── */
+    --border: #D4CFC7;
+    --border-subtle: #E4E0DA;
+    --border-card: rgb(48 44 38 / 6%);
+
+    /* ── Text (warm grey hierarchy) ─────────────────────────── */
+    --text-primary: #302C26;
+    --text-secondary: #635E56;
+    --text-muted: #969089;
+
+    /* ── Teal accent (primary — action and trust) ───────────── */
+    --accent: #2B8585;
+    --accent-bold: #1E6868;
+    --accent-bg: #E4F2F0;
+    --accent-border: #8DC8C2;
+
+    /* ── Brand mark (warm brown — logo/welcome decorative) ─── */
+    --color-brand-mark: #8B6544;
+
+    /* ── Rose accent (secondary — warmth and personality) ───── */
+    --rose: #B86878;
+    --rose-bg: #F8EEF0;
+    --rose-text: #8A4858;
+    --rose-border: #D8A8B2;
+
+    /* ── Periwinkle accent (information & automation) ────────── */
+    --peri: #7B7FC4;
+    --peri-bg: #EEEFF8;
+    --peri-text: #5A5FA8;
+    --peri-border: #B8BBE0;
+
+    /* ── Semantic status (reserved — never decorative) ──────── */
+    --green: #3D8B50;
+    --green-bg: #EEF6F0;
+    --green-text: #2E6B3E;
+    --red: #C05050;
+    --red-bg: #FAEDED;
+    --yellow: #B88A2A;
+    --yellow-bg: #F8F2E0;
+    --yellow-text: #7A5A12;   /* AA-passing amber text for pills/badges on --yellow-bg */
+    --pill-off-text: #5C574F;  /* AA-passing muted text on --bg-tertiary (darker than --text-muted) */
+    --orange: #C87830;
+
+    /* ── Shadows (warm-tinted) ──────────────────────────────── */
+    --shadow-sm: 0 1px 3px rgb(48 44 38 / 6%), 0 1px 2px rgb(48 44 38 / 4%);
+    --shadow-md: 0 4px 12px rgb(48 44 38 / 8%), 0 1px 3px rgb(48 44 38 / 4%);
+    --shadow-lg: 0 8px 24px rgb(48 44 38 / 10%), 0 2px 6px rgb(48 44 38 / 5%);
+    --shadow-focus: 0 0 0 3px rgb(43 133 133 / 25%);
+
+    /* ── Spacing scale (rem, base 16px) ─────────────────────── */
+    --space-1: 0.25rem;   /*  4px */
+    --space-2: 0.5rem;    /*  8px */
+    --space-3: 0.75rem;   /* 12px */
+    --space-4: 1rem;      /* 16px */
+    --space-5: 1.25rem;   /* 20px */
+    --space-6: 1.5rem;    /* 24px */
+    --space-7: 1.75rem;   /* 28px */
+    --space-8: 2rem;      /* 32px */
+    --space-9: 2.25rem;   /* 36px */
+    --space-10: 2.5rem;   /* 40px */
+    --space-12: 3rem;     /* 48px */
+    --space-16: 4rem;     /* 64px */
+
+    /* ── Component sizes ───────────────────────────────────── */
+    --error-min-height: 1.125rem; /* 18px — reserves space for error messages */
+
+    /* ── Font sizes (rem) ───────────────────────────────────── */
+    --text-2xs: 0.625rem;  /* 10px */
+    --text-xs: 0.6875rem;  /* 11px */
+    --text-sm: 0.8125rem;   /* 13px (was 12px) */
+    --text-base: 0.875rem;  /* 14px (was 13px) */
+    --text-md: 0.9375rem;   /* 15px (was 14px) */
+    --text-lg: 1rem;        /* 16px (was 15px) */
+    --text-lg-icon: 1.375rem; /* 22px — oversized for icon/PIN readability */
+    --text-xl: 1.0625rem;  /* 17px — restores xl > lg after the Phase 1 bump */
+    --text-2xl: 1.125rem;  /* 18px */
+    --text-3xl: 1.25rem;   /* 20px */
+
+    /* ── Border radii ───────────────────────────────────────── */
+    --radius-xs: 3px;
+    --radius-sm: 4px;
+    --radius-md: 6px;
+    --radius-lg: 8px;
+    --radius-xl: 10px;
+    --radius-2xl: 12px;
+    --radius-3xl: 16px;
+    --radius-pill: 9999px;
+
+    /* ── Z-index scale ──────────────────────────────────────── */
+    --z-base: 0;
+    --z-dropdown: 100;
+    --z-sticky: 200;
+    --z-overlay: 1000;
+    --z-toast: 2000;
+    --z-modal: 2500;
+
+    /* ── Transition durations ───────────────────────────────── */
+    --duration-fast: 0.15s;
+    --duration-normal: 0.2s;
+    --duration-slow: 0.3s;
+
+    /* ── Layout ─────────────────────────────────────────────── */
+    --nav-width: 200px;
+    --nav-collapsed: 56px;
+
+    /* ── Dark palette primitives (referenced by themes/dark.css) ── */
+    --dark-bg-primary: #171614;
+    --dark-bg-secondary: #1E1D1A;
+    --dark-bg-tertiary: #282622;
+    --dark-bg-card: #1C1B18;
+    --dark-border: #383530;
+    --dark-border-subtle: #2B2926;
+    --dark-border-card: rgb(228 224 218 / 6%);
+    --dark-text-primary: #E8E4DE;
+    --dark-text-secondary: #AEA8A0;
+    --dark-text-muted: #787268;
+    --dark-accent: #48B0B0;
+    --dark-accent-bold: #60C8C8;
+    --dark-accent-bg: #122828;
+    --dark-accent-border: #2A5858;
+    --dark-color-brand-mark: #B89878;
+    --dark-rose: #D08090;
+    --dark-rose-bg: #2E1820;
+    --dark-rose-text: #E0A0AE;
+    --dark-rose-border: #5A3040;
+    --dark-peri: #9FA3E8;
+    --dark-peri-bg: #1E2030;
+    --dark-peri-text: #B8BBF0;
+    --dark-peri-border: #484C80;
+    --dark-green: #50A862;
+    --dark-green-bg: #1A2D1E;
+    --dark-green-text: #68C07A;
+    --dark-red: #D86060;
+    --dark-red-bg: #301818;
+    --dark-yellow: #D0A040;
+    --dark-yellow-bg: #2A2210;
+    --dark-yellow-text: #E0B860;
+    --dark-pill-off-text: #A8A29A;
+    --dark-orange: #D89848;
+    --dark-shadow-sm: 0 1px 3px rgb(0 0 0 / 20%), 0 1px 2px rgb(0 0 0 / 15%);
+    --dark-shadow-md: 0 4px 12px rgb(0 0 0 / 25%), 0 1px 3px rgb(0 0 0 / 15%);
+    --dark-shadow-lg: 0 8px 24px rgb(0 0 0 / 30%), 0 2px 6px rgb(0 0 0 / 20%);
+    --dark-shadow-focus: 0 0 0 3px rgb(72 176 176 / 30%);
+    --dark-overlay-bg: rgb(0 0 0 / 60%);
+}

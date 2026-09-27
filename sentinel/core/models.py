@@ -1,16 +1,26 @@
-from datetime import datetime, timezone
-from enum import Enum
-from typing import Optional
+"""Core domain models and enums shared across the Sentinel pipeline.
 
-from pydantic import BaseModel, Field
+Defines TaggedData (the universal data wrapper with trust/provenance),
+StepResult, PlanStep, TaskPlan, and supporting enums.
+"""
+
+from datetime import UTC, datetime
+from enum import StrEnum
+
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+# Import at module level so Pydantic can resolve the forward-ref in
+# TaggedData.  ``_scan_context`` is a lightweight dataclass module with
+# no security-subsystem runtime dependencies — safe for core/ to import.
+from sentinel.security._scan_context import ScanResult as PipelineScanResult
 
 
-class TrustLevel(str, Enum):
+class TrustLevel(StrEnum):
     TRUSTED = "trusted"
     UNTRUSTED = "untrusted"
 
 
-class DataSource(str, Enum):
+class DataSource(StrEnum):
     USER = "user"
     CLAUDE = "claude"
     QWEN = "qwen"
@@ -20,19 +30,20 @@ class DataSource(str, Enum):
     SANDBOX = "sandbox"
 
 
-class OutputDestination(str, Enum):
-    DISPLAY = "display"      # Output goes to human (UI, Signal, API response)
+class OutputDestination(StrEnum):
+    DISPLAY = "display"  # Output goes to human (UI, Signal, API response)
     EXECUTION = "execution"  # Output feeds into a downstream tool_call
 
 
-class PolicyResult(str, Enum):
+class PolicyResult(StrEnum):
     ALLOWED = "allowed"
     BLOCKED = "blocked"
     HUMAN_APPROVAL_REQUIRED = "human_approval_required"
 
 
-class TaskStatus(str, Enum):
+class TaskStatus(StrEnum):
     """Task-level outcome status for F1 enriched history."""
+
     SUCCESS = "success"
     PARTIAL = "partial"
     SCAN_BLOCKED = "scan_blocked"
@@ -45,8 +56,9 @@ class TaskStatus(str, Enum):
     LOCKED = "locked"
 
 
-class StepStatus(str, Enum):
+class StepStatus(StrEnum):
     """Step-level outcome status for F1 enriched history."""
+
     SUCCESS = "success"
     FAILED = "failed"
     BLOCKED = "blocked"
@@ -68,6 +80,14 @@ class ScanMatch(BaseModel):
     pattern_name: str
     matched_text: str
     position: int = 0
+    suppressed: bool = False
+    suppression_reason: str | None = None
+    # Semgrep source-span metadata (optional, populated by semgrep_scanner)
+    start_col: int | None = None
+    end_line: int | None = None
+    end_col: int | None = None
+    semgrep_start_offset: int | None = None
+    semgrep_end_offset: int | None = None
 
 
 class ScanResult(BaseModel):
@@ -76,15 +96,31 @@ class ScanResult(BaseModel):
     scanner_name: str = ""
     degraded: bool = False  # F-004: True when scanner skipped due to unavailable model
 
+    @model_validator(mode="after")
+    def _compute_found(self) -> "ScanResult":
+        """Derive found from matches — True if any unsuppressed match exists."""
+        self.found = any(not m.suppressed for m in self.matches)
+        return self
+
 
 class TaggedData(BaseModel):
+    """Universal data wrapper with trust, provenance, and scan metadata.
+
+    ``scan_result`` holds the new-shape ``ScanResult`` (from
+    ``sentinel.security._scan_context``) produced by the scanner
+    pipeline.  Callers that need per-scanner breakdowns use
+    ``scan_result.verdicts_by_scanner()`` / ``unsuppressed_by_scanner()``.
+    """
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     id: str
     content: str
     trust_level: TrustLevel
     source: DataSource
     originated_from: str = ""
-    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
-    scan_results: dict[str, ScanResult] = Field(default_factory=dict)
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    scan_result: PipelineScanResult | None = None
     derived_from: list[str] = Field(default_factory=list)
 
 
@@ -92,13 +128,13 @@ class TaggedData(BaseModel):
 
 
 class PlanStep(BaseModel):
-    id: str                              # "step_1", "step_2"
-    type: str                            # "llm_task" or "tool_call"
+    id: str  # "step_1", "step_2"
+    type: str  # "llm_task" or "tool_call"
     description: str = ""
-    prompt: str | None = None            # For llm_task
-    tool: str | None = None              # For tool_call
+    prompt: str | None = None  # For llm_task
+    tool: str | None = None  # For tool_call
     args: dict = Field(default_factory=dict)
-    output_var: str | None = None        # "$var_name" to store result
+    output_var: str | None = None  # "$var_name" to store result
     expects_code: bool = False
     input_vars: list[str] = Field(default_factory=list)
     output_format: str | None = None  # "json", "tagged", or None (freeform)
@@ -127,17 +163,23 @@ class Plan(BaseModel):
 
 class StepResult(BaseModel):
     step_id: str
-    status: str                          # "success", "soft_failed", "blocked", "error", "skipped"
-    data_id: str | None = None           # TaggedData ID
+    status: str  # "success", "soft_failed", "blocked", "error", "skipped"
+    tool: str | None = None  # Tool name (e.g. "file_patch", "file_read")
+    output_size: int | None = (
+        None  # Size of step output in bytes (for empty-output detection)
+    )
+    data_id: str | None = None  # TaggedData ID
     content: str = ""
     error: str = ""
     # Per-step token usage from the worker LLM (Ollama/Qwen)
     worker_usage: dict | None = None
     # Verbose fields — populated when SENTINEL_VERBOSE_RESULTS=true.
     # Exposes defence internals; never enable in production.
-    planner_prompt: str | None = None    # Claude's raw plan step prompt
-    resolved_prompt: str | None = None   # What Qwen actually receives (after spotlighting/tags/sandwich)
-    worker_response: str | None = None   # Qwen's raw response (before output scanning)
+    planner_prompt: str | None = None  # Claude's raw plan step prompt
+    resolved_prompt: str | None = (
+        None  # What Qwen actually receives (after spotlighting/tags/sandwich)
+    )
+    worker_response: str | None = None  # Qwen's raw response (before output scanning)
     # R7: Quality gate warnings — populated after code extraction on every llm_task step.
     # Empty list means no quality issues. Never None (always initialised).
     quality_warnings: list[str] = Field(default_factory=list)
@@ -147,17 +189,19 @@ class ConversationInfo(BaseModel):
     session_id: str
     turn_number: int
     risk_score: float
-    action: str                          # "allow", "warn", "block"
+    action: str  # "allow", "warn", "block"
     warnings: list[str] = Field(default_factory=list)
+    mtm_turn_score: float = 0.0
+    mtm_turn_categories: list[str] = Field(default_factory=list)
 
 
 class TaskResult(BaseModel):
-    task_id: str = ""                    # UUID for event bus correlation
-    status: str                          # "success", "blocked", "denied", "refused", "error"
+    task_id: str = ""  # UUID for event bus correlation
+    status: str  # "success", "blocked", "denied", "refused", "error"
     plan_summary: str = ""
     step_results: list[StepResult] = Field(default_factory=list)
     reason: str = ""
-    response: str = ""                   # Fast-path response text (router)
+    response: str = ""  # Fast-path response text (router)
     approval_id: str = ""
     conversation: ConversationInfo | None = None
     # Per-task token usage from the planner (Claude API)
@@ -169,9 +213,9 @@ class TaskResult(BaseModel):
     # Plan-outcome memory: plan evolution phases for episodic storage
     plan_phases: list[dict] = Field(default_factory=list)
     # Goal verification signals (computed at end of _execute_plan)
-    completion: str = "full"             # "full" / "partial" / "abandoned"
+    completion: str = "full"  # "full" / "partial" / "abandoned"
     goal_actions_executed: bool | None = None  # True if any effect tool ran
     file_mutations: list[dict] = Field(default_factory=list)
     assertion_failures: list[dict] = Field(default_factory=list)
     tool_output_warnings: list[dict] = Field(default_factory=list)
-    judge_verdict: dict | None = None    # Tier 2 planner-as-judge result
+    judge_verdict: dict | None = None  # Tier 2 planner-as-judge result

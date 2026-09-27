@@ -12,6 +12,7 @@ Moved from monolith lines 219-921. Finding fixes applied:
   #49: renamed _fix_with_parso → _fix_with_ast
   #51: extracted retry limit to _MAX_INDENT_RETRIES
 """
+
 import ast
 import logging
 import re
@@ -29,6 +30,11 @@ logger = logging.getLogger(__name__)
 try:
     import parso
 except ImportError:
+    logger.warning(
+        "parso not available — f-string repair disabled",
+        extra={"event": "python.parso_import_error"},
+        exc_info=True,
+    )
     parso = None  # type: ignore[assignment]
 
 
@@ -38,6 +44,10 @@ except ImportError:
 
 # Finding #51: extracted from inline magic number
 _MAX_INDENT_RETRIES = 10
+
+# Ordered by frequency in typical Python (parens > brackets > braces)
+# so the swap strategy in _fix_mismatched_brackets tries the most likely fix first.
+_BRACKET_PAIRS = (("(", ")"), ("[", "]"), ("{", "}"))
 
 # Allowlist: usage pattern → (module, import_name)
 # For "from X import Y" style
@@ -73,7 +83,11 @@ _IMPORT_ALLOWLIST_FROM = {
 
 # Module-level imports (triggered by attribute access like re.search)
 _IMPORT_ALLOWLIST_MODULE = {
-    "re", "json", "os", "sys", "math",
+    "re",
+    "json",
+    "os",
+    "sys",
+    "math",
 }
 
 # Known-wrong import names that Qwen commonly hallucinates
@@ -89,6 +103,7 @@ _HALLUCINATED_IMPORTS = [
 # Public entry point
 # ---------------------------------------------------------------------------
 
+
 def fix_python(content: str) -> FixResult:
     """Python-specific fixes: syntax validation, import dedup, mixed indent.
 
@@ -103,6 +118,15 @@ def fix_python(content: str) -> FixResult:
     original = content
     fname = _current_filename.get()
 
+    logger.debug(
+        "Python fixer starting",
+        extra={
+            "event": "python.fixer_start",
+            "file": _current_filename.get(),
+            "content_length": len(content),
+        },
+    )
+
     # 1. Fix mixed indentation (tabs -> 4 spaces)
     # Only fix leading tabs — tabs in strings/comments are left alone
     if "\t" in content:
@@ -113,8 +137,14 @@ def fix_python(content: str) -> FixResult:
             stripped = line.lstrip("\t")
             tab_count = len(line) - len(stripped)
             if tab_count > 0:
+                logger.debug(
+                    "fix_python: match", extra={"event": "python.fix_python.match"}
+                )
                 fixed_lines.append("    " * tab_count + stripped)
             else:
+                logger.debug(
+                    "fix_python: clean", extra={"event": "python.fix_python.clean"}
+                )
                 fixed_lines.append(line)
         content = "\n".join(fixed_lines)
         if content != original:
@@ -122,7 +152,7 @@ def fix_python(content: str) -> FixResult:
             logger.debug(
                 "Fixed mixed indentation",
                 extra={
-                    "event": "fixer_detail",
+                    "event": "python.fixer_detail",
                     "fixer": "fix_python",
                     "file": fname,
                     "fix": "tabs_to_spaces",
@@ -142,14 +172,19 @@ def fix_python(content: str) -> FixResult:
             logger.debug(
                 "Fixed escaped triple quotes",
                 extra={
-                    "event": "fixer_detail",
+                    "event": "python.fixer_detail",
                     "fixer": "fix_python",
                     "file": fname,
                     "fix": "unescape_triple_quotes",
                 },
             )
         except SyntaxError:
-            pass  # unescaped version doesn't parse either, leave it alone
+            logger.warning(
+                "fix_python: SyntaxError",
+                extra={"event": "python.fix_error"},
+                exc_info=True,
+            )
+            # unescaped version doesn't parse either, leave it alone
 
     # 3. Duplicate import removal (module-level only)
     content = _dedup_imports(content, result)
@@ -191,11 +226,16 @@ def fix_python(content: str) -> FixResult:
     try:
         ast.parse(content)
     except SyntaxError as e:
+        logger.warning(
+            "fix_python: SyntaxError",
+            extra={"event": "python.fix_error", "error": str(e)},
+            exc_info=True,
+        )
         result.errors_found.append(f"SyntaxError: {e}")
         logger.debug(
             "Python file has residual syntax error",
             extra={
-                "event": "fixer_detail",
+                "event": "python.fixer_detail",
                 "fixer": "fix_python",
                 "file": fname,
                 "error": str(e),
@@ -210,6 +250,7 @@ def fix_python(content: str) -> FixResult:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _fix_indentation_errors(content: str, result: FixResult) -> str:
     """Fix IndentationError by aligning lines to surrounding context.
@@ -227,6 +268,11 @@ def _fix_indentation_errors(content: str, result: FixResult) -> str:
             ast.parse(content)
             return content  # parses clean — done
         except IndentationError as e:
+            logger.warning(
+                "_fix_indentation_errors: IndentationError",
+                extra={"event": "python.indentation_error", "error": str(e)},
+                exc_info=True,
+            )
             if e.lineno is None:
                 break
             lines = content.split("\n")
@@ -253,13 +299,11 @@ def _fix_indentation_errors(content: str, result: FixResult) -> str:
             if new_content == content:
                 break  # no change — avoid infinite loop
             content = new_content
-            result.fixes_applied.append(
-                f"Fixed indentation on line {e.lineno}"
-            )
+            result.fixes_applied.append(f"Fixed indentation on line {e.lineno}")
             logger.debug(
                 "Fixed indentation error",
                 extra={
-                    "event": "fixer_detail",
+                    "event": "python.fixer_detail",
                     "fixer": "_fix_indentation_errors",
                     "file": fname,
                     "line": e.lineno,
@@ -267,6 +311,11 @@ def _fix_indentation_errors(content: str, result: FixResult) -> str:
                 },
             )
         except SyntaxError:
+            logger.warning(
+                "_fix_indentation_errors: SyntaxError",
+                extra={"event": "python.indentation_error"},
+                exc_info=True,
+            )
             break  # not an indentation error — stop
     return content
 
@@ -291,7 +340,11 @@ def _fix_with_ast(content: str, result: FixResult) -> str:
         ast.parse(content)
         return content  # already valid — skip
     except SyntaxError:
-        pass
+        logger.warning(
+            "_fix_with_ast: SyntaxError",
+            extra={"event": "python.ast_fix_error"},
+            exc_info=True,
+        )
 
     fname = _current_filename.get()
     closings = [")", "]", "}", ")}", ")]", "})", ")}"]
@@ -314,7 +367,7 @@ def _fix_with_ast(content: str, result: FixResult) -> str:
         for closing in closings:
             fixed_line = line.rstrip()
             fixed_line = fixed_line[:-1] + closing + quote_char
-            test_lines = lines[:i] + [fixed_line] + lines[i + 1:]
+            test_lines = lines[:i] + [fixed_line] + lines[i + 1 :]
             test = "\n".join(test_lines)
             try:
                 ast.parse(test)
@@ -324,7 +377,7 @@ def _fix_with_ast(content: str, result: FixResult) -> str:
                 logger.debug(
                     "Closed bracket(s) in f-string",
                     extra={
-                        "event": "fixer_detail",
+                        "event": "python.fixer_detail",
                         "fixer": "_fix_with_ast",
                         "file": fname,
                         "line": i + 1,
@@ -333,6 +386,7 @@ def _fix_with_ast(content: str, result: FixResult) -> str:
                 )
                 return test
             except SyntaxError:
+                # Expected — brute-force search tries many combinations
                 continue
 
     # Strategy 2: append closing brackets at end of content.
@@ -342,13 +396,11 @@ def _fix_with_ast(content: str, result: FixResult) -> str:
             test = candidate + closing + "\n"
             try:
                 ast.parse(test)
-                result.fixes_applied.append(
-                    f"parso: closed bracket(s): {closing}"
-                )
+                result.fixes_applied.append(f"parso: closed bracket(s): {closing}")
                 logger.debug(
                     "Closed bracket(s) at end of file",
                     extra={
-                        "event": "fixer_detail",
+                        "event": "python.bracket_closed",
                         "fixer": "_fix_with_ast",
                         "file": fname,
                         "closing": closing,
@@ -356,9 +408,17 @@ def _fix_with_ast(content: str, result: FixResult) -> str:
                 )
                 return test
             except SyntaxError:
+                # Expected — brute-force search tries many combinations
                 continue
-    except Exception:
-        pass  # fail-safe
+    except (
+        Exception
+    ):  # catch-all: untrusted input parsing (AST fixer on malformed code)
+        logger.warning(
+            "_fix_with_ast: Exception",
+            extra={"event": "python.ast_fix_error"},
+            exc_info=True,
+        )
+        # fail-safe
 
     return content
 
@@ -368,6 +428,11 @@ def _dedup_imports(content: str, result: FixResult) -> str:
     try:
         tree = ast.parse(content)
     except SyntaxError:
+        logger.warning(
+            "_dedup_imports: SyntaxError",
+            extra={"event": "python.dedup_imports_error"},
+            exc_info=True,
+        )
         return content  # can't dedup if it doesn't parse
 
     seen_imports = set()
@@ -401,7 +466,7 @@ def _dedup_imports(content: str, result: FixResult) -> str:
         logger.debug(
             "Removed duplicate imports",
             extra={
-                "event": "fixer_detail",
+                "event": "python.fixer_detail",
                 "fixer": "_dedup_imports",
                 "file": _current_filename.get(),
                 "removed_count": len(lines_to_remove),
@@ -422,6 +487,11 @@ def _add_missing_imports(content: str, result: FixResult) -> str:
     try:
         tree = ast.parse(content)
     except SyntaxError:
+        logger.warning(
+            "_add_missing_imports: SyntaxError",
+            extra={"event": "python.add_imports_error"},
+            exc_info=True,
+        )
         return content  # can't analyse unparseable code
 
     # Bail on star imports — impossible to know what names they provide
@@ -434,11 +504,19 @@ def _add_missing_imports(content: str, result: FixResult) -> str:
     defined = set()
     for node in ast.walk(tree):
         if isinstance(node, (ast.Import, ast.ImportFrom)):
+            logger.debug(
+                "_add_missing_imports: branch",
+                extra={"event": "python._add_missing_imports.branch", "line": 494},
+            )
             for alias in node.names:
                 defined.add(alias.asname or alias.name)
                 # For "import os", "os" is defined
                 # For "from os import path", "path" is defined
         elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            logger.debug(
+                "_add_missing_imports: clean",
+                extra={"event": "python._add_missing_imports.branch.clean"},
+            )
             defined.add(node.name)
             # Parameters
             for arg in node.args.args + node.args.posonlyargs + node.args.kwonlyargs:
@@ -448,18 +526,36 @@ def _add_missing_imports(content: str, result: FixResult) -> str:
             if node.args.kwarg:
                 defined.add(node.args.kwarg.arg)
         elif isinstance(node, ast.ClassDef):
+            logger.debug(
+                "_add_missing_imports: clean",
+                extra={"event": "python._add_missing_imports.branch.clean"},
+            )
             defined.add(node.name)
         elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+            logger.debug(
+                "_add_missing_imports: clean",
+                extra={"event": "python._add_missing_imports.branch.clean"},
+            )
             defined.add(node.id)
-        elif isinstance(node, ast.Global):
-            defined.update(node.names)
-        elif isinstance(node, ast.Nonlocal):
+        elif isinstance(node, (ast.Global, ast.Nonlocal)):
+            logger.debug(
+                "_add_missing_imports: clean",
+                extra={"event": "python._add_missing_imports.branch.clean"},
+            )
             defined.update(node.names)
         # for/with/except targets
         elif isinstance(node, ast.For):
+            logger.debug(
+                "_add_missing_imports: clean",
+                extra={"event": "python._add_missing_imports.branch.clean"},
+            )
             if isinstance(node.target, ast.Name):
                 defined.add(node.target.id)
         elif isinstance(node, ast.ExceptHandler) and node.name:
+            logger.debug(
+                "_add_missing_imports: clean",
+                extra={"event": "python._add_missing_imports.branch.clean"},
+            )
             defined.add(node.name)
 
     # Collect all referenced names (bare Name nodes + Attribute roots)
@@ -551,13 +647,11 @@ def _add_missing_imports(content: str, result: FixResult) -> str:
         lines.insert(insert_idx + j, imp_line)
 
     content = "\n".join(lines)
-    result.fixes_applied.append(
-        f"Added missing import(s): {', '.join(new_lines)}"
-    )
+    result.fixes_applied.append(f"Added missing import(s): {', '.join(new_lines)}")
     logger.debug(
         "Added missing imports",
         extra={
-            "event": "fixer_detail",
+            "event": "python.fixer_detail",
             "fixer": "_add_missing_imports",
             "file": _current_filename.get(),
             "imports": new_lines,
@@ -592,6 +686,11 @@ def _fix_hallucinated_imports(content: str, result: FixResult) -> str:
                 tree = ast.parse(content)
             except SyntaxError:
                 # Can't parse — fall back to conservative no-rename
+                logger.warning(
+                    "_fix_hallucinated_imports: SyntaxError",
+                    extra={"event": "python.hallucinated_imports_error"},
+                    exc_info=True,
+                )
                 continue
 
             # Find all Name nodes that reference the wrong name
@@ -604,7 +703,7 @@ def _fix_hallucinated_imports(content: str, result: FixResult) -> str:
                     line = lines[line_idx]
                     # Replace at exact position
                     lines[line_idx] = (
-                        line[:col] + right_name + line[col + len(wrong_name):]
+                        line[:col] + right_name + line[col + len(wrong_name) :]
                     )
             content = "\n".join(lines)
 
@@ -614,7 +713,7 @@ def _fix_hallucinated_imports(content: str, result: FixResult) -> str:
         logger.debug(
             "Fixed hallucinated import",
             extra={
-                "event": "fixer_detail",
+                "event": "python.fixer_detail",
                 "fixer": "_fix_hallucinated_imports",
                 "file": fname,
                 "fix_description": f"{wrong_import} → {right_import}",
@@ -641,7 +740,7 @@ def _detect_truncation_python(content: str, result: FixResult) -> str:
         logger.debug(
             "Detected truncation: trailing decorator",
             extra={
-                "event": "fixer_detail",
+                "event": "python.fixer_detail",
                 "fixer": "_detect_truncation_python",
                 "file": _current_filename.get(),
             },
@@ -652,6 +751,11 @@ def _detect_truncation_python(content: str, result: FixResult) -> str:
     try:
         ast.parse(content)
     except SyntaxError:
+        logger.warning(
+            "_detect_truncation_python: SyntaxError",
+            extra={"event": "python.truncation_detect_error"},
+            exc_info=True,
+        )
         indent = len(lines[-1]) - len(lines[-1].lstrip())
         if indent > 0:
             result.errors_found.append(
@@ -660,7 +764,7 @@ def _detect_truncation_python(content: str, result: FixResult) -> str:
             logger.debug(
                 "Detected truncation: mid-block",
                 extra={
-                    "event": "fixer_detail",
+                    "event": "python.fixer_detail",
                     "fixer": "_detect_truncation_python",
                     "file": _current_filename.get(),
                     "indent_level": indent,
@@ -677,6 +781,11 @@ def _detect_duplicate_defs_python(content: str, result: FixResult) -> str:
     try:
         tree = ast.parse(content)
     except SyntaxError:
+        logger.warning(
+            "_detect_duplicate_defs_python: SyntaxError",
+            extra={"event": "python.duplicate_defs_error"},
+            exc_info=True,
+        )
         return content
 
     seen: dict[str, int] = {}
@@ -691,15 +800,19 @@ def _detect_duplicate_defs_python(content: str, result: FixResult) -> str:
                 logger.debug(
                     "Detected duplicate definition",
                     extra={
-                        "event": "fixer_detail",
+                        "event": "python.fixer_detail",
                         "fixer": "_detect_duplicate_defs_python",
                         "file": _current_filename.get(),
-                        "name": name,
+                        "def_name": name,
                         "first_line": seen[name],
                         "second_line": node.lineno,
                     },
                 )
             else:
+                logger.debug(
+                    "_detect_duplicate_defs_python: clean",
+                    extra={"event": "python.fixer_detail.clean"},
+                )
                 seen[name] = node.lineno
 
     return content
@@ -721,54 +834,58 @@ def _complete_brackets_python(content: str, original: str, result: FixResult) ->
         ast.parse(content)
         return content  # already valid — nothing to do
     except SyntaxError as e:
+        logger.warning(
+            "_complete_brackets_python: SyntaxError",
+            extra={"event": "python.bracket_error", "error": str(e)},
+            exc_info=True,
+        )
         err_msg = str(e)
-        if not ("unexpected EOF" in err_msg or "was never closed" in err_msg
-                or "unterminated" in err_msg):
+        if not (
+            "unexpected EOF" in err_msg
+            or "was never closed" in err_msg
+            or "unterminated" in err_msg
+        ):
+            logger.debug(
+                "_complete_brackets_python: match",
+                extra={"event": "python._complete_brackets_python.match"},
+            )
             return content  # not a truncation error — leave it
 
     fname = _current_filename.get()
 
-    # Count unmatched brackets, skipping strings and comments
+    # Count unmatched brackets using _iter_code_chars for f-string awareness.
+    # The inline parser previously used here didn't handle f-string nested
+    # expressions (e.g. f"hello {name + 'world'}") — the proper parser tracks
+    # expression nesting and quote restarts correctly.
     open_chars = {"(": ")", "[": "]", "{": "}"}
     close_chars = {v: k for k, v in open_chars.items()}
-    stack = []
-    in_str = None  # None, or the quote char(s)
-    i = 0
-    while i < len(content):
-        ch = content[i]
-        triple = content[i:i + 3]
-        if in_str is None:
-            if triple in ('"""', "'''"):
-                in_str = triple
-                i += 3
-                continue
-            elif ch in ('"', "'"):
-                in_str = ch
-                i += 1
-                continue
-            elif ch == "#":
-                nl = content.find("\n", i)
-                i = nl + 1 if nl != -1 else len(content)
-                continue
-            elif ch in open_chars:
-                stack.append(open_chars[ch])
-            elif ch in close_chars:
-                if stack and stack[-1] == ch:
-                    stack.pop()
-        else:
-            if ch == "\\" and i + 1 < len(content):
-                i += 2
-                continue
-            if in_str in ('"""', "'''"):
-                if content[i:i + 3] == in_str:
-                    in_str = None
-                    i += 3
-                    continue
-            elif ch == in_str:
-                in_str = None
-        i += 1
+    stack: list[str] = []
+    for _, ch, ctx in _iter_code_chars(content, "python"):
+        if ctx != CharContext.CODE:
+            continue
+        if ch in open_chars:
+            logger.debug(
+                "_complete_brackets_python: match",
+                extra={"event": "python._complete_brackets_python.match"},
+            )
+            stack.append(open_chars[ch])
+        elif ch in close_chars:
+            logger.debug(
+                "_complete_brackets_python: clean",
+                extra={"event": "python._complete_brackets_python.clean"},
+            )
+            if stack and stack[-1] == ch:
+                logger.debug(
+                    "_complete_brackets_python: match",
+                    extra={"event": "python._complete_brackets_python.match"},
+                )
+                stack.pop()
 
     if not stack:
+        logger.debug(
+            "_complete_brackets_python: match",
+            extra={"event": "python._complete_brackets_python.match"},
+        )
         return content
 
     closing = "".join(reversed(stack))
@@ -781,7 +898,7 @@ def _complete_brackets_python(content: str, original: str, result: FixResult) ->
         logger.debug(
             "Closed unclosed brackets",
             extra={
-                "event": "fixer_detail",
+                "event": "python.fixer_detail",
                 "fixer": "_complete_brackets_python",
                 "file": fname,
                 "closing": closing,
@@ -790,6 +907,11 @@ def _complete_brackets_python(content: str, original: str, result: FixResult) ->
         )
         return candidate
     except SyntaxError:
+        logger.warning(
+            "_complete_brackets_python: SyntaxError",
+            extra={"event": "python.bracket_error"},
+            exc_info=True,
+        )
         return content  # revert — our fix didn't help
 
 
@@ -809,7 +931,15 @@ def _fix_mismatched_brackets(content: str, result: FixResult) -> str:
         ast.parse(content)
         return content
     except SyntaxError as e:
+        logger.debug(
+            "Mismatched bracket check — content has SyntaxError, attempting repair",
+            extra={"event": "python.mismatch_brackets_entry", "error": str(e)},
+        )
         if e.lineno is None:
+            logger.debug(
+                "_fix_mismatched_brackets: match",
+                extra={"event": "python._fix_mismatched_brackets.match"},
+            )
             return content
         err_lineno = e.lineno  # save before Python 3 deletes e
 
@@ -817,6 +947,10 @@ def _fix_mismatched_brackets(content: str, result: FixResult) -> str:
     lines = content.split("\n")
     err_idx = err_lineno - 1
     if err_idx < 0 or err_idx >= len(lines):
+        logger.debug(
+            "_fix_mismatched_brackets: match",
+            extra={"event": "python._fix_mismatched_brackets.match"},
+        )
         return content
 
     err_line = lines[err_idx]
@@ -824,14 +958,22 @@ def _fix_mismatched_brackets(content: str, result: FixResult) -> str:
     # Finding #6: count brackets using _iter_code_chars for triple-quote awareness
     open_counts = {"(": 0, "[": 0, "{": 0}
     close_counts = {")": 0, "]": 0, "}": 0}
-    pairs = {"(": ")", "[": "]", "{": "}"}
+    pairs = dict(_BRACKET_PAIRS)
 
     for _, ch, ctx in _iter_code_chars(err_line, "python"):
         if ctx != CharContext.CODE:
             continue
         if ch in open_counts:
+            logger.debug(
+                "_fix_mismatched_brackets: match",
+                extra={"event": "python._fix_mismatched_brackets.match"},
+            )
             open_counts[ch] += 1
         elif ch in close_counts:
+            logger.debug(
+                "_fix_mismatched_brackets: clean",
+                extra={"event": "python._fix_mismatched_brackets.clean"},
+            )
             close_counts[ch] += 1
 
     # Find imbalances on this line
@@ -846,7 +988,7 @@ def _fix_mismatched_brackets(content: str, result: FixResult) -> str:
                 logger.debug(
                     "Multi-bracket imbalance skipped",
                     extra={
-                        "event": "fixer_detail",
+                        "event": "python.fixer_detail",
                         "fixer": "_fix_mismatched_brackets",
                         "file": fname,
                         "line": err_lineno,
@@ -856,8 +998,10 @@ def _fix_mismatched_brackets(content: str, result: FixResult) -> str:
                 )
                 continue
 
-            # Strategy 1: Swap — extra closer of one type, missing closer of another
-            for other_opener, other_closer in pairs.items():
+            # Strategy 1: Swap — extra closer of one type, missing closer of another.
+            # Iterate _BRACKET_PAIRS (frequency-ordered) so the most common
+            # bracket type is tried first when multiple swaps could work.
+            for other_opener, other_closer in _BRACKET_PAIRS:
                 if other_opener == opener:
                     continue
                 other_opens = open_counts[other_opener]
@@ -865,8 +1009,14 @@ def _fix_mismatched_brackets(content: str, result: FixResult) -> str:
                 if other_opens > other_closes:
                     last_pos = err_line.rfind(closer)
                     if last_pos >= 0:
-                        candidate_line = err_line[:last_pos] + other_closer + err_line[last_pos + 1:]
-                        candidate_lines = lines[:err_idx] + [candidate_line] + lines[err_idx + 1:]
+                        candidate_line = (
+                            err_line[:last_pos]
+                            + other_closer
+                            + err_line[last_pos + 1 :]
+                        )
+                        candidate_lines = (
+                            lines[:err_idx] + [candidate_line] + lines[err_idx + 1 :]
+                        )
                         candidate = "\n".join(candidate_lines)
                         try:
                             ast.parse(candidate)
@@ -877,7 +1027,7 @@ def _fix_mismatched_brackets(content: str, result: FixResult) -> str:
                             logger.debug(
                                 "Fixed bracket mismatch (swap)",
                                 extra={
-                                    "event": "fixer_detail",
+                                    "event": "python.fixer_detail",
                                     "fixer": "_fix_mismatched_brackets",
                                     "file": fname,
                                     "line": err_lineno,
@@ -887,13 +1037,16 @@ def _fix_mismatched_brackets(content: str, result: FixResult) -> str:
                             )
                             return candidate
                         except SyntaxError:
+                            # Expected — probing candidate fix
                             continue
 
             # Strategy 2: Remove — extra closer with no missing counterpart
             last_pos = err_line.rfind(closer)
             if last_pos >= 0:
-                candidate_line = err_line[:last_pos] + err_line[last_pos + 1:]
-                candidate_lines = lines[:err_idx] + [candidate_line] + lines[err_idx + 1:]
+                candidate_line = err_line[:last_pos] + err_line[last_pos + 1 :]
+                candidate_lines = (
+                    lines[:err_idx] + [candidate_line] + lines[err_idx + 1 :]
+                )
                 candidate = "\n".join(candidate_lines)
                 try:
                     ast.parse(candidate)
@@ -903,7 +1056,7 @@ def _fix_mismatched_brackets(content: str, result: FixResult) -> str:
                     logger.debug(
                         "Removed extra bracket",
                         extra={
-                            "event": "fixer_detail",
+                            "event": "python.fixer_detail",
                             "fixer": "_fix_mismatched_brackets",
                             "file": fname,
                             "line": err_lineno,
@@ -912,6 +1065,7 @@ def _fix_mismatched_brackets(content: str, result: FixResult) -> str:
                     )
                     return candidate
                 except SyntaxError:
+                    # Expected — probing candidate fix
                     continue
 
     return content

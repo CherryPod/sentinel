@@ -3,7 +3,8 @@
 ## Controller (Python/FastAPI) + Ollama (air-gapped Qwen 3 14B)
 ## TLS, security headers, PIN auth, static UI — all in one container.
 ##
-## Usage:
+## Usage (create external network first — one-time; see network block and docs/deploy-new-stack.md):
+##   podman network create --internal --disable-dns --subnet 172.30.0.0/24 sentinel_internal
 ##   podman compose up -d
 ##   curl -k https://localhost:3001/api/health
 ##   bash scripts/smoke_test.sh
@@ -17,7 +18,11 @@ services:
     networks:
       - sentinel_internal
       - sentinel_egress
+    # Podman 4.9.3 + --disable-dns does not inject peer names into /etc/hosts.
+    extra_hosts:
+      - "sentinel-ollama:172.30.0.3"
     environment:
+      - SENTINEL_MTM_ENABLED=shadow
       - SENTINEL_POLICY_FILE=/policies/sentinel-policy.yaml
       - SENTINEL_WORKSPACE_PATH=/workspace
       - SENTINEL_LOG_DIR=/logs
@@ -31,6 +36,10 @@ services:
       - SENTINEL_CREDENTIAL_KEY_FILE=/run/secrets/credential_key
       - SENTINEL_BOOTSTRAP_USERNAME=Admin
       - SENTINEL_REQUIRE_SECRETS=true
+      # Periodic DB maintenance cadence (default 3600s; range 60-86400s).
+      # Lower bound prevents test-only intervals slipping into prod; upper
+      # bound prevents silent disablement via INT_MAX-style misconfig.
+      - SENTINEL_DB_MAINTENANCE_INTERVAL_S=3600
       - SENTINEL_OLLAMA_URL=http://sentinel-ollama:11434
       - SENTINEL_OLLAMA_MODEL=qwen3:14b
       - SENTINEL_OLLAMA_TIMEOUT=7200
@@ -45,15 +54,15 @@ services:
       # Routine engine (Phase 5)
       - SENTINEL_ROUTINE_ENABLED=true
       # Signal channel (A3) — registered +440000000000
-      - SENTINEL_SIGNAL_ENABLED=true
+      - SENTINEL_SIGNAL_ENABLED=false
       - SENTINEL_SIGNAL_ACCOUNT=+440000000000
-      - SENTINEL_SIGNAL_ALLOWED_SENDERS=+440000000001,00000000-0000-0000-0000-000000000000
+      - SENTINEL_SIGNAL_ALLOWED_SENDERS=+440000000002,00000000-0000-0000-0000-000000000000
       - SENTINEL_SIGNAL_RATE_LIMIT=10
       - SENTINEL_SIGNAL_MAX_MESSAGE_LENGTH=2000
       - SENTINEL_SIGNAL_CLI_CONFIG=/app/signal-data
       # WASM sidecar (Phase 4)
       - SENTINEL_SIDECAR_ENABLED=true
-      - SENTINEL_SIDECAR_SOCKET=/tmp/sentinel-sidecar.sock
+      - SENTINEL_SIDECAR_SOCKET=/run/sentinel/sentinel-sidecar.sock
       - SENTINEL_SIDECAR_BINARY=/app/sidecar/sentinel-sidecar
       - SENTINEL_SIDECAR_TOOL_DIR=/app/wasm
       # Telegram channel (BotFather bot)
@@ -74,6 +83,9 @@ services:
       # Email — Posteo (IMAP + SMTP)
       - SENTINEL_EMAIL_ENABLED=true
       - SENTINEL_EMAIL_BACKEND=imap
+      - SENTINEL_EMAIL_CHANNEL_ENABLED=true
+      - SENTINEL_EMAIL_CHANNEL_POLL_INTERVAL=120
+      - SENTINEL_EMAIL_CHANNEL_ALLOWED_SENDERS=user@example.com
       - SENTINEL_SMTP_HOST=mail.example.com
       - SENTINEL_SMTP_PORT=465
       - SENTINEL_SMTP_USERNAME=sentinel@example.com
@@ -91,6 +103,40 @@ services:
       - SENTINEL_CALDAV_URL=https://mail.example.com:8443/calendars/sentinel/default
       - SENTINEL_CALDAV_USERNAME=sentinel@example.com
       - SENTINEL_CALDAV_PASSWORD_FILE=/run/secrets/caldav_password
+      # Crypto price (Binance + CoinGecko, no API key needed)
+      - SENTINEL_CRYPTO_ENABLED=true
+      # Weather (Met Office UK + Open-Meteo worldwide)
+      - SENTINEL_WEATHER_ENABLED=true
+      - SENTINEL_WEATHER_METOFFICE_API_KEY_FILE=/run/secrets/metoffice_api_key
+      # Matrix channel — self-hosted Matrix homeserver
+      - SENTINEL_MATRIX_ENABLED=true
+      - SENTINEL_MATRIX_HOMESERVER_URL=https://matrix.example.org
+      - SENTINEL_MATRIX_USER_ID=@sentinel:matrix.example.org
+      - SENTINEL_MATRIX_PASSWORD_FILE=/run/secrets/matrix_password
+      - SENTINEL_MATRIX_STORE_PATH=/app/matrix-store
+      - SENTINEL_MATRIX_ROOM_ID=!exampleRoom:matrix.example.org
+      - SENTINEL_MATRIX_ALERTS_ROOM_ID=!exampleAlertsRoom:matrix.example.org
+      - SENTINEL_MATRIX_MAINTENANCE_ROOM_ID=!exampleMaintenanceRoom:matrix.example.org
+      - SENTINEL_MATRIX_ROUTINES_ROOM_ID=!exampleRoutinesRoom:matrix.example.org
+      - SENTINEL_MATRIX_ALLOWED_SENDERS=@user:matrix.example.org
+      - SENTINEL_MATRIX_RATE_LIMIT=10
+      - SENTINEL_MATRIX_MAX_MESSAGE_LENGTH=30000
+      # Q13-F7 + Q12-FL6 (cleanup-pass C40):
+      # matrix.example.org is private (admin-gated joins, owned
+      # by operator). One Matrix encryption-posture operator knob:
+      #
+      #   IGNORE_UNVERIFIED_DEVICES_ON_SEND — outbound megolm
+      #     session keys are shared with every non-blacklisted
+      #     device key in the room, including unverified ones.
+      #     This bypasses recipient device verification.
+      #
+      # MUST stay False if the homeserver ever federates or opens
+      # registration. Emits a LOUD audit-stream warning when
+      # enabled — see matrix_channel.start.
+      - SENTINEL_MATRIX_IGNORE_UNVERIFIED_DEVICES_ON_SEND=true
+      # (SENTINEL_MATRIX_AUTO_TRUST_DEVICES removed in C40 cleanup
+      # — implicit-auto-trust violated Sentinel's known-contacts-
+      # only trust posture; deleted so it cannot be opted into.)
       # Podman sandbox (E5) — disposable containers for shell at TL2+
       - SENTINEL_SANDBOX_ENABLED=true
       - SENTINEL_SANDBOX_SOCKET=/tmp/podman-proxy.sock
@@ -108,6 +154,8 @@ services:
       - ./logs:/logs
       - /run/user/1000/podman/podman.sock:/run/podman/podman-host.sock:ro
       - ./data/signal-cli:/app/signal-data:Z
+      # Matrix E2EE key store — Olm/Megolm session keys, treat as sensitive
+      - matrix-store:/app/matrix-store
     secrets:
       - claude_api_key
       - sentinel_pin
@@ -119,6 +167,8 @@ services:
       - caldav_password
       - session_key
       - credential_key
+      - metoffice_api_key
+      - matrix_password
     ports:
       - "3001:8443"
       - "3002:8080"
@@ -133,6 +183,15 @@ services:
     read_only: true
     tmpfs:
       - /tmp:size=512M
+      # Q13.fix.f — dedicated 0700 tmpfs for Sentinel's internal Unix sockets
+      # (sidecar + signal-cli). Pins mode=0700 at mount time, independent of
+      # the 1777 default that /run/* tmpfs inherits otherwise. Do NOT add
+      # uid=/gid= options — podman 4.9.3 + podman-compose 1.0.6 reject them
+      # with "unknown mount option" (confirmed live 2026-04-22). When the
+      # container runs as root (current layout) the tmpfs is owned by UID 0
+      # by default, matching os.getuid() at the validator. Q13-U2 (non-root
+      # UID isolation) revisits this.
+      - /run/sentinel:size=1M,mode=0700
     # Health check
     healthcheck:
       test: ["CMD-SHELL", "python -c 'import urllib.request, ssl; ctx=ssl.create_default_context(); ctx.check_hostname=False; ctx.verify_mode=ssl.CERT_NONE; urllib.request.urlopen(\"https://localhost:8443/health\", context=ctx)'"]
@@ -145,12 +204,13 @@ services:
     image: docker.io/ollama/ollama:0.17.7
     container_name: sentinel-ollama
     networks:
-      - sentinel_internal
+      sentinel_internal:
+        ipv4_address: 172.30.0.3
     environment:
       - OLLAMA_HOST=0.0.0.0:11434
       - OLLAMA_KEEP_ALIVE=5m
       # Context: 24K total, 12K output cap. VRAM budget: model 9.3GB + KV cache
-      # 1.87GB (q8_0) = ~11.3GB. Leaves ~550MB headroom after Frigate (~380MB).
+      # 1.87GB (q8_0) = ~11.3GB on dedicated RTX 3060 12GB (Frigate/Whisper on 3050).
       # Previous: 20K context, 8K output. Increased to reduce Qwen output
       # truncation (1.1% of steps hit the 8K cap → broken code). Do NOT go
       # above 24K without checking nvidia-smi — 28K leaves only 240MB headroom,
@@ -159,9 +219,12 @@ services:
       - OLLAMA_NUM_PREDICT=12288
       - OLLAMA_KV_CACHE_TYPE=q8_0
       - OLLAMA_FLASH_ATTENTION=1
+      - NVIDIA_VISIBLE_DEVICES=all
+      - CUDA_VISIBLE_DEVICES=0
     volumes:
       - sentinel-ollama-data:/root/.ollama
     devices:
+      # RTX 3060 12GB (UUID) — dedicated LLM card
       - nvidia.com/gpu=all
     restart: "no"
     # Resource limits
@@ -176,12 +239,23 @@ services:
       start_period: 30s
 
 networks:
+  # sentinel_internal is declared external so compose does not manage it and
+  # the DNS plugin (aardvark-dns) can be disabled at creation time.
+  # Create the network manually BEFORE running `podman compose up`:
+  #   podman network create --internal --disable-dns --subnet 172.30.0.0/24 sentinel_internal
+  # --disable-dns removes aardvark-dns, closing the DNS-exfil channel described
+  # in Rec. 1 F-04.  Container-to-container hostname resolution between sentinel
+  # and sentinel-ollama continues via /etc/hosts injection (Podman's standard
+  # behaviour, independent of the DNS plugin).
+  # Migration from the old compose-managed network:
+  #   podman stop sentinel sentinel-ollama
+  #   podman rm sentinel sentinel-ollama          # rm required before network rm
+  #   podman network rm sentinel_sentinel_internal   # old project-prefixed name
+  #   podman network create --internal --disable-dns --subnet 172.30.0.0/24 sentinel_internal
+  #   podman compose up -d
   sentinel_internal:
-    driver: bridge
-    internal: true
-    ipam:
-      config:
-        - subnet: 172.30.0.0/24
+    external: true
+    name: sentinel_internal
   sentinel_egress:
     driver: bridge
 
@@ -206,8 +280,13 @@ secrets:
     file: ./secrets/session_key.txt
   credential_key:
     file: ./secrets/credential_key.txt
+  metoffice_api_key:
+    file: /home/user/.secrets/metoffice_api_key.txt
+  matrix_password:
+    file: /home/user/.secrets/matrix_sentinel_password.txt
 
 volumes:
   sentinel-data:
   sentinel-workspace:
   sentinel-ollama-data:
+  matrix-store:

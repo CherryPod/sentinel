@@ -1,0 +1,104 @@
+/* ── Dark Mode ────────────────────────────────────────────────
+   Single source of truth for dark theme tokens.
+   Values defined once as --dark-* primitives in tokens.css.
+   Both activation methods reference the same primitives.
+
+   Activation:
+   - Explicit: <html data-theme="dark">
+   - Auto: prefers-color-scheme: dark (when no explicit theme set)
+   ──────────────────────────────────────────────────────────── */
+
+/* Explicit toggle: user selected dark mode */
+[data-theme="dark"] {
+    --bg-primary: var(--dark-bg-primary);
+    --bg-secondary: var(--dark-bg-secondary);
+    --bg-tertiary: var(--dark-bg-tertiary);
+    --bg-card: var(--dark-bg-card);
+    --border: var(--dark-border);
+    --border-subtle: var(--dark-border-subtle);
+    --border-card: var(--dark-border-card);
+    --text-primary: var(--dark-text-primary);
+    --text-secondary: var(--dark-text-secondary);
+    --text-muted: var(--dark-text-muted);
+    --accent: var(--dark-accent);
+    --accent-bold: var(--dark-accent-bold);
+    --accent-bg: var(--dark-accent-bg);
+    --accent-border: var(--dark-accent-border);
+    --color-brand-mark: var(--dark-color-brand-mark);
+    --rose: var(--dark-rose);
+    --rose-bg: var(--dark-rose-bg);
+    --rose-text: var(--dark-rose-text);
+    --rose-border: var(--dark-rose-border);
+    --peri: var(--dark-peri);
+    --peri-bg: var(--dark-peri-bg);
+    --peri-text: var(--dark-peri-text);
+    --peri-border: var(--dark-peri-border);
+    --green: var(--dark-green);
+    --green-bg: var(--dark-green-bg);
+    --green-text: var(--dark-green-text);
+    --red: var(--dark-red);
+    --red-bg: var(--dark-red-bg);
+    --yellow: var(--dark-yellow);
+    --yellow-bg: var(--dark-yellow-bg);
+    --yellow-text: var(--dark-yellow-text);
+    --pill-off-text: var(--dark-pill-off-text);
+    --orange: var(--dark-orange);
+    --shadow-sm: var(--dark-shadow-sm);
+    --shadow-md: var(--dark-shadow-md);
+    --shadow-lg: var(--dark-shadow-lg);
+    --shadow-focus: var(--dark-shadow-focus);
+    --overlay-bg: var(--dark-overlay-bg);
+}
+
+/* Auto-detect: when no explicit data-theme is set, follow OS preference */
+@media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+        --bg-primary: var(--dark-bg-primary);
+        --bg-secondary: var(--dark-bg-secondary);
+        --bg-tertiary: var(--dark-bg-tertiary);
+        --bg-card: var(--dark-bg-card);
+        --border: var(--dark-border);
+        --border-subtle: var(--dark-border-subtle);
+        --border-card: var(--dark-border-card);
+        --text-primary: var(--dark-text-primary);
+        --text-secondary: var(--dark-text-secondary);
+        --text-muted: var(--dark-text-muted);
+        --accent: var(--dark-accent);
+        --accent-bold: var(--dark-accent-bold);
+        --accent-bg: var(--dark-accent-bg);
+        --accent-border: var(--dark-accent-border);
+        --color-brand-mark: var(--dark-color-brand-mark);
+        --rose: var(--dark-rose);
+        --rose-bg: var(--dark-rose-bg);
+        --rose-text: var(--dark-rose-text);
+        --rose-border: var(--dark-rose-border);
+        --peri: var(--dark-peri);
+        --peri-bg: var(--dark-peri-bg);
+        --peri-text: var(--dark-peri-text);
+        --peri-border: var(--dark-peri-border);
+        --green: var(--dark-green);
+        --green-bg: var(--dark-green-bg);
+        --green-text: var(--dark-green-text);
+        --red: var(--dark-red);
+        --red-bg: var(--dark-red-bg);
+        --yellow: var(--dark-yellow);
+        --yellow-bg: var(--dark-yellow-bg);
+        --yellow-text: var(--dark-yellow-text);
+        --pill-off-text: var(--dark-pill-off-text);
+        --orange: var(--dark-orange);
+        --shadow-sm: var(--dark-shadow-sm);
+        --shadow-md: var(--dark-shadow-md);
+        --shadow-lg: var(--dark-shadow-lg);
+        --shadow-focus: var(--dark-shadow-focus);
+        --overlay-bg: var(--dark-overlay-bg);
+    }
+}
+
+/* ── Dark mode component overrides ───────────────────────────── */
+
+[data-theme="dark"] ::-webkit-scrollbar-thumb { background: color-mix(in srgb, var(--accent) 30%, transparent); }
+[data-theme="dark"] ::-webkit-scrollbar-thumb:hover { background: color-mix(in srgb, var(--accent) 50%, transparent); }
+
+/* Theme toggle icon swap */
+[data-theme="dark"] .theme-icon-light { display: none !important; }
+[data-theme="dark"] .theme-icon-dark { display: inline !important; }

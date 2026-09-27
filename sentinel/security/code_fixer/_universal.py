@@ -3,6 +3,7 @@
 fix_universal: BOM removal, CRLF, trailing whitespace, trailing newline.
 strip_prose: Remove conversational prose LLMs prepend to code output.
 """
+
 import logging
 import re
 
@@ -21,8 +22,12 @@ logger = logging.getLogger(__name__)
 _PROSE_PATTERNS = [
     re.compile(r"^Here(?:'s| is) (?:the|a|an|your) .+:?\s*$", re.IGNORECASE),
     re.compile(r"^Sure[,!].+:?\s*$", re.IGNORECASE),
-    re.compile(r"^I(?:'ve| have) (?:created|written|made|updated).+:?\s*$", re.IGNORECASE),
-    re.compile(r"^This (?:code|script|file|function|program|module).+:?\s*$", re.IGNORECASE),
+    re.compile(
+        r"^I(?:'ve| have) (?:created|written|made|updated).+:?\s*$", re.IGNORECASE
+    ),
+    re.compile(
+        r"^This (?:code|script|file|function|program|module).+:?\s*$", re.IGNORECASE
+    ),
     re.compile(r"^Let me .+:?\s*$", re.IGNORECASE),
     re.compile(r"^The (?:following|above|below).+:?\s*$", re.IGNORECASE),
     re.compile(r"^Updated (?:code|file|version).+:?\s*$", re.IGNORECASE),
@@ -40,6 +45,7 @@ _PROSE_SCAN_LIMIT = 5
 # ---------------------------------------------------------------------------
 # Layer 1: Universal normalisation (all file types)
 # ---------------------------------------------------------------------------
+
 
 def fix_universal(content: str) -> FixResult:
     """BOM removal, CRLF, trailing whitespace, trailing newline.
@@ -79,7 +85,7 @@ def fix_universal(content: str) -> FixResult:
         logger.debug(
             "Universal fixes applied",
             extra={
-                "event": "fixer_applied",
+                "event": "universal.fixer_applied",
                 "fixer": "fix_universal",
                 "file": _current_filename.get(),
                 "fix_description": ", ".join(result.fixes_applied),
@@ -95,6 +101,7 @@ def fix_universal(content: str) -> FixResult:
 # Layer 2: Prose stripping (code files only)
 # ---------------------------------------------------------------------------
 
+
 def strip_prose(content: str) -> FixResult:
     """Remove conversational prose that LLMs prepend to code output.
 
@@ -105,6 +112,16 @@ def strip_prose(content: str) -> FixResult:
     never used it.
     """
     result = FixResult(content=content)
+
+    logger.debug(
+        "Checking for prose lines",
+        extra={
+            "event": "universal.prose_check",
+            "file": _current_filename.get(),
+            "content_length": len(content),
+        },
+    )
+
     lines = content.split("\n")
     removed = []
     clean_lines = []
@@ -121,8 +138,7 @@ def strip_prose(content: str) -> FixResult:
             if line == stripped and any(p.match(stripped) for p in _PROSE_PATTERNS):
                 removed.append(stripped)
                 continue
-            else:
-                prose_zone = False  # first non-prose line ends the zone
+            prose_zone = False  # first non-prose line ends the zone
         clean_lines.append(line)
 
     if removed:
@@ -137,11 +153,10 @@ def strip_prose(content: str) -> FixResult:
         logger.debug(
             "Prose lines stripped",
             extra={
-                "event": "fixer_applied",
+                "event": "universal.prose_stripped",
                 "fixer": "strip_prose",
                 "file": _current_filename.get(),
                 "lines_removed": len(removed),
-                "removed_text": removed,
             },
         )
 

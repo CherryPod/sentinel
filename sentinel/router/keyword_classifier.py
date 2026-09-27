@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import logging
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from sentinel.router.classifier import ClassificationResult, Route
 from sentinel.router.templates import TemplateRegistry
@@ -42,7 +42,7 @@ _MULTI_STEP_SIGNALS = [
     r"\bfirst\b.+\bthen\b",
     r"\bas well as\b",
     r",\s*also\b",
-    r"\bboth\b.+\band\b.+\b(?:email|signal|telegram|calendar)\b",
+    r"\bboth\b.+\band\b.+\b(?:email|signal|telegram|matrix|calendar)\b",
 ]
 
 # Generative/creative intent — these verbs route to planner UNLESS
@@ -74,6 +74,7 @@ def _planner_fallback(reason: str) -> ClassificationResult:
 @dataclass
 class _PatternEntry:
     """A single pattern-to-template mapping with optional param extraction."""
+
     pattern: re.Pattern
     template_name: str
     param_extractor: str | None = None  # regex group name or callable hint
@@ -83,8 +84,13 @@ class _PatternEntry:
 # Pattern definitions — ORDER MATTERS (specific before general)
 # ---------------------------------------------------------------------------
 
-def _build_patterns() -> list[_PatternEntry]:
+
+def _build_patterns(channel_registry=None) -> list[_PatternEntry]:
     """Build the ordered pattern list.
+
+    Args:
+        channel_registry: Optional ChannelRegistry for dynamic messaging patterns.
+            If None, uses static fallback patterns for Signal/Telegram/Matrix.
 
     Rules:
     - More specific patterns come first to avoid false matches
@@ -92,21 +98,32 @@ def _build_patterns() -> list[_PatternEntry]:
     - Patterns should match natural English phrasing
     - param_extractor names a capture group whose content becomes the query
     """
+    logger.debug(
+        "_build_patterns called", extra={"event": "keyword_classifier._build_patterns"}
+    )
     entries = []
 
     def add(pattern: str, template: str, extractor: str | None = None):
-        entries.append(_PatternEntry(
-            pattern=re.compile(pattern, re.IGNORECASE),
-            template_name=template,
-            param_extractor=extractor,
-        ))
+        entries.append(
+            _PatternEntry(
+                pattern=re.compile(pattern, re.IGNORECASE),
+                template_name=template,
+                param_extractor=extractor,
+            )
+        )
 
     # ---- calendar_add (before calendar_read — "add/create" is more specific) ----
     add(r"\badd\b.+\bto\b.+\bcalendar\b", "calendar_add")
     add(r"\bput\b.+\bin\b.+\bcalendar\b", "calendar_add")
-    add(r"\bschedule\s+(?:a|an|the)\s+(?:meeting|call|appointment|session|event)\b", "calendar_add")
+    add(
+        r"\bschedule\s+(?:a|an|the)\s+(?:meeting|call|appointment|session|event)\b",
+        "calendar_add",
+    )
     add(r"\bbook\s+(?:a|an|the)\b.+\bmeeting\b", "calendar_add")
-    add(r"\bcreate\s+(?:a|an)\s+(?:calendar\s+)?event\s+(?:for|on|at|tomorrow)\b", "calendar_add")
+    add(
+        r"\bcreate\s+(?:a|an)\s+(?:calendar\s+)?event\s+(?:for|on|at|tomorrow)\b",
+        "calendar_add",
+    )
     add(r"\bnew\s+event\b", "calendar_add")
     add(r"\bset\s+(?:a\s+)?reminder\b", "calendar_add")
     add(r"\bremind\s+me\b", "calendar_add")
@@ -121,12 +138,24 @@ def _build_patterns() -> list[_PatternEntry]:
     add(r"\bupcoming\s+events?\b", "calendar_read")
     add(r"\bany\s+meetings?\b", "calendar_read")
     add(r"\bmeetings?\s+(?:today|tomorrow|this\s+week|next\s+week)\b", "calendar_read")
-    add(r"\bcalendar\s+(?:for\s+)?(?:today|tomorrow|this\s+week|next\s+week)\b", "calendar_read")
-    add(r"\bdo\s+i\s+have\s+anything\s+(?:on|for|this|tomorrow|today)\b", "calendar_read")
-    add(r"\bwhat(?:'s|\s+is)\s+happening\s+(?:this|today|tomorrow|on)\b", "calendar_read")
+    add(
+        r"\bcalendar\s+(?:for\s+)?(?:today|tomorrow|this\s+week|next\s+week)\b",
+        "calendar_read",
+    )
+    add(
+        r"\bdo\s+i\s+have\s+anything\s+(?:on|for|this|tomorrow|today)\b",
+        "calendar_read",
+    )
+    add(
+        r"\bwhat(?:'s|\s+is)\s+happening\s+(?:this|today|tomorrow|on)\b",
+        "calendar_read",
+    )
     add(r"\b(?:my\s+)?next\s+meeting\b", "calendar_read")
     add(r"\bwhen\s+is\s+my\s+next\s+meeting\b", "calendar_read")
-    add(r"\bwhen(?:'s|\s+is)\s+my\s+next\s+(?:meeting|event|appointment|call)\b", "calendar_read")
+    add(
+        r"\bwhen(?:'s|\s+is)\s+my\s+next\s+(?:meeting|event|appointment|call)\b",
+        "calendar_read",
+    )
 
     # ---- email_send (before email_search — "send/draft/write/forward" is more specific) ----
     add(r"\bsend\s+(?:a\s+|an\s+)?email\b", "email_send")
@@ -137,8 +166,16 @@ def _build_patterns() -> list[_PatternEntry]:
     add(r"\bwrite\s+(?:a\s+|an\s+)?email\b", "email_send")
 
     # ---- email_search (after email_send — "search/find" is the key differentiator) ----
-    add(r"\bsearch\s+(?:my\s+)?emails?\s+(?:for\s+)?(?P<query>.+)", "email_search", "query")
-    add(r"\bfind\s+(?:my\s+)?emails?\s+(?:from|about|to)\s+(?P<query>.+)", "email_search", "query")
+    add(
+        r"\bsearch\s+(?:my\s+)?emails?\s+(?:for\s+)?(?P<query>.+)",
+        "email_search",
+        "query",
+    )
+    add(
+        r"\bfind\s+(?:my\s+)?emails?\s+(?:from|about|to)\s+(?P<query>.+)",
+        "email_search",
+        "query",
+    )
     # Standalone "emails from/about/to" — but only when not preceded by send-intent.
     # The send patterns above already captured "send an email to", "email X about",
     # so if we reach here, it's a genuine search intent like "emails from John".
@@ -151,46 +188,155 @@ def _build_patterns() -> list[_PatternEntry]:
     add(r"\bany\s+(?:new|unread)\s+emails?\b", "email_read")
     add(r"\bunread\s+emails?\b", "email_read")
     add(r"\bwhat\s+did\b.+\bemail\b", "email_read")
-    add(r"\b(?:my\s+)?inbox\b", "email_read")
+    # "inbox" only in natural language — not inside file paths like /media/inbox/
+    add(r"(?<!/)\b(?:my\s+)?inbox\b", "email_read")
     add(r"\bopen\s+(?:my\s+)?emails?\b", "email_read")
 
-    # ---- signal_send ----
-    add(r"\b(?:send|text|message)\b.+\b(?:on|via|over)\s+signal\b", "signal_send")
-    add(r"\bsignal\s+\w+\s+saying\b", "signal_send")
-
-    # ---- telegram_send ----
-    add(r"\b(?:send|text|message)\b.+\b(?:on|via|over)\s+telegram\b", "telegram_send")
-    add(r"\btelegram\s+\w+\s+saying\b", "telegram_send")
-
-    # NOTE: signal_send and telegram_send param extraction is handled by
-    # _extract_messaging_params() in the classify() method, not by regex
-    # capture groups. The patterns above are for intent matching only.
+    # ---- messaging channel patterns (dynamic from registry) ----
+    # Generated from channel_registry if provided, otherwise static fallback.
+    # Pattern structure: "send/text/message ... on/via/over <channel>"
+    # and "<channel> ... saying". Param extraction is handled by
+    # _extract_messaging_params() in the classify() method.
+    if channel_registry is not None:
+        for channel in channel_registry.with_tools():
+            name = channel.descriptor.name
+            tool = channel.descriptor.tool_name
+            add(rf"\b(?:send|text|message)\b.+\b(?:on|via|over)\s+{name}\b", tool)
+            add(rf"\b{name}\s+\w+\s+saying\b", tool)
+    else:
+        # Static fallback for tests without a registry
+        for name, tool in [
+            ("signal", "signal_send"),
+            ("telegram", "telegram_send"),
+            ("matrix", "matrix_send"),
+        ]:
+            add(rf"\b(?:send|text|message)\b.+\b(?:on|via|over)\s+{name}\b", tool)
+            add(rf"\b{name}\s+\w+\s+saying\b", tool)
 
     # ---- x_search (before web_search — "twitter/X" is more specific) ----
-    add(r"\bsearch\s+(?:on\s+)?(?:x|twitter)\s+(?:for\s+)?(?P<query>.+)", "x_search", "query")
+    add(
+        r"\bsearch\s+(?:on\s+)?(?:x|twitter)\s+(?:for\s+)?(?P<query>.+)",
+        "x_search",
+        "query",
+    )
     add(r"\b(?:what(?:'s|\s+is)\s+)?trending\s+on\s+(?:x|twitter)\b", "x_search")
     add(r"\btweets?\s+(?:about|on|from)\s+(?P<query>.+)", "x_search", "query")
     add(r"\bwhat\s+are\s+people\s+saying\b.+\bon\s+(?:x|twitter)\b", "x_search")
     add(r"\bposts?\s+(?:about|on)\b.+\bon\s+(?:x|twitter)\b", "x_search")
 
+    # ---- weather (before web_search — specific domain tool) ----
+    # Temporal/filler suffixes stripped from location captures so "glasgow now?"
+    # doesn't get sent as the location string to the geocoding API.
+    _wx_stop = r"(?:\s+(?:now|today|tonight|tomorrow|currently|right\s+now|please|thanks|mate)\b[?!.,;:]*|\s*[?!.,;:]+)*\s*$"
+    add(
+        rf"\bweather\s+(?:like\s+)?(?:in|for|at)\s+(?P<location>.+?){_wx_stop}",
+        "weather",
+        "location",
+    )
+    add(
+        rf"\bwhat(?:'s|\s+is)\s+the\s+weather\s+like\b(?:\s+(?:in|for|at)\s+(?P<location>.+?){_wx_stop})?",
+        "weather",
+        "location",
+    )
+    add(
+        rf"\bwhat(?:'s|\s+is)\s+the\s+weather\b(?:\s+(?:in|for|at)\s+(?P<location>.+?){_wx_stop})?",
+        "weather",
+        "location",
+    )
+    add(
+        rf"\bforecast\s+(?:for|in)\s+(?P<location>.+?){_wx_stop}", "weather", "location"
+    )
+    add(
+        rf"\btemperature\s+(?:in|at)\s+(?P<location>.+?){_wx_stop}",
+        "weather",
+        "location",
+    )
+    add(
+        rf"\bhow\s+(?:hot|cold|warm)\s+(?:is\s+it\s+)?(?:in|at)\s+(?P<location>.+?){_wx_stop}",
+        "weather",
+        "location",
+    )
+    # "london weather" — location before keyword
+    add(
+        rf"(?P<location>[a-zA-Z][a-zA-Z\s\-']+?)\s+weather\b{_wx_stop}",
+        "weather",
+        "location",
+    )
+    # "weather glasgow" — no preposition, capture the location directly
+    _wx_not_temporal = r"(?!(?:station|api|data|service|now|today|tonight|tomorrow|currently|please|thanks|mate|like)\b)"
+    add(
+        rf"\bweather\s+{_wx_not_temporal}(?P<location>[a-zA-Z][a-zA-Z\s\-']+?){_wx_stop}",
+        "weather",
+        "location",
+    )
+    add(r"\bweather\b(?!\s+(?:station|api|data|service))", "weather")
+
+    # ---- crypto_price (before web_search — specific domain tool) ----
+    add(
+        r"\b(?:price\s+of|how\s+much\s+is)\s+(?P<coin>bitcoin|btc|ethereum|eth|solana|sol|xrp|ripple|cardano|ada|polkadot|dot|chainlink|link|avalanche|avax|dogecoin|doge|polygon|matic)\b",
+        "crypto_price",
+        "coin",
+    )
+    add(
+        r"\b(?P<coin>bitcoin|btc|ethereum|eth|solana|sol|xrp|cardano|ada|doge|dogecoin)\s+price\b",
+        "crypto_price",
+        "coin",
+    )
+    add(
+        r"\bwhat(?:'s|\s+is)\s+(?P<coin>bitcoin|btc|ethereum|eth|solana|sol|xrp|cardano|ada|doge|dogecoin)\s+(?:at|worth|trading)\b",
+        "crypto_price",
+        "coin",
+    )
+    add(
+        r"\bwhat(?:'s|\s+is)\s+the\s+(?:price|value)\s+of\s+(?P<coin>bitcoin|btc|ethereum|eth|solana|sol|xrp|ripple|cardano|ada|polkadot|dot|chainlink|link|avalanche|avax|dogecoin|doge|polygon|matic)\b",
+        "crypto_price",
+        "coin",
+    )
+
+    # Bare coin name as the entire message (e.g. "bitcoin", "BTC", "ethereum?")
+    add(
+        r"^\s*(?P<coin>bitcoin|btc|ethereum|eth|solana|sol|xrp|ripple|cardano|ada|polkadot|dot|chainlink|link|avalanche|avax|dogecoin|doge|polygon|matic)\s*\??\s*$",
+        "crypto_price",
+        "coin",
+    )
+
     # ---- web_search (LAST — most general, catches broad "search" intent) ----
-    add(r"\b(?P<query>weather\s+(?:in|for|at)\s+.+)", "web_search", "query")
-    add(r"\bwhat(?:'s|\s+is)\s+the\s+(?P<query>weather\b(?:\s+(?:in|for|at)\s+.+)?)", "web_search", "query")
-    add(r"\bsearch\s+(?:the\s+web\s+)?for\s+(?!.*\b(?:twitter|x|email)\b)(?P<query>.+)", "web_search", "query")
+    add(
+        r"\bsearch\s+(?:the\s+web\s+)?for\s+(?!.*\b(?:twitter|x|email)\b)(?P<query>.+)",
+        "web_search",
+        "query",
+    )
     add(r"\blook\s+up\s+(?P<query>.+)", "web_search", "query")
     add(r"\bgoogle\s+(?P<query>.+)", "web_search", "query")
     add(r"\bhow\s+(?:do\s+i|to|can\s+i)\s+(?P<query>.+)", "web_search", "query")
-    add(r"\bwhen\s+(?:is|did|does|was)\s+(?!my\s+next\s+(?:meeting|event|appointment|call)\b)(?P<query>.+)", "web_search", "query")
+    add(
+        r"\bwhen\s+(?:is|did|does|was)\s+(?!my\s+next\s+(?:meeting|event|appointment|call)\b)(?P<query>.+)",
+        "web_search",
+        "query",
+    )
     add(r"\bwhy\s+(?:is|do|does|did|are)\s+(?P<query>.+)", "web_search", "query")
     add(r"\bdefine\s+(?P<query>.+)", "web_search", "query")
     add(r"\bmeaning\s+of\s+(?P<query>.+)", "web_search", "query")
     add(r"\bhow\s+much\s+(?:does|do|is)\b.+\b(?:cost|price)\b", "web_search")
-    add(r"\bprice\s+of\s+(?P<query>.+)", "web_search", "query")
-    add(r"\bwhat\s+is\s+(?!on\s+(?:my\s+)?(?:calendar|schedule)\b)(?!happening\s+(?:this|today|tomorrow|on)\b)(?P<query>.+)", "web_search", "query")
+    # Exclude known crypto coins — those are handled by the crypto_price template above
+    add(
+        r"\bprice\s+of\s+(?!(?:bitcoin|btc|ethereum|eth|solana|sol|xrp|ripple|cardano|ada|polkadot|dot|chainlink|link|avalanche|avax|dogecoin|doge|polygon|matic)\b)(?P<query>.+)",
+        "web_search",
+        "query",
+    )
+    add(
+        r"\bwhat\s+is\s+(?!on\s+(?:my\s+)?(?:calendar|schedule)\b)(?!happening\s+(?:this|today|tomorrow|on)\b)(?P<query>.+)",
+        "web_search",
+        "query",
+    )
     add(r"\bwho\s+is\s+(?P<query>.+)", "web_search", "query")
     add(r"\bwhere\s+is\s+(?P<query>.+)", "web_search", "query")
     add(r"\b(?:latest\s+)?news\s+(?:on|about)\s+(?P<query>.+)", "web_search", "query")
-    add(r"\bsearch\s+(?:for\s+)?(?!(?:on\s+)?(?:twitter|x)\b)(?!(?:my\s+)?emails?\b)(?P<query>.+)", "web_search", "query")
+    add(
+        r"\bsearch\s+(?:for\s+)?(?!(?:on\s+)?(?:twitter|x)\b)(?!(?:my\s+)?emails?\b)(?P<query>.+)",
+        "web_search",
+        "query",
+    )
 
     return entries
 
@@ -203,7 +349,7 @@ def _build_patterns() -> list[_PatternEntry]:
 # Intake rewrites display names to "user N", but we handle both for robustness.
 _MESSAGING_RECIPIENT_TO_RE = re.compile(
     r"\bto\s+(?P<recipient>(?:user\s+)?\w+)"
-    r"(?:\s+(?:on|via|over)\s+(?:signal|telegram)\b)?",
+    r"(?:\s+(?:on|via|over)\s+(?:signal|telegram|matrix)\b)?",
     re.IGNORECASE,
 )
 _MESSAGING_RECIPIENT_VERB_RE = re.compile(
@@ -225,7 +371,8 @@ _MESSAGING_RECIPIENT_VERB_RE = re.compile(
 #   "message Keith via signal saying I'm late" → message="I'm late"
 #   "text Keith on signal hello"   → message="hello" (content after channel)
 _MESSAGING_BODY_SAYING_RE = re.compile(
-    r"\bsaying\s+(?P<body>.+)", re.IGNORECASE,
+    r"\bsaying\s+(?P<body>.+)",
+    re.IGNORECASE,
 )
 
 
@@ -238,17 +385,25 @@ def _extract_messaging_params(msg: str, template_name: str) -> dict:
 
     Returns a dict that may contain 'recipient' and/or 'message' keys.
     """
+    logger.debug(
+        "_extract_messaging_params called",
+        extra={
+            "event": "keyword_classifier._extract_messaging_params",
+            "msg_len": len(msg),
+            "template_name": template_name,
+        },
+    )
     params: dict[str, str] = {}
 
-    # Determine the channel name for stripping from the message
-    channel = "signal" if template_name == "signal_send" else "telegram"
+    # Derive channel name from template name (e.g. "signal_send" → "signal")
+    channel = template_name.replace("_send", "")
 
     # Extract recipient — try "to user N"/"to Name" first, then "verb user N"
     recip_match = _MESSAGING_RECIPIENT_TO_RE.search(msg)
     if recip_match:
         recipient = recip_match.group("recipient").strip()
         # Don't treat the channel name itself as a recipient
-        if recipient.lower() not in (channel, "signal", "telegram"):
+        if recipient.lower() not in (channel, "signal", "telegram", "matrix"):
             params["recipient"] = recipient
     if "recipient" not in params:
         # Fallback: "message user 1 via signal", "text user 2 on signal"
@@ -267,12 +422,18 @@ def _extract_messaging_params(msg: str, template_name: str) -> dict:
     # parts and what remains is the message body.
     # Start by removing the channel designator ("on signal", "via telegram")
     body = re.sub(
-        r"\b(?:on|via|over)\s+(?:signal|telegram)\b", "", msg, flags=re.IGNORECASE,
+        r"\b(?:on|via|over)\s+(?:signal|telegram|matrix)\b",
+        "",
+        msg,
+        flags=re.IGNORECASE,
     ).strip()
 
     # Remove the action verb prefix ("send", "text", "message")
     body = re.sub(
-        r"^\s*(?:send|text|message)\s+", "", body, flags=re.IGNORECASE,
+        r"^\s*(?:send|text|message)\s+",
+        "",
+        body,
+        flags=re.IGNORECASE,
     ).strip()
 
     # Remove the recipient phrase ("to user 1", "to Keith", or "user N" after verb)
@@ -280,12 +441,17 @@ def _extract_messaging_params(msg: str, template_name: str) -> dict:
         # Strip "to <recipient>" pattern
         body = re.sub(
             r"\bto\s+" + re.escape(params["recipient"]),
-            "", body, count=1, flags=re.IGNORECASE,
+            "",
+            body,
+            count=1,
+            flags=re.IGNORECASE,
         ).strip()
         # Also strip bare "user N" if it appears right after the verb was removed
         body = re.sub(
             r"^" + re.escape(params["recipient"]) + r"\b",
-            "", body, flags=re.IGNORECASE,
+            "",
+            body,
+            flags=re.IGNORECASE,
         ).strip()
 
     # Clean up any leftover whitespace or punctuation artifacts
@@ -304,9 +470,9 @@ class KeywordClassifier:
     Falls back to planner for anything ambiguous, multi-step, or unrecognised.
     """
 
-    def __init__(self, registry: TemplateRegistry) -> None:
+    def __init__(self, registry: TemplateRegistry, channel_registry=None) -> None:
         self._registry = registry
-        self._patterns = _build_patterns()
+        self._patterns = _build_patterns(channel_registry=channel_registry)
 
     async def classify(self, user_message: str) -> ClassificationResult:
         """Classify a user message as FAST or PLANNER.
@@ -318,12 +484,19 @@ class KeywordClassifier:
 
         msg = user_message.strip()
 
+        # Strip [ATTACHMENTS] block before classification — attachment
+        # metadata contains file paths (e.g. /media/inbox/) that can
+        # false-match keyword patterns like "inbox" → email_read.
+        attachments_idx = msg.find("\n\n[ATTACHMENTS]")
+        if attachments_idx != -1:
+            msg = msg[:attachments_idx].strip()
+
         # 1. Planner override phrases
         msg_lower = msg.lower()
         for phrase in _PLANNER_OVERRIDE_PHRASES:
             # Negation-aware check (same logic as Qwen classifier)
             for m in re.finditer(r"\b" + re.escape(phrase) + r"\b", msg_lower):
-                prefix = msg_lower[:m.start()].rstrip()
+                prefix = msg_lower[: m.start()].rstrip()
                 if prefix.endswith(("not", "don't", "dont", "no", "never")):
                     continue
                 logger.debug("Planner override phrase: %r", phrase)
@@ -339,7 +512,9 @@ class KeywordClassifier:
         # "build me a website" etc. but allows "create an event for Friday",
         # "draft an email to John", "write an email saying..."
         if _GENERATIVE_VERBS_RE.search(msg):
-            if not _HOW_TO_PREFIX_RE.search(msg) and not _GENERATIVE_TEMPLATE_EXCEPTIONS.search(msg):
+            if not _HOW_TO_PREFIX_RE.search(
+                msg
+            ) and not _GENERATIVE_TEMPLATE_EXCEPTIONS.search(msg):
                 logger.debug("Generative intent without template keyword — planner")
                 return _planner_fallback("Generative/creative request — needs planner")
 
@@ -357,15 +532,29 @@ class KeywordClassifier:
                     try:
                         extracted = m.group(entry.param_extractor)
                         if extracted:
-                            params["query"] = extracted.strip()
+                            # Store under the actual capture group name so
+                            # callers can access e.g. params["location"] or
+                            # params["coin"] rather than always "query".
+                            params[entry.param_extractor] = extracted.strip()
                     except (IndexError, re.error):
-                        pass
+                        logger.debug(
+                            "classify: IndexError | re.error suppressed",
+                            extra={"event": "keyword_classifier.classify.suppressed"},
+                            exc_info=True,
+                        )
                 matches.append((entry.template_name, params))
 
         # 4. Route based on match count
         if not matches:
             logger.debug("No pattern match — planner fallback")
             return _planner_fallback("No template match")
+        logger.debug(
+            "classify: not_matches_passed",
+            extra={
+                "event": "keyword_classifier.classify.not_matches_passed",
+                "reason": "not_matches_passed",
+            },
+        )  # auto:neg
 
         if len(matches) > 1:
             templates = [t for t, _ in matches]
@@ -384,7 +573,7 @@ class KeywordClassifier:
         # Messaging templates (signal_send, telegram_send) need structured
         # param extraction — recipient and message body from natural language.
         # This runs BEFORE the generic required-param fallback below.
-        if template_name in ("signal_send", "telegram_send"):
+        if template_name.endswith("_send") and template_name != "email_send":
             messaging_params = _extract_messaging_params(msg, template_name)
             params.update(messaging_params)
 
@@ -446,7 +635,7 @@ class KeywordClassifier:
             "Keyword classifier: fast-path -> %s",
             template_name,
             extra={
-                "event": "keyword_classify",
+                "event": "keyword.classify",
                 "route": "fast",
                 "template": template_name,
                 "param_keys": list(params.keys()),

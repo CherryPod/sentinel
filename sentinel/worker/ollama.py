@@ -1,19 +1,29 @@
+"""Ollama worker backend for Qwen model interaction.
+
+Manages HTTP communication with the Ollama server, including retries,
+health checks, model loading, and response extraction. All output is
+UNTRUSTED — the caller is responsible for security scanning.
+"""
+
 import asyncio
+import hashlib
+import json
 import logging
 import random
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import httpx
 
 from sentinel.core.config import OLLAMA_NUM_PREDICT
 from sentinel.worker.base import (
     ProviderConnectionError,
+    ProviderError,
     ProviderModelNotFound,
     ProviderTimeoutError,
     WorkerBase,
 )
 
-logger = logging.getLogger("sentinel.audit")
+logger = logging.getLogger(__name__)
 
 # NOTE: Qwen 3 thinking mode is intentionally left enabled for code generation
 # quality. The reasoning chain is an attack surface but is mitigated by output
@@ -125,6 +135,16 @@ class OllamaModelNotFound(ProviderModelNotFound):
     """Requested model is not available on the Ollama server."""
 
 
+class OllamaProtocolError(ProviderError):
+    """Ollama returned a response body that is not valid JSON.
+
+    Raised by ``generate()`` when ``resp.json()`` fails on a successful HTTP
+    response. Keeps raw ``json.JSONDecodeError`` from escaping the provider
+    boundary as an untyped exception. Not retried — a decode failure on a
+    received response is not a transient transport error.
+    """
+
+
 class OllamaWorker(WorkerBase):
     """Async client for the Ollama /api/generate endpoint."""
 
@@ -132,6 +152,10 @@ class OllamaWorker(WorkerBase):
     # Pinned to prevent runaway generation loops and ensure reproducible output.
     # Analysis: docs/archive/2026-02-19_ollama-tuning-analysis.md
     # repeat_penalty (1.1) suppresses repetition in quantized models.
+    _RETRY_BACKOFF_S = 1.0  # base delay between retry attempts
+    _RETRY_JITTER = (0.8, 1.2)  # ±20% jitter range multiplier
+    _MAX_ATTEMPTS = 2  # initial + 1 retry
+
     _DEFAULT_OPTIONS = {
         "temperature": 0.6,
         "top_p": 0.95,
@@ -163,7 +187,7 @@ class OllamaWorker(WorkerBase):
         on error paths). Non-streaming mode. Retries once on transient failures.
         """
         if system_prompt is None:
-            now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+            now = datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
             system_prompt = QWEN_SYSTEM_PROMPT_TEMPLATE.format(
                 marker=marker, current_datetime=now
             )
@@ -183,9 +207,8 @@ class OllamaWorker(WorkerBase):
         # Retry policy: only retry transient errors (5xx, timeouts, connection
         # errors). 4xx errors are not retried. Exponential backoff with ±20%
         # jitter between attempts (BH3-052).
-        _RETRY_BACKOFF_BASE = [1.0, 2.0]  # seconds for attempt 0→1 delay
         last_error: Exception | None = None
-        for attempt in range(2):  # initial + 1 retry
+        for attempt in range(self._MAX_ATTEMPTS):
             try:
                 async with httpx.AsyncClient(
                     timeout=httpx.Timeout(self._timeout)
@@ -201,7 +224,16 @@ class OllamaWorker(WorkerBase):
                     )
 
                 resp.raise_for_status()
-                data = resp.json()
+                try:
+                    data = resp.json()
+                except (json.JSONDecodeError, ValueError) as exc:
+                    raise OllamaProtocolError(
+                        "Ollama response body is not valid JSON"
+                    ) from exc
+                if not isinstance(data, dict):
+                    raise OllamaProtocolError(
+                        f"Ollama response is not a JSON object (got {type(data).__name__})"
+                    )
 
                 # Extract token stats from Ollama response for per-prompt accounting
                 stats = {
@@ -213,21 +245,30 @@ class OllamaWorker(WorkerBase):
                 logger.info(
                     "Ollama token stats",
                     extra={
-                        "event": "ollama_token_stats",
+                        "event": "ollama.token_stats",
                         **{k: v for k, v in stats.items() if v is not None},
                     },
                 )
 
-                raw_response = data.get("response", "")
+                raw_response = data.get("response")
+                if not isinstance(raw_response, str):
+                    raw_response = ""
                 logger.debug(
                     "Raw Ollama HTTP response",
                     extra={
-                        "event": "ollama_raw_response",
-                        "content_full": raw_response,
+                        "event": "ollama.raw_response",
+                        "content_hash": hashlib.sha256(
+                            raw_response.encode()
+                        ).hexdigest()[:16],
                         "content_length": len(raw_response),
-                        "has_entities": ("&lt;" in raw_response or "&gt;" in raw_response),
+                        "has_entities": (
+                            "&lt;" in raw_response or "&gt;" in raw_response
+                        ),
                         "has_response_tags": ("<RESPONSE>" in raw_response),
-                        "has_html_tags": ("<html" in raw_response.lower() or "<!doctype" in raw_response.lower()),
+                        "has_html_tags": (
+                            "<html" in raw_response.lower()
+                            or "<!doctype" in raw_response.lower()
+                        ),
                     },
                 )
                 return raw_response, stats
@@ -235,16 +276,26 @@ class OllamaWorker(WorkerBase):
             except OllamaModelNotFound:
                 raise  # don't retry 404s
 
+            except OllamaProtocolError:
+                raise  # CRIT-13: JSON decode failure is not retryable
+
             except httpx.TimeoutException as exc:
                 last_error = OllamaTimeoutError(
                     f"Ollama request timed out after {self._timeout}s"
                 )
                 logger.warning(
                     "Ollama timeout",
-                    extra={"event": "ollama_timeout", "attempt": attempt + 1, "timeout_s": self._timeout},
+                    extra={
+                        "event": "ollama.timeout",
+                        "attempt": attempt + 1,
+                        "timeout_s": self._timeout,
+                    },
+                    exc_info=True,
                 )
                 if attempt == 0:
-                    await asyncio.sleep(_RETRY_BACKOFF_BASE[0] * random.uniform(0.8, 1.2))
+                    await asyncio.sleep(
+                        self._RETRY_BACKOFF_S * random.uniform(*self._RETRY_JITTER)
+                    )
                     continue
                 raise last_error from exc
 
@@ -254,10 +305,18 @@ class OllamaWorker(WorkerBase):
                 )
                 logger.warning(
                     "Ollama connection error",
-                    extra={"event": "ollama_connect_error", "attempt": attempt + 1, "base_url": self._base_url, "error": str(exc)},
+                    extra={
+                        "event": "ollama.connect_error",
+                        "attempt": attempt + 1,
+                        "base_url": self._base_url,
+                        "error": str(exc),
+                    },
+                    exc_info=True,
                 )
                 if attempt == 0:
-                    await asyncio.sleep(_RETRY_BACKOFF_BASE[0] * random.uniform(0.8, 1.2))
+                    await asyncio.sleep(
+                        self._RETRY_BACKOFF_S * random.uniform(*self._RETRY_JITTER)
+                    )
                     continue
                 raise last_error from exc
 
@@ -268,13 +327,20 @@ class OllamaWorker(WorkerBase):
                 )
                 logger.warning(
                     "Ollama HTTP error",
-                    extra={"event": "ollama_http_error", "attempt": attempt + 1, "status_code": status_code},
+                    extra={
+                        "event": "ollama.http_error",
+                        "attempt": attempt + 1,
+                        "status_code": status_code,
+                    },
+                    exc_info=True,
                 )
                 # Only retry 5xx (server) errors — 4xx are client errors
                 if status_code < 500:
                     raise last_error from exc
                 if attempt == 0:
-                    await asyncio.sleep(_RETRY_BACKOFF_BASE[0] * random.uniform(0.8, 1.2))
+                    await asyncio.sleep(
+                        self._RETRY_BACKOFF_S * random.uniform(*self._RETRY_JITTER)
+                    )
                     continue
                 raise last_error from exc
 

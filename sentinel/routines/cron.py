@@ -3,9 +3,12 @@
 Wraps croniter with validation helpers used by the routine store and engine.
 """
 
-from datetime import datetime, timezone
+import logging
+from datetime import UTC, datetime
 
 from croniter import croniter
+
+logger = logging.getLogger(__name__)
 
 
 def validate_cron(expression: str) -> bool:
@@ -29,9 +32,9 @@ def next_run(expression: str, base: datetime | None = None) -> datetime:
     if not validate_cron(expression):
         raise ValueError(f"Invalid cron expression: {expression!r}")
     if base is None:
-        base = datetime.now(timezone.utc)
+        base = datetime.now(UTC)
     it = croniter(expression, base)
-    return it.get_next(datetime).replace(tzinfo=timezone.utc)
+    return it.get_next(datetime).replace(tzinfo=UTC)
 
 
 def validate_trigger_config(trigger_type: str, trigger_config: dict) -> None:
@@ -43,7 +46,9 @@ def validate_trigger_config(trigger_type: str, trigger_config: dict) -> None:
     if trigger_type == "cron":
         cron_expr = trigger_config.get("cron")
         if not cron_expr or not isinstance(cron_expr, str):
-            raise ValueError("Cron trigger requires 'cron' key with a string expression")
+            raise ValueError(
+                "Cron trigger requires 'cron' key with a string expression"
+            )
         if not validate_cron(cron_expr):
             raise ValueError(f"Invalid cron expression: {cron_expr!r}")
 
@@ -68,7 +73,11 @@ def validate_trigger_config(trigger_type: str, trigger_config: dict) -> None:
     elif trigger_type == "interval":
         seconds = trigger_config.get("seconds")
         if not isinstance(seconds, int) or seconds < 1:
-            raise ValueError("Interval trigger requires 'seconds' key with a positive integer")
+            raise ValueError(
+                "Interval trigger requires 'seconds' key with a positive integer"
+            )
 
     else:
-        raise ValueError(f"Unknown trigger_type: {trigger_type!r} (must be cron, event, or interval)")
+        raise ValueError(
+            f"Unknown trigger_type: {trigger_type!r} (must be cron, event, or interval)"
+        )

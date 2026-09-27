@@ -1,0 +1,22 @@
+/* ── Sentinel UI — Root Stylesheet ────────────────────────────
+   All styles loaded via @import chain.
+   Structural styles first, then per-view styles.
+   ──────────────────────────────────────────────────────────── */
+
+/* ── Structural (shared across all views) ──────────────────── */
+@import url('styles/tokens.css');
+@import url('styles/reset.css');
+@import url('styles/layout.css');
+@import url('styles/components.css');
+@import url('styles/utilities.css');
+@import url('styles/themes/dark.css');
+
+/* ── Per-view styles ───────────────────────────────────────── */
+@import url('views/dashboard/dashboard.css');
+@import url('views/chat/chat.css');
+@import url('views/memory/memory.css');
+@import url('views/routines/routines.css');
+@import url('views/logs/logs.css');
+@import url('views/activity/activity.css');
+@import url('views/settings/settings.css');
+@import url('views/admin/admin.css');

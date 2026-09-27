@@ -1,3 +1,10 @@
+"""Policy engine for file and command constraint enforcement.
+
+Validates file paths and shell commands against configurable allow/deny
+policies. Handles path normalisation (URL decode, homoglyph, traversal
+detection) and command parsing (shlex, compound splitting, ANSI-C quotes).
+"""
+
 import copy
 import fnmatch
 import logging
@@ -5,13 +12,15 @@ import os
 import re
 import shlex
 from pathlib import Path, PurePosixPath
+from typing import Any
 from urllib.parse import unquote
 
 import yaml
 
-logger = logging.getLogger("sentinel.audit")
+logger = logging.getLogger(__name__)
 
 from sentinel.core.models import PolicyResult, ValidationResult
+from sentinel.crypto.blind_index import log_hash
 from sentinel.security.homoglyph import normalise_homoglyphs
 
 
@@ -23,9 +32,12 @@ class PolicyEngine:
     # The sandbox already constrains blast radius (no network, read-only root,
     # dropped capabilities, resource limits), so inline Python execution adds
     # no new capability beyond write-then-run (file_write + python3 script.py).
-    _SANDBOX_EXEMPT_PATTERNS: frozenset[str] = frozenset({
-        "python -c", "python3 -c",
-    })
+    _SANDBOX_EXEMPT_PATTERNS: frozenset[str] = frozenset(
+        {
+            "python -c",
+            "python3 -c",
+        }
+    )
 
     # Regex to detect and decode ANSI-C shell quoting ($'\xNN', $'\NNN').
     # Bash interprets $'...' sequences, which can encode blocked commands
@@ -40,16 +52,15 @@ class PolicyEngine:
     # the real command — that must also be validated.
     _COMMAND_PREFIXES: frozenset[str] = frozenset({"env"})
 
-    def __init__(self, policy_path: str, workspace_path: str = "/workspace",
-                 trust_level: int = 0):
+    def __init__(
+        self, policy_path: str, workspace_path: str = "/workspace", trust_level: int = 0
+    ):
         # Audit #3: wrap policy load with clear error on missing/malformed file
         try:
             with open(policy_path) as f:
                 self._policy = yaml.safe_load(f)
         except FileNotFoundError:
-            raise ValueError(
-                f"Policy file not found: {policy_path}"
-            ) from None
+            raise ValueError(f"Policy file not found: {policy_path}") from None
         except yaml.YAMLError as e:
             raise ValueError(
                 f"Policy file is not valid YAML: {policy_path}: {e}"
@@ -74,8 +85,12 @@ class PolicyEngine:
 
         # Audit #11: cache file access lists at init instead of re-extracting per call
         self._blocked_file_patterns: list[str] = self._file_access.get("blocked", [])
-        self._write_allowed_patterns: list[str] = self._file_access.get("write_allowed", [])
-        self._read_allowed_patterns: list[str] = self._file_access.get("read_allowed", [])
+        self._write_allowed_patterns: list[str] = self._file_access.get(
+            "write_allowed", []
+        )
+        self._read_allowed_patterns: list[str] = self._file_access.get(
+            "read_allowed", []
+        )
 
         # Audit #5: pre-compile blocked command patterns as regexes at init.
         # Single-word patterns use word-boundary matching to avoid FPs
@@ -88,18 +103,32 @@ class PolicyEngine:
                 # Multi-word / pipe patterns: substring match (no regex needed)
                 self._blocked_patterns_compiled.append((blocked, None))
             else:
-                # Single-word: pre-compile word-boundary regex with hyphen lookbehind
-                self._blocked_patterns_compiled.append(
-                    (blocked, re.compile(rf"(?<![-])\b{re.escape(blocked)}\b"))
-                )
+                # Single-word: pre-compile word-boundary regex with hyphen lookbehind.
+                # Align with command_pattern.py init-log pattern — structured
+                # event + re-raise preserves fail-closed invariant at startup.
+                try:
+                    compiled = re.compile(rf"(?<![-])\b{re.escape(blocked)}\b")
+                except re.error:
+                    logger.error(
+                        "invalid regex in policy blocked_patterns — fail-closed",
+                        extra={
+                            "event": "security.scanner.bad_rule",
+                            "error_category": "configuration",
+                            "scanner": "policy_engine",
+                            "rule_id": blocked,
+                        },
+                        exc_info=True,
+                    )
+                    raise
+                self._blocked_patterns_compiled.append((blocked, compiled))
 
         # Build allowed command set (base commands)
         self._allowed_commands: set[str] = set(self._commands.get("allowed", []))
 
         # Constitutional patterns — always blocked (all trust levels)
         self._injection_patterns_always = [
-            re.compile(r"\$\("),       # $( subshell
-            re.compile(r"`"),          # backtick subshell
+            re.compile(r"\$\("),  # $( subshell
+            re.compile(r"`"),  # backtick subshell
         ]
 
         # Structural patterns — blocked at TL0-3, relaxed at TL4+
@@ -109,9 +138,9 @@ class PolicyEngine:
         # executor's call sequence, not by the policy engine. Adding verification
         # here would tightly couple policy_engine to the orchestrator/executor.
         self._injection_patterns_strict = [
-            re.compile(r";\s*"),       # semicolon chaining
-            re.compile(r"&&"),         # AND chaining
-            re.compile(r"\|\|"),       # OR chaining
+            re.compile(r";\s*"),  # semicolon chaining
+            re.compile(r"&&"),  # AND chaining
+            re.compile(r"\|\|"),  # OR chaining
             re.compile(r"(?<!\|)\|(?!\|)"),  # bare pipe (not ||)
         ]
 
@@ -121,6 +150,9 @@ class PolicyEngine:
         Catches typos like ``write_alowed`` that would silently result
         in empty allowlists (fail-closed but hard to diagnose).
         """
+        logger.debug(
+            "_validate_policy called", extra={"event": "policy_engine._validate_policy"}
+        )  # auto:entry
         required_sections: dict[str, list[str]] = {
             "file_access": ["read_allowed", "write_allowed", "blocked"],
             "commands": ["allowed", "blocked_patterns", "path_constrained"],
@@ -203,13 +235,27 @@ class PolicyEngine:
             except (OSError, ValueError):
                 logger.warning(
                     "Path resolve fallback to PurePosixPath",
-                    extra={"path": cleaned[:200]},
+                    extra={
+                        "event": "policy_engine.path_resolve_fallback",
+                        "path_len": len(cleaned),
+                    },
+                    exc_info=True,
                 )
                 normalised = str(posix)
         return normalised
 
     def _detect_traversal(self, raw_path: str) -> bool:
         """Check for path traversal attempts in the raw (pre-normalised) input."""
+        logger.debug(
+            "_detect_traversal called",
+            extra={
+                "event": "policy_engine._detect_traversal",
+                "raw_path_len": len(raw_path) if isinstance(raw_path, str) else 0,
+                "raw_path_hash": log_hash(raw_path)
+                if isinstance(raw_path, str)
+                else "nokey",
+            },
+        )  # auto:entry
         decoded = self._url_decode_iterative(raw_path)
         cleaned = self._strip_null_bytes(decoded)
 
@@ -229,10 +275,7 @@ class PolicyEngine:
 
         # Audit #7: overlong UTF-8 encoding of '.' as %c0%ae (CVE-2021-41773).
         # Python's unquote() may not decode overlong sequences, so check explicitly.
-        if "%c0%ae" in lower:
-            return True
-
-        return False
+        return "%c0%ae" in lower
 
     # ── File access checks ──────────────────────────────────────────
 
@@ -258,8 +301,7 @@ class PolicyEngine:
             # the "**" prefix rather than relying on the next char not being '*'.
             if pattern.startswith("**"):
                 suffix_pattern = pattern[2:]  # strip exactly "**", not all *
-                if suffix_pattern.startswith("/"):
-                    suffix_pattern = suffix_pattern[1:]
+                suffix_pattern = suffix_pattern.removeprefix("/")
                 # Check if any suffix of the path matches
                 parts = PurePosixPath(path).parts
                 for i in range(len(parts)):
@@ -271,10 +313,44 @@ class PolicyEngine:
                     return True
         return False
 
+    def _log_blocked_validation(
+        self,
+        event: str,
+        reason: str,
+        *,
+        trust_level: str | None = None,
+        **safe_context: Any,
+    ) -> None:
+        """Emit a structured INFO log for a BLOCKED validation outcome.
+
+        Discipline: *safe_context* carries length/hash surrogates only —
+        never raw path/command/stripped/normalised values. Enforced at
+        review time (Python cannot introspect field meaning).
+        """
+        extra: dict[str, Any] = {"event": event, "reason": reason}
+        if trust_level is not None:
+            extra["trust_level"] = trust_level
+        extra.update(safe_context)
+        logger.info("Policy check blocked", extra=extra)
+
     def check_file_write(self, path: str) -> ValidationResult:
         """Validate a file write operation against policy."""
         # Check traversal on raw input first
+        logger.debug(
+            "check_file_write called",
+            extra={
+                "event": "policy_engine.check_file_write",
+                "path_len": len(path) if isinstance(path, str) else 0,
+                "path_hash": log_hash(path) if isinstance(path, str) else "nokey",
+            },
+        )  # auto:entry
         if self._detect_traversal(path):
+            self._log_blocked_validation(
+                "policy_engine.check_file_write.blocked_path_traversal",
+                reason="Path traversal detected",
+                path_len=len(path) if isinstance(path, str) else 0,
+                path_hash=log_hash(path) if isinstance(path, str) else "nokey",
+            )
             return ValidationResult(
                 status=PolicyResult.BLOCKED,
                 path=path,
@@ -285,6 +361,13 @@ class PolicyEngine:
 
         # Check blocked patterns first (higher priority)
         if self._matches_any_glob(resolved, self._blocked_file_patterns):
+            self._log_blocked_validation(
+                "policy_engine.check_file_write.blocked_pattern_match",
+                reason="Path matches blocked pattern",
+                path_len=len(path) if isinstance(path, str) else 0,
+                path_hash=log_hash(path) if isinstance(path, str) else "nokey",
+                resolved_hash=log_hash(resolved),
+            )
             return ValidationResult(
                 status=PolicyResult.BLOCKED,
                 path=path,
@@ -300,6 +383,13 @@ class PolicyEngine:
                 resolved_path=resolved,
             )
 
+        self._log_blocked_validation(
+            "policy_engine.check_file_write.blocked_allowlist_miss",
+            reason="Path not in write_allowed list",
+            path_len=len(path) if isinstance(path, str) else 0,
+            path_hash=log_hash(path) if isinstance(path, str) else "nokey",
+            resolved_hash=log_hash(resolved),
+        )
         return ValidationResult(
             status=PolicyResult.BLOCKED,
             path=path,
@@ -309,7 +399,21 @@ class PolicyEngine:
 
     def check_file_read(self, path: str) -> ValidationResult:
         """Validate a file read operation against policy."""
+        logger.debug(
+            "check_file_read called",
+            extra={
+                "event": "policy_engine.check_file_read",
+                "path_len": len(path) if isinstance(path, str) else 0,
+                "path_hash": log_hash(path) if isinstance(path, str) else "nokey",
+            },
+        )  # auto:entry
         if self._detect_traversal(path):
+            self._log_blocked_validation(
+                "policy_engine.check_file_read.blocked_path_traversal",
+                reason="Path traversal detected",
+                path_len=len(path) if isinstance(path, str) else 0,
+                path_hash=log_hash(path) if isinstance(path, str) else "nokey",
+            )
             return ValidationResult(
                 status=PolicyResult.BLOCKED,
                 path=path,
@@ -320,6 +424,13 @@ class PolicyEngine:
 
         # Check blocked patterns first
         if self._matches_any_glob(resolved, self._blocked_file_patterns):
+            self._log_blocked_validation(
+                "policy_engine.check_file_read.blocked_pattern_match",
+                reason="Path matches blocked pattern",
+                path_len=len(path) if isinstance(path, str) else 0,
+                path_hash=log_hash(path) if isinstance(path, str) else "nokey",
+                resolved_hash=log_hash(resolved),
+            )
             return ValidationResult(
                 status=PolicyResult.BLOCKED,
                 path=path,
@@ -335,6 +446,13 @@ class PolicyEngine:
                 resolved_path=resolved,
             )
 
+        self._log_blocked_validation(
+            "policy_engine.check_file_read.blocked_allowlist_miss",
+            reason="Path not in read_allowed list",
+            path_len=len(path) if isinstance(path, str) else 0,
+            path_hash=log_hash(path) if isinstance(path, str) else "nokey",
+            resolved_hash=log_hash(resolved),
+        )
         return ValidationResult(
             status=PolicyResult.BLOCKED,
             path=path,
@@ -368,13 +486,31 @@ class PolicyEngine:
             c = command[i]
 
             if c == "'" and not in_dq:
+                logger.debug(
+                    "_split_compound_command: clean",
+                    extra={
+                        "event": "policy_engine._split_compound_command.branch.clean"
+                    },
+                )
                 in_sq = not in_sq
                 current.append(c)
             elif c == '"' and not in_sq:
+                logger.debug(
+                    "_split_compound_command: clean",
+                    extra={
+                        "event": "policy_engine._split_compound_command.branch.clean"
+                    },
+                )
                 in_dq = not in_dq
                 current.append(c)
             elif not in_sq and not in_dq:
                 # Two-char operators: || and &&
+                logger.debug(
+                    "_split_compound_command: clean",
+                    extra={
+                        "event": "policy_engine._split_compound_command.branch.clean"
+                    },
+                )
                 if c == "|" and i + 1 < n and command[i + 1] == "|":
                     part = "".join(current).strip()
                     if part:
@@ -398,13 +534,19 @@ class PolicyEngine:
                 else:
                     current.append(c)
             else:
+                logger.debug(
+                    "_split_compound_command: clean",
+                    extra={
+                        "event": "policy_engine._split_compound_command.branch.clean"
+                    },
+                )
                 current.append(c)
             i += 1
 
         part = "".join(current).strip()
         if part:
             parts.append(part)
-        return parts if parts else [command]
+        return parts or [command]
 
     def _extract_base_command(self, command: str) -> str:
         """Extract the base command (possibly multi-word like 'podman build')."""
@@ -428,7 +570,7 @@ class PolicyEngine:
         if shlex fails on unmatched quotes — the fallback must NOT skip
         the policy check entirely.
         """
-        rest = command.strip()[len(base_command):].strip()
+        rest = command.strip()[len(base_command) :].strip()
         if not rest:
             return []
         try:
@@ -436,6 +578,14 @@ class PolicyEngine:
         except ValueError:
             # Unmatched quotes — fall back to whitespace split rather
             # than skipping args entirely (that would be a new fail-open).
+            logger.debug(
+                "shlex.split failed, falling back to whitespace split",
+                extra={
+                    "event": "policy_engine.shlex_fallback",
+                    "rest_len": len(rest),
+                },
+                exc_info=True,
+            )
             return rest.split()
 
     @classmethod
@@ -446,20 +596,25 @@ class PolicyEngine:
         characters. Blocked pattern matching must see the decoded result,
         not the encoded form. E.g. $'\\x63\\x75\\x72\\x6c' → "curl".
         """
+
         def _decode_content(match: re.Match) -> str:
+            logger.debug(
+                "_decode_content called",
+                extra={
+                    "event": "policy_engine._decode_content",
+                    "match_type": type(match).__name__,
+                },
+            )  # auto:entry
             content = match.group(1)
             # Decode hex escapes: \xNN
             content = cls._ANSI_C_HEX_RE.sub(
                 lambda m: chr(int(m.group(1), 16)), content
             )
             # Decode octal escapes: \NNN
-            content = cls._ANSI_C_OCT_RE.sub(
-                lambda m: chr(int(m.group(1), 8)), content
-            )
+            content = cls._ANSI_C_OCT_RE.sub(lambda m: chr(int(m.group(1), 8)), content)
             # Common single-char escapes
             content = (
-                content
-                .replace("\\n", "\n")
+                content.replace("\\n", "\n")
                 .replace("\\t", "\t")
                 .replace("\\r", "\r")
                 .replace("\\\\", "\\")
@@ -492,10 +647,18 @@ class PolicyEngine:
 
         return command
 
-    def check_command(self, command: str, *, sandbox_context: bool = False) -> ValidationResult:
+    def check_command(
+        self, command: str, *, sandbox_context: bool = False
+    ) -> ValidationResult:
         """Validate a shell command against policy."""
         stripped = command.strip()
         if not stripped:
+            self._log_blocked_validation(
+                "policy_engine.check_command.blocked_empty",
+                reason="Empty command",
+                trust_level=str(self._trust_level),
+                command_len=len(command) if isinstance(command, str) else 0,
+            )
             return ValidationResult(
                 status=PolicyResult.BLOCKED,
                 reason="Empty command",
@@ -518,11 +681,29 @@ class PolicyEngine:
             patterns = patterns + self._injection_patterns_strict
         for pattern in patterns:
             if pattern.search(normalised):
+                self._log_blocked_validation(
+                    "policy_engine.check_command.blocked_injection",
+                    reason=f"Injection pattern detected: {pattern.pattern}",
+                    trust_level=str(self._trust_level),
+                    command_len=len(stripped),
+                    command_hash=log_hash(stripped),
+                    pattern_name=pattern.pattern,
+                )
+                # Q14-FL1: fixed-template user-facing reason (no
+                # pattern.pattern). Server-side log above keeps the
+                # pattern via _log_blocked_validation extras.
                 return ValidationResult(
                     status=PolicyResult.BLOCKED,
                     path=stripped,
-                    reason=f"Injection pattern detected: {pattern.pattern}",
+                    reason="Injection pattern detected",
                 )
+        logger.debug(
+            "check_command injection patterns clean",
+            extra={
+                "event": "policy_engine.check_command.injection_clean",
+                "pattern_count": len(patterns),
+            },
+        )
 
         # Check blocked patterns using pre-compiled regexes (audit #5).
         # Single-word patterns use word-boundary matching to avoid FPs
@@ -536,18 +717,47 @@ class PolicyEngine:
             if compiled_re is None:
                 # Multi-word / pipe pattern: substring match
                 if blocked in normalised:
+                    self._log_blocked_validation(
+                        "policy_engine.check_command.blocked_compound_pattern",
+                        reason=f"Matches blocked pattern: {blocked}",
+                        trust_level=str(self._trust_level),
+                        command_len=len(stripped),
+                        command_hash=log_hash(stripped),
+                        pattern_name=blocked,
+                        sandbox_context=sandbox_context,
+                    )
+                    # Q14-FL1: fixed-template user-facing reason (no
+                    # blocked literal). Server-side log above keeps it.
                     return ValidationResult(
                         status=PolicyResult.BLOCKED,
                         path=stripped,
-                        reason=f"Matches blocked pattern: {blocked}",
+                        reason="Matches blocked pattern",
                     )
             else:
                 if compiled_re.search(normalised):
+                    self._log_blocked_validation(
+                        "policy_engine.check_command.blocked_compound_pattern",
+                        reason=f"Matches blocked pattern: {blocked}",
+                        trust_level=str(self._trust_level),
+                        command_len=len(stripped),
+                        command_hash=log_hash(stripped),
+                        pattern_name=blocked,
+                        sandbox_context=sandbox_context,
+                    )
+                    # Q14-FL1: fixed-template user-facing reason (no
+                    # blocked literal). Server-side log above keeps it.
                     return ValidationResult(
                         status=PolicyResult.BLOCKED,
                         path=stripped,
-                        reason=f"Matches blocked pattern: {blocked}",
+                        reason="Matches blocked pattern",
                     )
+        logger.debug(
+            "check_command blocked patterns clean",
+            extra={
+                "event": "policy_engine.check_command.blocked_clean",
+                "pattern_count": len(self._blocked_patterns_compiled),
+            },
+        )
 
         # Split compound commands (pipes, &&, ||, ;) and validate each
         # sub-command against the allowed list and path constraints.
@@ -566,10 +776,28 @@ class PolicyEngine:
 
             base = self._extract_base_command(resolved_cmd)
             if base not in self._allowed_commands:
+                # `base` on the allowlist-miss path is attacker-influenced —
+                # _extract_base_command falls back to raw parts[0] when the
+                # command isn't a known form, so any user-supplied token ends
+                # up here before membership is checked. Use surrogates, not
+                # raw value. (The path-constrained site below keeps `base`
+                # raw because by that point `base in self._allowed_commands`
+                # has been verified — policy-config-derived, safe to log.)
+                self._log_blocked_validation(
+                    "policy_engine.check_command.blocked_allowlist_miss",
+                    reason=f"Command not in allowed list: {base}",
+                    trust_level=str(self._trust_level),
+                    command_len=len(stripped),
+                    command_hash=log_hash(stripped),
+                    base_command_len=len(base),
+                    base_command_hash=log_hash(base),
+                )
+                # Q14-FL1: fixed-template user-facing reason (no base
+                # command). Server-side log above keeps base_command_hash.
                 return ValidationResult(
                     status=PolicyResult.BLOCKED,
                     path=stripped,
-                    reason=f"Command not in allowed list: {base}",
+                    reason="Command not in allowed list",
                 )
 
             # Audit #13: WONTFIX — flag-skip for path-constrained args is fragile
@@ -590,17 +818,38 @@ class PolicyEngine:
                     if a.startswith("/"):
                         path_args.append(a)
                     else:
-                        resolved = os.path.normpath(os.path.join(self._workspace_path, a))
+                        resolved = os.path.normpath(
+                            os.path.join(self._workspace_path, a)
+                        )
                         path_args.append(resolved)
                 for path_arg in path_args:
                     result = self.check_file_read(path_arg)
                     if result.status == PolicyResult.BLOCKED:
+                        self._log_blocked_validation(
+                            "policy_engine.check_command.blocked_path_constrained",
+                            reason=f"Path-constrained command '{base}' used with blocked path",
+                            trust_level=str(self._trust_level),
+                            command_len=len(stripped),
+                            command_hash=log_hash(stripped),
+                            base_command=base,
+                            path_arg_hash=log_hash(path_arg),
+                        )
+                        # Q14-FL1: fixed-template user-facing reason
+                        # (no base, no path_arg). Server-side log above
+                        # keeps base_command + path_arg_hash.
                         return ValidationResult(
                             status=PolicyResult.BLOCKED,
                             path=stripped,
-                            reason=f"Path-constrained command '{base}' used with blocked path: {path_arg}",
+                            reason="Path-constrained command used with blocked path",
                         )
 
+        logger.debug(
+            "check_command passed all checks",
+            extra={
+                "event": "policy_engine.check_command.clean",
+                "sub_command_count": len(sub_commands),
+            },
+        )
         return ValidationResult(
             status=PolicyResult.ALLOWED,
             path=stripped,

@@ -28,9 +28,17 @@ ollama-data/
 
 # Logs (stored in container volume)
 logs/
+# Exception: UI logs view module
+!ui/views/logs/
+
+# Node (UI lint tools — devDependencies only)
+node_modules/
 
 # Claude Code
 .claude/
+
+# Overnight Orchestrator harness-reserved runtime (never commit)
+.overnight/
 
 # Serena
 .serena/
@@ -57,13 +65,13 @@ sentinel.db
 # Benchmark artifacts (results, logs, lock files)
 benchmarks/*.jsonl
 benchmarks/*.log
+benchmarks/*.txt
 benchmarks/.compose.lock
 benchmarks/.pipeline_start_*
 benchmarks/tainted_run14/
 
-# Test results & screenshots (untracked local artifacts)
+# Local test-run output. UI screenshots in screenshots/ are part of the repo.
 test-results/
-screenshots/
 
 # Compose backup
 podman-compose.yaml.bak
@@ -74,6 +82,9 @@ docs/archive/claude_api_tokens*.csv
 # Tainted run artifacts
 docs/assessments/tainted_run14/
 
+# Auto-generated audit_scan / audit_fix artifacts (scanner output)
+docs/assessments/automated/
+
 # GitHub deploy staging area
 .github-deploy/
 
@@ -81,3 +92,7 @@ docs/assessments/tainted_run14/
 injection_benchmark_config.yaml
 benchmarks/.injection_benchmark_cleanup.json
 .superpowers/
+.audit_baseline.json
+.playwright-mcp/
+sidecar/wasm/wasm/wasm/
+.aider*

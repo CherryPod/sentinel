@@ -22,26 +22,28 @@ from pathlib import Path
 
 from sentinel.core.models import ScanMatch, ScanResult
 
-logger = logging.getLogger("sentinel.audit")
+logger = logging.getLogger(__name__)
 
 # Semgrep writes settings/logs to ~/.semgrep — redirect to /tmp for read-only containers
 _SEMGREP_ENV = {
     **os.environ,
-    "XDG_CONFIG_HOME": "/tmp",
-    "XDG_CACHE_HOME": "/tmp",
+    "XDG_CONFIG_HOME": "/tmp",  # nosec B108 — writable dir for read-only container
+    "XDG_CACHE_HOME": "/tmp",  # nosec B108 — writable dir for read-only container
     "SEMGREP_SEND_METRICS": "off",
 }
 
 # Rules that produce findings but should NOT block the response.
 # Matches are still logged (audit trail) but don't set found=True.
-_WARN_ONLY_RULES: frozenset[str] = frozenset({
-    "insecure-crypto-prng-random",  # CWE-338: flags all random.X(), not just crypto
-    "insecure-hardcoded-secrets",   # CWE-798: variable-name matching FPs on test fixtures
-    "crypto-fixed-prng-seed",      # CWE-338: FPs on test determinism (random.seed(42))
-    "insecure-math-random",        # CWE-338: JS Math.random(), not always crypto context
-    "insecure-random",             # CWE-338: Java new Random(), not always crypto context
-    "insecure-cookie",             # CWE-614: client-side cookie, high FP rate
-})
+_WARN_ONLY_RULES: frozenset[str] = frozenset(
+    {
+        "insecure-crypto-prng-random",  # CWE-338: flags all random.X(), not just crypto
+        "insecure-hardcoded-secrets",  # CWE-798: variable-name matching FPs on test fixtures
+        "crypto-fixed-prng-seed",  # CWE-338: FPs on test determinism (random.seed(42))
+        "insecure-math-random",  # CWE-338: JS Math.random(), not always crypto context
+        "insecure-random",  # CWE-338: Java new Random(), not always crypto context
+        "insecure-cookie",  # CWE-614: client-side cookie, high FP rate
+    }
+)
 
 # Default rules directory relative to project root
 _DEFAULT_RULES_DIR = Path(__file__).resolve().parent.parent.parent / "rules" / "semgrep"
@@ -60,6 +62,7 @@ def _find_semgrep() -> str | None:
         return str(venv_bin)
     # Fall back to system PATH — returns None if not found
     return shutil.which("semgrep")
+
 
 # Language → file extension mapping (code_extractor uses similar mapping)
 _LANG_EXTENSION: dict[str, str] = {
@@ -94,6 +97,9 @@ _LANG_RULES_DIR: dict[str, str] = {
 
 _loaded: bool = False
 _rules_dir: Path = _DEFAULT_RULES_DIR
+# Q11-U1 documented exception: module global initialised by initialize()
+# from settings.semgrep_timeout (further down in this module); the `= 30`
+# literal is a pre-init fallback for direct test instantiation only.
 _timeout: int = 30
 _init_lock = threading.Lock()  # B-002: protect module globals during initialization
 
@@ -124,18 +130,16 @@ def initialize(rules_dir: str | Path | None = None, timeout: int | None = None) 
             _timeout = timeout
         else:
             from sentinel.core.config import settings
+
             _timeout = settings.semgrep_timeout
 
-        if rules_dir is not None:
-            _rules_dir = Path(rules_dir)
-        else:
-            _rules_dir = _DEFAULT_RULES_DIR
+        _rules_dir = Path(rules_dir) if rules_dir is not None else _DEFAULT_RULES_DIR
 
         if not _rules_dir.is_dir():
             logger.warning(
                 "Semgrep rules directory not found: %s",
                 _rules_dir,
-                extra={"event": "semgrep_rules_missing", "path": str(_rules_dir)},
+                extra={"event": "semgrep.rules_missing", "path": str(_rules_dir)},
             )
             _loaded = False
             return False
@@ -143,6 +147,7 @@ def initialize(rules_dir: str | Path | None = None, timeout: int | None = None) 
         # Verify semgrep CLI is available
         try:
             import subprocess
+
             semgrep_bin = _find_semgrep()
             # Finding #5: _find_semgrep now returns None when not found.
             # Guard here so we emit a clear warning instead of passing None
@@ -150,20 +155,26 @@ def initialize(rules_dir: str | Path | None = None, timeout: int | None = None) 
             if semgrep_bin is None:
                 logger.warning(
                     "semgrep CLI not found — Semgrep scanner disabled",
-                    extra={"event": "semgrep_not_found"},
+                    extra={"event": "semgrep.not_found"},
                 )
                 _loaded = False
                 return False
+            # Q11-U1 documented exception: bootstrap probe — one-shot
+            # startup verification that the semgrep binary exists and is
+            # invokable. Pre-init / first-touch class explicitly carved out
+            # by the umbrella scope brief; not operator-tunable.
             result = subprocess.run(
                 [semgrep_bin, "--version"],
-                capture_output=True, text=True, timeout=10,
+                capture_output=True,
+                text=True,
+                timeout=10,
                 env=_SEMGREP_ENV,
             )
             if result.returncode != 0:
                 logger.warning(
                     "semgrep --version failed (returncode=%d)",
                     result.returncode,
-                    extra={"event": "semgrep_version_failed"},
+                    extra={"event": "semgrep.version_failed"},
                 )
                 _loaded = False
                 return False
@@ -171,9 +182,10 @@ def initialize(rules_dir: str | Path | None = None, timeout: int | None = None) 
             version = result.stdout.strip()
             logger.info(
                 "Semgrep scanner initialized (v%s, %s)",
-                version, _rules_dir,
+                version,
+                _rules_dir,
                 extra={
-                    "event": "semgrep_loaded",
+                    "event": "semgrep.loaded",
                     "version": version,
                     "rules_dir": str(_rules_dir),
                 },
@@ -184,15 +196,19 @@ def initialize(rules_dir: str | Path | None = None, timeout: int | None = None) 
         except FileNotFoundError:
             logger.warning(
                 "semgrep CLI not found — Semgrep scanner disabled",
-                extra={"event": "semgrep_not_found"},
+                extra={"event": "semgrep.not_found"},
+                exc_info=True,
             )
             _loaded = False
             return False
-        except Exception as exc:
+        except (
+            Exception
+        ) as exc:  # catch-all: subprocess init (permissions, env, OS errors)
             logger.warning(
                 "Semgrep init failed: %s",
                 exc,
-                extra={"event": "semgrep_init_failed", "error": str(exc)},
+                extra={"event": "semgrep.init_failed", "error": str(exc)},
+                exc_info=True,
             )
             _loaded = False
             return False
@@ -213,10 +229,14 @@ async def scan_blocks(blocks: list[tuple[str, str | None]]) -> ScanResult:
         blocks: list of (code_text, language_hint) tuples where
                 language_hint is e.g. "python", "javascript", or None.
     """
+    logger.debug(
+        "Semgrep block scan started",
+        extra={"event": "semgrep_scanner.scan_blocks", "block_count": len(blocks)},
+    )
     if not _loaded:
         logger.debug(
             "Semgrep not loaded, skipping block scan",
-            extra={"event": "semgrep_skipped"},
+            extra={"event": "semgrep.skipped"},
         )
         return ScanResult(found=False, matches=[], scanner_name="semgrep")
 
@@ -233,13 +253,16 @@ async def scan_blocks(blocks: list[tuple[str, str | None]]) -> ScanResult:
             logger.error(
                 "Semgrep block scan error: %s",
                 exc,
-                extra={"event": "semgrep_block_scan_error", "error": str(exc)},
+                extra={"event": "semgrep.block_scan_error", "error": str(exc)},
+                exc_info=True,
             )
-            all_blocking.append(ScanMatch(
-                pattern_name="semgrep_block_error",
-                matched_text=f"Scan failed for code block: {exc}",
-                position=0,
-            ))
+            all_blocking.append(
+                ScanMatch(
+                    pattern_name="semgrep_block_error",
+                    matched_text=f"Scan failed for code block: {exc}",
+                    position=0,
+                )
+            )
             continue
 
     # Log warn-only findings for audit trail (not blocking)
@@ -248,7 +271,7 @@ async def scan_blocks(blocks: list[tuple[str, str | None]]) -> ScanResult:
             "Semgrep warn-only findings (not blocking): %d",
             len(all_warn_only),
             extra={
-                "event": "semgrep_warn_only",
+                "event": "semgrep.warn_only",
                 "count": len(all_warn_only),
                 "rules": [m.pattern_name for m in all_warn_only],
             },
@@ -262,7 +285,7 @@ async def scan_blocks(blocks: list[tuple[str, str | None]]) -> ScanResult:
     logger.info(
         "Semgrep block scan complete",
         extra={
-            "event": "semgrep_block_scan_complete",
+            "event": "semgrep.block_scan_complete",
             "block_count": len(blocks),
             "issues_count": len(all_blocking),
             "warn_only_count": len(all_warn_only),
@@ -280,7 +303,8 @@ async def scan(code: str, language: str | None = None) -> ScanResult:
 
 
 async def _scan_single(
-    code: str, language: str | None,
+    code: str,
+    language: str | None,
 ) -> tuple[list[ScanMatch], list[ScanMatch]]:
     """Run semgrep on a single code block, return (blocking, warn_only) matches."""
     lang = (language or "").lower().strip()
@@ -309,11 +333,13 @@ async def _scan_single(
             # than passing None to create_subprocess_exec.
             semgrep_bin = _find_semgrep()
             if semgrep_bin is None:
-                return [ScanMatch(
-                    pattern_name="semgrep_not_found",
-                    matched_text="Semgrep binary not available",
-                    position=0,
-                )], []
+                return [
+                    ScanMatch(
+                        pattern_name="semgrep_not_found",
+                        matched_text="Semgrep binary not available",
+                        position=0,
+                    )
+                ], []
 
             # Build semgrep command — one --config per rule directory
             cmd = [semgrep_bin, "--json", "--quiet", "--metrics", "off"]
@@ -329,14 +355,19 @@ async def _scan_single(
             )
             try:
                 stdout, stderr = await asyncio.wait_for(
-                    proc.communicate(), timeout=_timeout,
+                    proc.communicate(),
+                    timeout=_timeout,
                 )
             except asyncio.CancelledError:
                 # SYS-5b: Kill subprocess on task cancellation (shutdown drain)
                 try:
                     proc.kill()
                 except (ProcessLookupError, OSError):
-                    pass
+                    logger.debug(
+                        "_scan_single: ProcessLookupError | OSError suppressed",
+                        extra={"event": "semgrep_scanner._scan_single.suppressed"},
+                        exc_info=True,
+                    )
                 raise
 
             if proc.returncode not in (0, 1):
@@ -347,35 +378,44 @@ async def _scan_single(
                     proc.returncode,
                     stderr.decode("utf-8", errors="replace")[:500],
                     extra={
-                        "event": "semgrep_exit_error",
+                        "event": "semgrep.exit_error",
                         "returncode": proc.returncode,
                     },
                 )
-                return [ScanMatch(
-                    pattern_name="semgrep_scan_error",
-                    matched_text=f"Semgrep exited with error code {proc.returncode}",
-                    position=0,
-                )], []
+                return [
+                    ScanMatch(
+                        pattern_name="semgrep_scan_error",
+                        matched_text=f"Semgrep exited with error code {proc.returncode}",
+                        position=0,
+                    )
+                ], []
 
             return _parse_results(stdout.decode("utf-8", errors="replace"))
 
-        except asyncio.TimeoutError:
+        except TimeoutError:
             # B-001: Fail CLOSED — kill the subprocess and return a blocking match
             try:
                 proc.kill()
                 await proc.wait()
             except (ProcessLookupError, OSError, UnboundLocalError):
-                pass
+                logger.debug(
+                    "_scan_single: ProcessLookupError | OSError | UnboundLocalError suppressed",
+                    extra={"event": "semgrep_scanner._scan_single.suppressed"},
+                    exc_info=True,
+                )
             logger.warning(
                 "Semgrep scan timed out after %ds",
                 _timeout,
-                extra={"event": "semgrep_timeout", "timeout": _timeout},
+                extra={"event": "semgrep.timeout", "timeout": _timeout},
+                exc_info=True,
             )
-            return [ScanMatch(
-                pattern_name="semgrep_timeout",
-                matched_text=f"Semgrep scan timed out after {_timeout}s",
-                position=0,
-            )], []
+            return [
+                ScanMatch(
+                    pattern_name="semgrep_timeout",
+                    matched_text=f"Semgrep scan timed out after {_timeout}s",
+                    position=0,
+                )
+            ], []
         finally:
             # Clean up temp files.
             # Safe to use ignore_errors=True here: on CancelledError, the
@@ -383,11 +423,16 @@ async def _scan_single(
             # runs, so no race between semgrep writing and rmtree cleaning.
             if tmp_dir is not None:
                 import shutil
+
                 shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 def _get_config_dirs(language: str) -> list[str]:
     """Return list of rule directory paths to use for this language."""
+    logger.debug(
+        "_get_config_dirs called",
+        extra={"event": "semgrep_scanner.get_config_dirs", "language": language},
+    )
     dirs = []
 
     # Language-specific rules
@@ -415,6 +460,13 @@ def _get_config_dirs(language: str) -> list[str]:
 def _parse_results(raw_json: str) -> tuple[list[ScanMatch], list[ScanMatch]]:
     """Parse semgrep JSON output into (blocking, warn_only) match lists."""
     if not raw_json.strip():
+        logger.debug(
+            "_parse_results: not_strip",
+            extra={
+                "event": "semgrep_scanner._parse_results.match",
+                "reason": "not_strip",
+            },
+        )  # auto:neg
         return [], []
 
     try:
@@ -424,20 +476,25 @@ def _parse_results(raw_json: str) -> tuple[list[ScanMatch], list[ScanMatch]]:
         # Every other failure mode in this module returns a blocking match.
         logger.warning(
             "Semgrep JSON parse failed — failing closed",
-            extra={"event": "semgrep_json_parse_error", "raw_length": len(raw_json)},
+            extra={"event": "semgrep.json_parse_error", "raw_length": len(raw_json)},
+            exc_info=True,
         )
-        return [ScanMatch(
-            pattern_name="semgrep_parse_error",
-            matched_text="Semgrep returned unparseable JSON output",
-            position=0,
-        )], []
+        return [
+            ScanMatch(
+                pattern_name="semgrep_parse_error",
+                matched_text="Semgrep returned unparseable JSON output",
+                position=0,
+            )
+        ], []
 
     blocking: list[ScanMatch] = []
     warn_only: list[ScanMatch] = []
     for result in data.get("results", []):
         rule_id = result.get("check_id", "unknown")
         message = result.get("extra", {}).get("message", "security issue detected")
-        line = result.get("start", {}).get("line", 0)
+        start = result.get("start", {})
+        end = result.get("end", {})
+        line = start.get("line", 0)
 
         # Extract CWE from metadata if available
         metadata = result.get("extra", {}).get("metadata", {})
@@ -455,6 +512,13 @@ def _parse_results(raw_json: str) -> tuple[list[ScanMatch], list[ScanMatch]]:
             pattern_name=pattern_name,
             matched_text=message[:500],
             position=line,
+            # Source-span metadata for the new scanner wrapper (C fix).
+            # Old consumers ignore these fields.
+            start_col=start.get("col"),
+            end_line=end.get("line"),
+            end_col=end.get("col"),
+            semgrep_start_offset=start.get("offset"),
+            semgrep_end_offset=end.get("offset"),
         )
 
         # Strip directory prefix from rule_id (e.g. "python.insecure-crypto-prng-random")

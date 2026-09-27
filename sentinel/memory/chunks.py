@@ -13,11 +13,12 @@ import json
 import logging
 import uuid
 from dataclasses import dataclass
+from datetime import UTC
 from typing import TYPE_CHECKING, Any, cast
 
-from sentinel.core.context import get_task_id
+from sentinel.core.context import get_task_id, require_user_id
 
-logger = logging.getLogger("sentinel.audit")
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -34,9 +35,9 @@ class MemoryChunk:
 
 
 def _now_iso() -> str:
-    from datetime import datetime, timezone
+    from datetime import datetime
 
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
 
 def _dt_to_iso(dt: Any) -> str:
@@ -88,22 +89,31 @@ class MemoryStore:
         content: str,
         source: str = "",
         metadata: dict | None = None,
-        user_id: int = 1,
+        user_id: int | None = None,
         task_domain: str | None = None,
     ) -> str:
         """Insert a chunk. Returns chunk_id. tsvector auto-generated."""
+        # Q4-F9: resolve via helper — None resolves from current_user_id; raises on 0.
+        user_id = require_user_id(user_id, "MemoryStore.store")
         chunk_id = str(uuid.uuid4())
         meta_json = json.dumps(metadata or {})
 
         if self._pool is not None:
+            logger.debug("store: match", extra={"event": "chunks.store.match"})
             async with self._pool.acquire() as conn:
                 await conn.execute(
                     "INSERT INTO memory_chunks "
                     "(chunk_id, user_id, content, source, metadata, task_domain) "
                     "VALUES ($1, $2, $3, $4, $5::jsonb, $6)",
-                    chunk_id, user_id, content, source, meta_json, task_domain,
+                    chunk_id,
+                    user_id,
+                    content,
+                    source,
+                    meta_json,
+                    task_domain,
                 )
         else:
+            logger.debug("store: clean", extra={"event": "chunks.store.clean"})
             now = _now_iso()
             self._mem[chunk_id] = MemoryChunk(
                 chunk_id=chunk_id,
@@ -118,7 +128,7 @@ class MemoryStore:
         logger.info(
             "Memory chunk stored",
             extra={
-                "event": "memory_store",
+                "event": "memory.store",
                 "chunk_id": chunk_id,
                 "source": source,
                 "content_length": len(content),
@@ -137,26 +147,43 @@ class MemoryStore:
         embedding: list[float],
         source: str = "",
         metadata: dict | None = None,
-        user_id: int = 1,
+        user_id: int | None = None,
         embed_model: str = "nomic-embed-text",
         render_version: int = 1,
         task_domain: str | None = None,
     ) -> str:
         """Insert a chunk with vector embedding. Returns chunk_id."""
+        # Q4-F9: resolve via helper — None resolves from current_user_id; raises on 0.
+        user_id = require_user_id(user_id, "MemoryStore.store_with_embedding")
         chunk_id = str(uuid.uuid4())
         meta_json = json.dumps(metadata or {})
         vec_str = _embedding_to_pg(embedding)
 
         if self._pool is not None:
+            logger.debug(
+                "store_with_embedding: match",
+                extra={"event": "chunks.store_with_embedding.match"},
+            )
             async with self._pool.acquire() as conn:
                 await conn.execute(
                     "INSERT INTO memory_chunks "
                     "(chunk_id, user_id, content, source, metadata, embedding, embed_model, render_version, task_domain) "
                     "VALUES ($1, $2, $3, $4, $5::jsonb, $6::vector, $7, $8, $9)",
-                    chunk_id, user_id, content, source, meta_json, vec_str,
-                    embed_model, render_version, task_domain,
+                    chunk_id,
+                    user_id,
+                    content,
+                    source,
+                    meta_json,
+                    vec_str,
+                    embed_model,
+                    render_version,
+                    task_domain,
                 )
         else:
+            logger.debug(
+                "store_with_embedding: clean",
+                extra={"event": "chunks.store_with_embedding.clean"},
+            )
             now = _now_iso()
             self._mem[chunk_id] = MemoryChunk(
                 chunk_id=chunk_id,
@@ -171,7 +198,7 @@ class MemoryStore:
         logger.debug(
             "Memory chunk stored with embedding",
             extra={
-                "event": "memory_store_embedded",
+                "event": "memory.store_embedded",
                 "chunk_id": chunk_id,
                 "source": source,
                 "content_length": len(content),
@@ -181,8 +208,10 @@ class MemoryStore:
         )
         return chunk_id
 
-    async def count_stale_embeddings(self, user_id: int = 1) -> int:
+    async def count_stale_embeddings(self, user_id: int | None = None) -> int:
         """Count memory chunks where embed_model or render_version doesn't match current."""
+        # Q4-F9: resolve via helper — None resolves from current_user_id; raises on 0.
+        user_id = require_user_id(user_id, "MemoryStore.count_stale_embeddings")
         if self._pool is None:
             return 0
         async with self._pool.acquire() as conn:
@@ -190,7 +219,9 @@ class MemoryStore:
                 "SELECT COUNT(*) AS cnt FROM memory_chunks "
                 "WHERE user_id = $1 AND embedding IS NOT NULL "
                 "AND (embed_model != $2 OR render_version != $3)",
-                user_id, self.CURRENT_EMBED_MODEL, self.CURRENT_RENDER_VERSION,
+                user_id,
+                self.CURRENT_EMBED_MODEL,
+                self.CURRENT_RENDER_VERSION,
             )
             return row["cnt"] if row else 0
 
@@ -198,7 +229,7 @@ class MemoryStore:
         self,
         embedding_client,
         render_fn,
-        user_id: int = 1,
+        user_id: int | None = None,
         batch_size: int = 10,
     ) -> int:
         """Re-embed stale chunks. Returns count of updated chunks.
@@ -206,6 +237,8 @@ class MemoryStore:
         render_fn: callable(content) -> str that re-renders content for embedding
         embedding_client: EmbeddingBase with embed() method
         """
+        # Q4-F9: resolve via helper — None resolves from current_user_id; raises on 0.
+        user_id = require_user_id(user_id, "MemoryStore.re_embed_stale")
         if self._pool is None:
             return 0
 
@@ -215,7 +248,9 @@ class MemoryStore:
                 "WHERE user_id = $1 AND embedding IS NOT NULL "
                 "AND (embed_model != $2 OR render_version != $3) "
                 "LIMIT $4",
-                user_id, self.CURRENT_EMBED_MODEL, self.CURRENT_RENDER_VERSION,
+                user_id,
+                self.CURRENT_EMBED_MODEL,
+                self.CURRENT_RENDER_VERSION,
                 batch_size,
             )
 
@@ -223,31 +258,44 @@ class MemoryStore:
         for row in rows:
             try:
                 text = render_fn(row["content"])
-                new_embedding = await embedding_client.embed(text, prefix="search_document: ")
+                new_embedding = await embedding_client.embed(
+                    text, prefix="search_document: "
+                )
                 vec_str = _embedding_to_pg(new_embedding)
                 async with self._pool.acquire() as conn:
                     await conn.execute(
                         "UPDATE memory_chunks SET embedding = $1::vector, "
                         "embed_model = $2, render_version = $3, updated_at = NOW() "
                         "WHERE chunk_id = $4",
-                        vec_str, self.CURRENT_EMBED_MODEL, self.CURRENT_RENDER_VERSION,
+                        vec_str,
+                        self.CURRENT_EMBED_MODEL,
+                        self.CURRENT_RENDER_VERSION,
                         row["chunk_id"],
                     )
                 updated += 1
-            except Exception as exc:
+            except Exception as exc:  # catch-all: per-chunk re-embed isolation
                 logger.warning(
                     "Re-embed failed for chunk",
                     extra={
-                        "event": "re_embed_failed",
+                        "event": "chunks.re_embed_failed",
                         "chunk_id": row["chunk_id"],
                         "error": str(exc),
                     },
+                    exc_info=True,
                 )
 
         return updated
 
-    async def get(self, chunk_id: str, user_id: int = 1) -> MemoryChunk | None:
+    async def get(
+        self, chunk_id: str, user_id: int | None = None
+    ) -> MemoryChunk | None:
         """Fetch a single chunk by ID, scoped to user_id."""
+        # Q4-F9: resolve via helper — None resolves from current_user_id; raises on 0.
+        user_id = require_user_id(user_id, "MemoryStore.get")
+        logger.debug(
+            "get called",
+            extra={"event": "chunks.get", "chunk_id": chunk_id, "user_id": user_id},
+        )
         resolved_user_id = user_id
         if self._pool is not None:
             async with self._pool.acquire() as conn:
@@ -255,7 +303,8 @@ class MemoryStore:
                     "SELECT chunk_id, user_id, content, source, metadata, "
                     "created_at, updated_at FROM memory_chunks "
                     "WHERE chunk_id = $1 AND user_id = $2",
-                    chunk_id, resolved_user_id,
+                    chunk_id,
+                    resolved_user_id,
                 )
                 if row is None:
                     return None
@@ -269,34 +318,64 @@ class MemoryStore:
 
     async def list_chunks(
         self,
-        user_id: int = 1,
+        user_id: int | None = None,
         limit: int = 50,
         offset: int = 0,
         source: str | None = None,
     ) -> list[MemoryChunk]:
         """Paginated list of chunks for a user, newest first."""
+        # Q4-F9: resolve via helper — None resolves from current_user_id; raises on 0.
+        user_id = require_user_id(user_id, "MemoryStore.list_chunks")
+        logger.debug(
+            "list_chunks called",
+            extra={
+                "event": "chunks.list_chunks",
+                "user_id": user_id,
+                "limit": limit,
+                "offset": offset,
+            },
+        )
         if self._pool is not None:
+            logger.debug(
+                "list_chunks: pg query", extra={"event": "chunks.list_chunks.pg"}
+            )
             async with self._pool.acquire() as conn:
                 if source is not None:
+                    logger.debug(
+                        "list_chunks: source filter",
+                        extra={"event": "chunks.list_chunks.source_filter"},
+                    )
                     rows = await conn.fetch(
                         "SELECT chunk_id, user_id, content, source, metadata, "
                         "created_at, updated_at FROM memory_chunks "
                         "WHERE user_id = $1 AND source = $2 "
                         "ORDER BY created_at DESC LIMIT $3 OFFSET $4",
-                        user_id, source, limit, offset,
+                        user_id,
+                        source,
+                        limit,
+                        offset,
                     )
                 else:
+                    logger.debug(
+                        "list_chunks: clean",
+                        extra={"event": "chunks.list_chunks.clean"},
+                    )
                     rows = await conn.fetch(
                         "SELECT chunk_id, user_id, content, source, metadata, "
                         "created_at, updated_at FROM memory_chunks "
                         "WHERE user_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3",
-                        user_id, limit, offset,
+                        user_id,
+                        limit,
+                        offset,
                     )
                 return [_row_to_chunk(r) for r in rows]
 
         # In-memory fallback
         chunks = [c for c in self._mem.values() if c.user_id == user_id]
         if source is not None:
+            logger.debug(
+                "list_chunks: match", extra={"event": "chunks.list_chunks.match"}
+            )
             chunks = [c for c in chunks if c.source == source]
         chunks.sort(key=lambda c: c.created_at, reverse=True)
         return chunks[offset : offset + limit]
@@ -306,24 +385,47 @@ class MemoryStore:
         chunk_id: str,
         content: str,
         metadata: dict | None = None,
-        user_id: int = 1,
+        user_id: int | None = None,
     ) -> bool:
         """Update chunk content. tsvector auto-regenerates. Returns True if found."""
+        # Q4-F9: resolve via helper — None resolves from current_user_id; raises on 0.
+        user_id = require_user_id(user_id, "MemoryStore.update")
+        logger.debug(
+            "update called",
+            extra={
+                "event": "chunks.update",
+                "chunk_id": chunk_id,
+                "content_len": len(content) if hasattr(content, "__len__") else 0,
+                "metadata_len": len(metadata) if hasattr(metadata, "__len__") else 0,
+            },
+        )
         resolved_user_id = user_id
         if self._pool is not None:
+            logger.debug("update: match", extra={"event": "chunks.update.match"})
             async with self._pool.acquire() as conn:
                 if metadata is not None:
+                    logger.debug(
+                        "update: match", extra={"event": "chunks.update.match"}
+                    )
                     meta_json = json.dumps(metadata)
                     result = await conn.execute(
                         "UPDATE memory_chunks SET content = $1, metadata = $2::jsonb, "
                         "updated_at = NOW() WHERE chunk_id = $3 AND user_id = $4",
-                        content, meta_json, chunk_id, resolved_user_id,
+                        content,
+                        meta_json,
+                        chunk_id,
+                        resolved_user_id,
                     )
                 else:
+                    logger.debug(
+                        "update: clean", extra={"event": "chunks.update.clean"}
+                    )
                     result = await conn.execute(
                         "UPDATE memory_chunks SET content = $1, "
                         "updated_at = NOW() WHERE chunk_id = $2 AND user_id = $3",
-                        content, chunk_id, resolved_user_id,
+                        content,
+                        chunk_id,
+                        resolved_user_id,
                     )
                 # asyncpg returns "UPDATE N" where N is affected rows
                 return result == "UPDATE 1"
@@ -334,14 +436,17 @@ class MemoryStore:
             return False
         chunk.content = content
         if metadata is not None:
+            logger.debug("update: match", extra={"event": "chunks.update.match"})
             chunk.metadata = metadata
         return True
 
-    async def delete(self, chunk_id: str, user_id: int = 1) -> bool:
+    async def delete(self, chunk_id: str, user_id: int | None = None) -> bool:
         """Delete a chunk. No FTS/vec cleanup needed — cascades automatically.
 
         Raises ValueError for system-protected entries (source starts with 'system:').
         """
+        # Q4-F9: resolve via helper — None resolves from current_user_id; raises on 0.
+        user_id = require_user_id(user_id, "MemoryStore.delete")
         resolved_user_id = user_id
         if self._pool is not None:
             async with self._pool.acquire() as conn:
@@ -349,7 +454,8 @@ class MemoryStore:
                 row = await conn.fetchrow(
                     "SELECT source FROM memory_chunks "
                     "WHERE chunk_id = $1 AND user_id = $2",
-                    chunk_id, resolved_user_id,
+                    chunk_id,
+                    resolved_user_id,
                 )
                 if row is None:
                     return False
@@ -358,14 +464,14 @@ class MemoryStore:
                     raise ValueError("Cannot delete system-protected memory entries")
 
                 result = await conn.execute(
-                    "DELETE FROM memory_chunks "
-                    "WHERE chunk_id = $1 AND user_id = $2",
-                    chunk_id, resolved_user_id,
+                    "DELETE FROM memory_chunks WHERE chunk_id = $1 AND user_id = $2",
+                    chunk_id,
+                    resolved_user_id,
                 )
 
             logger.info(
                 "Memory chunk deleted",
-                extra={"event": "memory_delete", "chunk_id": chunk_id},
+                extra={"event": "memory.delete", "chunk_id": chunk_id},
             )
             return result == "DELETE 1"
 
@@ -379,9 +485,21 @@ class MemoryStore:
         return True
 
     async def get_latest_by_source(
-        self, source: str, user_id: int = 1,
+        self,
+        source: str,
+        user_id: int | None = None,
     ) -> MemoryChunk | None:
         """Return the most recent chunk with the given source, or None."""
+        # Q4-F9: resolve via helper — None resolves from current_user_id; raises on 0.
+        user_id = require_user_id(user_id, "MemoryStore.get_latest_by_source")
+        logger.debug(
+            "get_latest_by_source called",
+            extra={
+                "event": "chunks.get_latest_by_source",
+                "source_len": len(source) if hasattr(source, "__len__") else 0,
+                "user_id": user_id,
+            },
+        )
         resolved_user_id = user_id
         if self._pool is not None:
             async with self._pool.acquire() as conn:
@@ -390,7 +508,8 @@ class MemoryStore:
                     "created_at, updated_at FROM memory_chunks "
                     "WHERE source = $1 AND user_id = $2 "
                     "ORDER BY created_at DESC LIMIT 1",
-                    source, resolved_user_id,
+                    source,
+                    resolved_user_id,
                 )
                 if row is None:
                     return None
@@ -398,7 +517,8 @@ class MemoryStore:
 
         # In-memory fallback — filter by user_id
         matches = [
-            c for c in self._mem.values()
+            c
+            for c in self._mem.values()
             if c.source == source and c.user_id == resolved_user_id
         ]
         if not matches:
@@ -408,10 +528,9 @@ class MemoryStore:
 
     async def close(self) -> None:
         """No-op — pool lifecycle managed by app lifespan."""
-        pass
 
 
 if TYPE_CHECKING:
     from sentinel.core.store_protocols import MemoryStoreProtocol
 
-    _: MemoryStoreProtocol = cast(MemoryStoreProtocol, MemoryStore(None))
+    _: MemoryStoreProtocol = cast("MemoryStoreProtocol", MemoryStore(None))

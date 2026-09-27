@@ -10,7 +10,7 @@ use std::sync::Arc;
 use anyhow::{bail, Context, Result};
 use wasmtime::*;
 use wasmtime_wasi::WasiCtxBuilder;
-use wasmtime_wasi::p2::pipe::{MemoryInputPipe, MemoryOutputPipe};
+use wasmtime_wasi::p2::pipe::MemoryOutputPipe;
 
 use crate::capabilities::CapabilitySet;
 use crate::config::SidecarConfig;
@@ -32,6 +32,7 @@ pub struct SandboxEngine {
 
 impl SandboxEngine {
     /// Create a new sandbox engine with fuel metering and epoch interruption.
+    #[allow(dead_code)] // Standalone constructor — main.rs uses from_engine() to share Engine
     pub fn new(config: &SidecarConfig, active_children: Arc<std::sync::Mutex<HashSet<u32>>>) -> Result<Self> {
         let mut engine_config = Config::new();
         engine_config.consume_fuel(true);
@@ -59,6 +60,7 @@ impl SandboxEngine {
     }
 
     /// Get a reference to the engine (needed for epoch ticker).
+    #[allow(dead_code)] // Public API — callers may need engine ref for external epoch ticking
     pub fn engine(&self) -> &Engine {
         &self.engine
     }
@@ -171,6 +173,7 @@ impl SandboxEngine {
 /// Synchronous WASM execution — runs inside spawn_blocking.
 ///
 /// Returns (stdout_output, fuel_consumed) on success.
+#[allow(clippy::too_many_arguments)] // Internal fn — params are per-invocation isolation state
 fn execute_wasm_sync(
     engine: &Engine,
     module: &Module,
@@ -256,7 +259,7 @@ fn execute_wasm_sync(
     // rather than blocking on join() for the full timeout duration.
     let engine_clone = engine.clone();
     let epoch_interval_ms = 500u64;
-    let total_epochs = (timeout_ms + epoch_interval_ms - 1) / epoch_interval_ms;
+    let total_epochs = timeout_ms.div_ceil(epoch_interval_ms);
     let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let done_clone = done.clone();
     let ticker = std::thread::spawn(move || {
@@ -271,7 +274,7 @@ fn execute_wasm_sync(
 
     // Instantiate and run
     let instance = linker
-        .instantiate(&mut store, &module)
+        .instantiate(&mut store, module)
         .context("failed to instantiate WASM module")?;
 
     let start = instance

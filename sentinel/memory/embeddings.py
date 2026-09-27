@@ -17,7 +17,10 @@ from sentinel.worker.ollama import (
     OllamaTimeoutError,
 )
 
-logger = logging.getLogger("sentinel.audit")
+logger = logging.getLogger(__name__)
+
+# Exponential backoff base seconds per retry attempt, with ±20% jitter (BH3-052)
+_EMBED_RETRY_BACKOFF_S = 1.0
 
 
 class EmbeddingClient(EmbeddingBase):
@@ -41,7 +44,9 @@ class EmbeddingClient(EmbeddingBase):
         results = await self.embed_batch([text], prefix=prefix)
         return results[0]
 
-    async def embed_batch(self, texts: list[str], prefix: str | None = None) -> list[list[float]]:
+    async def embed_batch(
+        self, texts: list[str], prefix: str | None = None
+    ) -> list[list[float]]:
         """Embed multiple texts in a single Ollama call.
 
         The /api/embed endpoint accepts {"input": [...]} for batch embedding.
@@ -70,7 +75,6 @@ class EmbeddingClient(EmbeddingBase):
         # Retry policy: only retry transient errors (5xx, timeouts, connection
         # errors). 4xx errors are not retried. Exponential backoff with ±20%
         # jitter between attempts (BH3-052).
-        _RETRY_BACKOFF_BASE = [1.0, 2.0]
         last_error: Exception | None = None
         for attempt in range(2):  # initial + 1 retry
             try:
@@ -99,7 +103,7 @@ class EmbeddingClient(EmbeddingBase):
                 logger.info(
                     "Embeddings generated",
                     extra={
-                        "event": "embedding_complete",
+                        "event": "embedding.complete",
                         "model": self._model,
                         "count": len(texts),
                         "dims": len(embeddings[0]) if embeddings else 0,
@@ -117,13 +121,16 @@ class EmbeddingClient(EmbeddingBase):
                 logger.warning(
                     "Embedding timeout",
                     extra={
-                        "event": "embedding_timeout",
+                        "event": "embedding.timeout",
                         "attempt": attempt + 1,
                         "timeout_s": self._timeout,
                     },
+                    exc_info=True,
                 )
                 if attempt == 0:
-                    await asyncio.sleep(_RETRY_BACKOFF_BASE[0] * random.uniform(0.8, 1.2))
+                    await asyncio.sleep(
+                        _EMBED_RETRY_BACKOFF_S * random.uniform(0.8, 1.2)
+                    )
                     continue
                 raise last_error from exc
 
@@ -134,14 +141,17 @@ class EmbeddingClient(EmbeddingBase):
                 logger.warning(
                     "Embedding connection error",
                     extra={
-                        "event": "embedding_connect_error",
+                        "event": "embedding.connect_error",
                         "attempt": attempt + 1,
                         "base_url": self._base_url,
                         "error": str(exc),
                     },
+                    exc_info=True,
                 )
                 if attempt == 0:
-                    await asyncio.sleep(_RETRY_BACKOFF_BASE[0] * random.uniform(0.8, 1.2))
+                    await asyncio.sleep(
+                        _EMBED_RETRY_BACKOFF_S * random.uniform(0.8, 1.2)
+                    )
                     continue
                 raise last_error from exc
 
@@ -153,16 +163,19 @@ class EmbeddingClient(EmbeddingBase):
                 logger.warning(
                     "Embedding HTTP error",
                     extra={
-                        "event": "embedding_http_error",
+                        "event": "embedding.http_error",
                         "attempt": attempt + 1,
                         "status_code": status_code,
                     },
+                    exc_info=True,
                 )
                 # Only retry 5xx (server) errors — 4xx are client errors
                 if status_code < 500:
                     raise last_error from exc
                 if attempt == 0:
-                    await asyncio.sleep(_RETRY_BACKOFF_BASE[0] * random.uniform(0.8, 1.2))
+                    await asyncio.sleep(
+                        _EMBED_RETRY_BACKOFF_S * random.uniform(0.8, 1.2)
+                    )
                     continue
                 raise last_error from exc
 

@@ -9,7 +9,7 @@ import logging
 
 import httpx
 
-logger = logging.getLogger("sentinel.audit")
+logger = logging.getLogger(__name__)
 
 # Grok system prompt — constrains output to concise, factual summaries
 _SYSTEM_PROMPT = (
@@ -19,11 +19,12 @@ _SYSTEM_PROMPT = (
     "preamble, no filler. Be direct. Under 500 words."
 )
 
+# Moved to sentinel.core.exceptions (SH-3) — re-exported here.
+from sentinel.core.exceptions import XSearchError
 
-class XSearchError(Exception):
-    """Error during X search via Grok."""
-
-
+# ASYNCIO SAFETY: Module-level dict, only mutated in sync _load_api_key() —
+# no await between dict.get() check and dict.__setitem__, so no interleaving
+# possible under the single-threaded event loop.
 _api_key_cache: dict[str, str] = {}
 
 
@@ -33,12 +34,15 @@ def _load_api_key(key_file: str) -> str:
     if cached is not None:
         return cached
     try:
+        logger.debug(
+            "_load_api_key: file_io", extra={"event": "x_search._load_api_key.io"}
+        )
         with open(key_file) as f:
             key = f.read().strip()
-    except FileNotFoundError:
-        raise XSearchError(f"API key file not found: {key_file}")
+    except FileNotFoundError as exc:
+        raise XSearchError(f"API key file not found: {key_file}") from exc
     except OSError as exc:
-        raise XSearchError(f"Cannot read API key file: {exc}")
+        raise XSearchError(f"Cannot read API key file: {exc}") from exc
     _api_key_cache[key_file] = key
     return key
 
@@ -57,6 +61,13 @@ async def search_x(
     results), so there is no max_results parameter to pass downstream.
     Result count is governed by Grok's internal search + system prompt.
     """
+    logger.debug(
+        "search_x called",
+        extra={
+            "event": "x_search.search_x",
+            "query_len": len(query) if hasattr(query, "__len__") else 0,
+        },
+    )  # auto:entry
     api_key = _load_api_key(api_key_file)
 
     payload = {

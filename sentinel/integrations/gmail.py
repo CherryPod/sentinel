@@ -10,6 +10,7 @@ DataSource.WEB / TrustLevel.UNTRUSTED before returning to the planner.
 
 import asyncio
 import base64
+import binascii
 import html
 import logging
 import re
@@ -19,23 +20,30 @@ from urllib.parse import quote
 
 import httpx
 
-logger = logging.getLogger("sentinel.audit")
+logger = logging.getLogger(__name__)
 
 _GMAIL_BASE = "https://www.googleapis.com/gmail/v1/users/me"
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
 
+# HTTP status codes — named constants for clarity
+_HTTP_BAD_REQUEST = 400
+_HTTP_UNAUTHORIZED = 401
+_HTTP_RATE_LIMITED = 429
+_HTTP_SERVER_ERROR = 500
 
-class GmailError(Exception):
-    """Error from Gmail API operations."""
-
+# Moved to sentinel.core.exceptions (SH-3) — re-exported here.
+from sentinel.core.exceptions import GmailError
+from sentinel.crypto.blind_index import log_hash
 
 # ---------------------------------------------------------------------------
 # Data classes
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class EmailSearchResult:
     """Summary of an email from a search result."""
+
     message_id: str
     thread_id: str
     subject: str
@@ -47,6 +55,7 @@ class EmailSearchResult:
 @dataclass
 class EmailMessage:
     """Full email message with decoded body."""
+
     message_id: str
     thread_id: str
     subject: str
@@ -59,6 +68,7 @@ class EmailMessage:
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
 
 async def _gmail_request(
     method: str,
@@ -78,6 +88,7 @@ async def _gmail_request(
     """
     headers = {"Authorization": f"Bearer {token}"}
 
+    last_exc: Exception | None = None
     for attempt in range(2):
         try:
             if client is not None:
@@ -94,37 +105,48 @@ async def _gmail_request(
                         json=json_body,
                     )
         except httpx.TimeoutException as exc:
+            last_exc = exc
             if attempt < 1:
-                logger.warning("Gmail API timeout, retrying", extra={"event": "gmail_retry"})
+                logger.warning(
+                    "Gmail API timeout, retrying",
+                    extra={"event": "gmail.retry"},
+                    exc_info=True,
+                )
                 await asyncio.sleep(2)
                 continue
             raise GmailError(f"Gmail API request timed out: {exc}") from exc
         except httpx.ConnectError as exc:
+            last_exc = exc
             if attempt < 1:
-                logger.warning("Gmail API connect error, retrying", extra={"event": "gmail_retry"})
+                logger.warning(
+                    "Gmail API connect error, retrying",
+                    extra={"event": "gmail.retry"},
+                    exc_info=True,
+                )
                 await asyncio.sleep(2)
                 continue
             raise GmailError(f"Cannot connect to Gmail API: {exc}") from exc
 
-        if resp.status_code == 429:
+        if resp.status_code == _HTTP_RATE_LIMITED:
             raise GmailError("Gmail API rate limited")
-        if resp.status_code == 401:
+        if resp.status_code == _HTTP_UNAUTHORIZED:
             raise GmailError("Gmail API auth failed — token may be expired")
-        if resp.status_code >= 500:
+        if resp.status_code >= _HTTP_SERVER_ERROR:
             if attempt < 1:
                 logger.warning(
                     "Gmail API server error, retrying",
-                    extra={"event": "gmail_retry", "status": resp.status_code},
+                    extra={"event": "gmail.retry", "status": resp.status_code},
+                    exc_info=True,
                 )
                 await asyncio.sleep(2)
                 continue
             raise GmailError(f"Gmail API error {resp.status_code}")
-        if resp.status_code >= 400:
+        if resp.status_code >= _HTTP_BAD_REQUEST:
             raise GmailError(f"Gmail API client error {resp.status_code}")
 
         return resp
 
-    raise GmailError("Gmail API request failed after retry")
+    raise GmailError("Gmail API request failed after retry") from last_exc
 
 
 def _parse_headers(headers_list: list[dict]) -> dict[str, str]:
@@ -139,15 +161,37 @@ def _parse_headers(headers_list: list[dict]) -> dict[str, str]:
 
 def _decode_body(payload: dict) -> str:
     """Recursive multipart traversal — prefers text/plain, falls back to text/html."""
+    logger.debug(
+        "_decode_body called",
+        extra={
+            "event": "gmail._decode_body",
+            "payload_len": len(payload) if hasattr(payload, "__len__") else 0,
+        },
+    )  # auto:entry
     mime_type = payload.get("mimeType", "")
 
     # Direct body (non-multipart)
     body = payload.get("body", {})
     if body.get("data"):
+        logger.debug(
+            "_decode_body: get_data",
+            extra={"event": "gmail._decode_body.match", "reason": "get_data"},
+        )  # auto:neg
         decoded = _base64url_decode(body["data"])
         if "html" in mime_type:
+            logger.debug(
+                "_decode_body: html_in_mime_type",
+                extra={
+                    "event": "gmail._decode_body.match",
+                    "reason": "html_in_mime_type",
+                },
+            )  # auto:neg
             return _sanitize_body(decoded)
         return decoded
+    logger.debug(
+        "_decode_body: get_data_passed",
+        extra={"event": "gmail._decode_body.passed", "reason": "get_data_passed"},
+    )  # auto:neg
 
     # Multipart — recurse through parts
     parts = payload.get("parts", [])
@@ -167,13 +211,24 @@ def _decode_body(payload: dict) -> str:
         elif part_mime.startswith("multipart/"):
             # Nested multipart — recurse
             nested = _decode_body(part)
-            if nested:
-                if not plain_text:
-                    plain_text = nested
+            if nested and not plain_text:
+                plain_text = nested
 
     if plain_text:
+        logger.debug(
+            "_decode_body: plain_text",
+            extra={"event": "gmail._decode_body.match", "reason": "plain_text"},
+        )  # auto:neg
         return plain_text
+    logger.debug(
+        "_decode_body: plain_text_passed",
+        extra={"event": "gmail._decode_body.passed", "reason": "plain_text_passed"},
+    )  # auto:neg
     if html_text:
+        logger.debug(
+            "_decode_body: html_text",
+            extra={"event": "gmail._decode_body.match", "reason": "html_text"},
+        )  # auto:neg
         return _sanitize_body(html_text)
     return ""
 
@@ -184,12 +239,21 @@ def _base64url_decode(data: str) -> str:
     padded = data + "=" * (4 - len(data) % 4) if len(data) % 4 else data
     try:
         return base64.urlsafe_b64decode(padded).decode("utf-8", errors="replace")
-    except Exception:
+    except (ValueError, binascii.Error):
+        logger.warning(
+            "base64url decode failed (malformed email body data)",
+            extra={"event": "gmail._base64url_decode_error"},
+            exc_info=True,
+        )
         return ""
 
 
 def _sanitize_body(html_text: str) -> str:
     """Strip HTML tags, decode entities — for HTML-only emails."""
+    logger.debug(
+        "_sanitize_body called",
+        extra={"event": "gmail._sanitize_body", "html_len": len(html_text)},
+    )
     text = _HTML_TAG_RE.sub("", html_text)
     text = html.unescape(text)
     # Collapse excessive whitespace
@@ -208,6 +272,7 @@ def _truncate_body(body: str, max_length: int) -> str:
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+
 
 async def search_emails(
     token: str,
@@ -239,13 +304,24 @@ async def search_emails(
 
         # Step 2: Fetch metadata for each message in parallel to avoid N+1
         async def _fetch_one(msg_ref: dict) -> EmailSearchResult:
+            logger.debug(
+                "_fetch_one called",
+                extra={
+                    "event": "gmail._fetch_one",
+                    "msg_ref_len": len(msg_ref) if hasattr(msg_ref, "__len__") else 0,
+                },
+            )  # auto:entry
             msg_id = msg_ref["id"]
             detail_url = (
                 f"{_GMAIL_BASE}/messages/{msg_id}"
                 "?format=metadata&metadataHeaders=Subject&metadataHeaders=From&metadataHeaders=Date"
             )
             detail_resp = await _gmail_request(
-                "get", detail_url, token, timeout, client=shared_client,
+                "get",
+                detail_url,
+                token,
+                timeout,
+                client=shared_client,
             )
             detail = detail_resp.json()
             headers = _parse_headers(detail.get("payload", {}).get("headers", []))
@@ -269,6 +345,15 @@ async def read_email(
     timeout: int = 15,
 ) -> EmailMessage:
     """Read a full email message by ID, decoding the body."""
+    logger.debug(
+        "read_email called",
+        extra={
+            "event": "gmail.read_email",
+            "message_id_hash": log_hash(message_id),
+            "message_id_len": len(message_id),
+            "max_body_length": max_body_length,
+        },
+    )
     url = f"{_GMAIL_BASE}/messages/{message_id}?format=full"
     resp = await _gmail_request("get", url, token, timeout)
     data = resp.json()
@@ -299,6 +384,14 @@ async def send_email(
 ) -> str:
     """Send an email (or reply if thread_id is set). Returns message_id."""
     # Build RFC 2822 MIME message
+    logger.debug(
+        "send_email called",
+        extra={
+            "event": "gmail.send_email",
+            "to_masked": to[:2] + "***" if to else "",
+            "subject_len": len(subject),
+        },
+    )
     msg = MIMEText(body, "plain", "utf-8")
     msg["To"] = to
     msg["Subject"] = subject
@@ -324,6 +417,14 @@ async def create_draft(
     timeout: int = 15,
 ) -> str:
     """Create a draft email. Returns draft_id."""
+    logger.debug(
+        "create_draft called",
+        extra={
+            "event": "gmail.create_draft",
+            "to_masked": to[:2] + "***" if to else "",
+            "subject_len": len(subject),
+        },
+    )
     msg = MIMEText(body, "plain", "utf-8")
     msg["To"] = to
     msg["Subject"] = subject
@@ -332,7 +433,10 @@ async def create_draft(
 
     url = f"{_GMAIL_BASE}/drafts"
     resp = await _gmail_request(
-        "post", url, token, timeout,
+        "post",
+        url,
+        token,
+        timeout,
         json_body={"message": {"raw": raw}},
     )
     data = resp.json()
@@ -342,6 +446,7 @@ async def create_draft(
 # ---------------------------------------------------------------------------
 # Formatters — produce LLM-friendly text
 # ---------------------------------------------------------------------------
+
 
 def format_search_results(results: list[EmailSearchResult]) -> str:
     """Format search results as numbered text for LLM consumption."""

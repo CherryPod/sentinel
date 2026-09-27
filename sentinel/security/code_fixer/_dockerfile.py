@@ -9,6 +9,7 @@ Fixes common LLM mistakes in Dockerfiles and Containerfiles:
 - :latest tag usage (warning)
 - apt-get install without prior update (warning)
 """
+
 import logging
 import re
 
@@ -26,7 +27,7 @@ def fix_dockerfile(content: str) -> FixResult:
     logger.debug(
         "Dockerfile fixer starting",
         extra={
-            "event": "dockerfile_fixer_start",
+            "event": "dockerfile.fixer_start",
             "file": fname,
             "content_length": len(content),
         },
@@ -57,6 +58,10 @@ def fix_dockerfile(content: str) -> FixResult:
     ]
     if code_lines and not code_lines[0].upper().startswith("FROM"):
         result.errors_found.append("First instruction is not FROM")
+        logger.warning(
+            "Dockerfile missing FROM as first instruction",
+            extra={"event": "dockerfile.missing_from", "file": fname},
+        )
 
     lines = content.split("\n")
     new_lines = []
@@ -74,6 +79,10 @@ def fix_dockerfile(content: str) -> FixResult:
             result.warnings.append(
                 f"Line {i + 1}: apt-get install without prior apt-get update"
             )
+            logger.debug(
+                "apt-get install without prior update",
+                extra={"event": "dockerfile.apt_no_update", "file": fname},
+            )
         if "apt-get update" in stripped:
             has_apt_update = True
 
@@ -84,7 +93,13 @@ def fix_dockerfile(content: str) -> FixResult:
             args = stripped[4:].strip()
             src = args.split()[0] if args.split() else args
             archive_exts = (
-                ".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tar.xz", ".zip", ".gz",
+                ".tar",
+                ".tar.gz",
+                ".tgz",
+                ".tar.bz2",
+                ".tar.xz",
+                ".zip",
+                ".gz",
             )
             if not src.startswith("http") and not any(
                 src.endswith(ext) for ext in archive_exts
@@ -102,7 +117,7 @@ def fix_dockerfile(content: str) -> FixResult:
         # Shell operators in exec form — if && || | appear anywhere in
         # the bracket content, warn. In exec form these are string args,
         # not shell operators, so the container will pass them literally.
-        exec_match = re.match(r'^(CMD|ENTRYPOINT|RUN)\s+\[(.+)\]', stripped)
+        exec_match = re.match(r"^(CMD|ENTRYPOINT|RUN)\s+\[(.+)\]", stripped)
         if exec_match:
             args_str = exec_match.group(2)
             if "&&" in args_str or "||" in args_str or "|" in args_str:
@@ -114,6 +129,10 @@ def fix_dockerfile(content: str) -> FixResult:
         # Detect :latest tag
         if re.match(r"^\s*FROM\s+\S+:latest", line):
             result.warnings.append(f"Using :latest tag: {stripped}")
+            logger.debug(
+                "Dockerfile uses :latest tag",
+                extra={"event": "dockerfile.latest_tag", "file": fname},
+            )
 
         new_lines.append(line)
 
@@ -122,6 +141,10 @@ def fix_dockerfile(content: str) -> FixResult:
     # Missing USER instruction
     if not has_user and code_lines:
         result.warnings.append("No USER instruction — container runs as root")
+        logger.debug(
+            "Dockerfile has no USER instruction",
+            extra={"event": "dockerfile.no_user", "file": fname},
+        )
 
     result.content = content
     result.changed = content != original
@@ -130,9 +153,9 @@ def fix_dockerfile(content: str) -> FixResult:
         logger.debug(
             "Dockerfile fixer applied changes",
             extra={
-                "event": "dockerfile_fixer_done",
+                "event": "dockerfile.fixer_done",
                 "file": fname,
-                "fixes": result.fixes_applied,
+                "fix_description": ", ".join(result.fixes_applied),
             },
         )
 

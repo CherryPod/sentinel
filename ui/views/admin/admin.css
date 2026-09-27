@@ -1,0 +1,190 @@
+/* ── Admin View ──────────────────────────────────────────────
+   System administration dashboard. Role-gated, lazy-loaded.
+   Naming: flat hyphenated (admin-*), consistent with project convention.
+   ──────────────────────────────────────────────────────────── */
+
+.admin-content {
+    max-width: 900px;
+}
+
+/* ── Status bar ──────────────────────────────────────────── */
+
+.admin-status-bar {
+    display: flex;
+    gap: var(--space-3);
+    flex-wrap: wrap;
+    margin-bottom: var(--space-6);
+    padding: var(--space-3) var(--space-4);
+    background: var(--bg-card);
+    border: 1px solid var(--border-card);
+    border-radius: var(--radius-lg);
+    box-shadow: var(--shadow-sm);
+}
+
+.admin-status-item {
+    font-size: var(--text-sm);
+    font-weight: 600;
+    color: var(--text-secondary);
+    padding: var(--space-1) var(--space-3);
+    border-radius: var(--radius-pill);
+    background: var(--bg-secondary);
+}
+
+.admin-status-item.admin-ok {
+    color: var(--green-text);
+    background: var(--green-bg);
+}
+
+.admin-status-item.admin-warn {
+    color: var(--red);
+    background: var(--red-bg);
+}
+
+/* ── Card grid ───────────────────────────────────────────── */
+
+.admin-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(22rem, 1fr));
+    gap: var(--space-4);
+}
+
+.admin-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border-card);
+    border-radius: var(--radius-2xl);
+    padding: var(--space-4) var(--space-4);
+    box-shadow: var(--shadow-sm);
+    transition: box-shadow var(--duration-fast);
+}
+
+.admin-card:hover {
+    box-shadow: var(--shadow-md);
+}
+
+.admin-card-title {
+    font-size: var(--text-md);
+    font-weight: 600;
+    color: var(--text-primary);
+    margin-bottom: var(--space-3);
+    padding-bottom: var(--space-2);
+    border-bottom: 1px solid var(--border-subtle);
+}
+
+.admin-card-body {
+    font-size: var(--text-sm);
+}
+
+/* ── List items (key-value rows) ─────────────────────────── */
+
+.admin-list {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+}
+
+.admin-list-item {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: var(--space-1) 0;
+}
+
+.admin-list-label {
+    color: var(--text-secondary);
+    font-size: var(--text-sm);
+}
+
+.admin-list-value {
+    font-weight: 600;
+    font-size: var(--text-sm);
+    color: var(--text-primary);
+}
+
+.admin-list-value.admin-ok {
+    color: var(--green);
+}
+
+.admin-list-value.admin-off {
+    color: var(--text-muted);
+}
+
+.admin-list-value.admin-warn {
+    color: var(--red);
+}
+
+/* ── User list ───────────────────────────────────────────── */
+
+.admin-user-list {
+    margin-top: var(--space-3);
+    border-top: 1px solid var(--border-subtle);
+    padding-top: var(--space-2);
+}
+
+.admin-user-row {
+    display: grid;
+    grid-template-columns: 1fr auto auto auto;
+    gap: var(--space-3);
+    align-items: center;
+    padding: var(--space-2) 0;
+    border-bottom: 1px solid var(--border-subtle);
+    font-size: var(--text-sm);
+}
+
+.admin-user-row:last-child {
+    border-bottom: none;
+}
+
+.admin-user-name {
+    font-weight: 500;
+    color: var(--text-primary);
+}
+
+.admin-user-role {
+    color: var(--text-muted);
+    text-transform: capitalize;
+}
+
+.admin-user-trust {
+    font-weight: 600;
+    color: var(--accent);
+}
+
+.admin-user-status {
+    font-weight: 500;
+    font-size: var(--text-xs);
+    padding: var(--space-1) var(--space-2);
+    border-radius: var(--radius-pill);
+}
+
+.admin-user-status.admin-ok {
+    color: var(--green-text);
+    background: var(--green-bg);
+}
+
+.admin-user-status.admin-off {
+    color: var(--text-muted);
+    background: var(--bg-secondary);
+}
+
+/* ── Responsive ──────────────────────────────────────────── */
+
+@media (width <= 768px) {
+    .admin-grid {
+        grid-template-columns: 1fr;
+    }
+
+    .admin-status-bar {
+        flex-direction: column;
+        gap: var(--space-2);
+    }
+
+    .admin-user-row {
+        grid-template-columns: 1fr auto;
+        gap: var(--space-2);
+    }
+
+    .admin-user-role,
+    .admin-user-trust {
+        display: none;
+    }
+}

@@ -10,6 +10,7 @@ Finding fixes applied:
   #41: extracted Pass 4 to _js_insert_missing_semicolons helper
   #54: split() result assigned once instead of called twice
 """
+
 import logging
 import re
 
@@ -33,37 +34,37 @@ logger = logging.getLogger(__name__)
 _JS_SEMI_ENDINGS = re.compile(
     r"(?:"
     r"[a-zA-Z_$0-9]"  # identifier char
-    r"|['\"`]"         # string ending
-    r"|\)"             # closing paren
-    r"|\]"             # closing bracket
+    r"|['\"`]"  # string ending
+    r"|\)"  # closing paren
+    r"|\]"  # closing bracket
     r"|true|false|null|undefined"
-    r"|\+\+|--"        # postfix operators
+    r"|\+\+|--"  # postfix operators
     r")$"
 )
 
 # Lines ending with these should NOT get a semicolon
 _JS_NO_SEMI = re.compile(
     r"(?:"
-    r"[{},;]"          # block/comma/already has semi
-    r"|//"             # comment
-    r"|\*/"            # block comment end
-    r"|=>$"            # arrow function
+    r"[{},;]"  # block/comma/already has semi
+    r"|//"  # comment
+    r"|\*/"  # block comment end
+    r"|=>$"  # arrow function
     r")$"
 )
 
 # Object property line: key (with optional quotes) followed by colon and value
 _JS_OBJ_PROP = re.compile(
-    r'^(\s*)'                           # leading whitespace (group 1)
-    r'(?:["\'][^"\']+["\']'            # quoted key (any chars inside quotes)
-    r'|[\w$]+)'                         # or bare identifier key
-    r'\s*:\s*'                          # colon separator
-    r'.+?'                              # value (non-greedy)
-    r';'                                # trailing semicolon (the error)
-    r'\s*$'                             # optional trailing whitespace
+    r"^(\s*)"  # leading whitespace (group 1)
+    r'(?:["\'][^"\']+["\']'  # quoted key (any chars inside quotes)
+    r"|[\w$]+)"  # or bare identifier key
+    r"\s*:\s*"  # colon separator
+    r".+?"  # value (non-greedy)
+    r";"  # trailing semicolon (the error)
+    r"\s*$"  # optional trailing whitespace
 )
 
 # Python-style comment: line starting with # (not #! shebang)
-_JS_PYTHON_COMMENT = re.compile(r'^(\s*)#(?!!)\s*(.*)')
+_JS_PYTHON_COMMENT = re.compile(r"^(\s*)#(?!!)\s*(.*)")
 
 
 # ---------------------------------------------------------------------------
@@ -79,29 +80,35 @@ def _js_fix_python_comments(content: str, fixes: list[str]) -> str:
     Finding #16: uses _iter_code_chars for template literal tracking
     instead of manual backtick counting.
     """
+    logger.debug(
+        "Checking for Python-style comments in JS",
+        extra={
+            "event": "javascript.python_comment_check",
+            "file": _current_filename.get(),
+            "content_length": len(content),
+        },
+    )
+
     lines = content.split("\n")
     fixed_count = 0
 
-    # Finding #16: build a set of line numbers that are inside template
-    # literals, using _iter_code_chars for accurate tracking
-    template_lines: set[int] = set()
+    # Finding #16: check context of each '#' char to avoid converting
+    # hash characters inside template literals (STRING context) into
+    # JS comments.  Uses _iter_code_chars for accurate nesting tracking.
+    string_hash_lines: set[int] = set()
+    first_hash_seen: set[int] = set()
     current_line = 0
-    in_template_body = False
     for _idx, ch, ctx in _iter_code_chars(content, "javascript"):
         if ch == "\n":
             current_line += 1
             continue
-        # A line is "in template" if it has STRING context chars from a
-        # template literal.  We detect this by tracking whether we're in
-        # a multi-line string context (backtick strings span lines)
-        if ctx == CharContext.STRING and in_template_body:
-            template_lines.add(current_line)
-        # Heuristic: backtick at STRING boundary toggles template body
-        if ch == "`" and ctx == CharContext.STRING:
-            in_template_body = not in_template_body
+        if ch == "#" and current_line not in first_hash_seen:
+            first_hash_seen.add(current_line)
+            if ctx == CharContext.STRING:
+                string_hash_lines.add(current_line)
 
     for i, line in enumerate(lines):
-        if i in template_lines:
+        if i in string_hash_lines:
             continue
 
         m = _JS_PYTHON_COMMENT.match(line)
@@ -113,14 +120,12 @@ def _js_fix_python_comments(content: str, fixes: list[str]) -> str:
 
     if fixed_count:
         content = "\n".join(lines)
-        fixes.append(
-            f"Converted {fixed_count} Python-style comment(s) to JS-style"
-        )
+        fixes.append(f"Converted {fixed_count} Python-style comment(s) to JS-style")
         logger.debug(
             "Converted %d Python-style comments",
             fixed_count,
             extra={
-                "event": "js_python_comments_fixed",
+                "event": "javascript.python_comments_fixed",
                 "file": _current_filename.get(),
                 "count": fixed_count,
             },
@@ -212,14 +217,13 @@ def _js_fix_object_semicolons(content: str, fixes: list[str]) -> str:
     if fixed_count:
         content = "\n".join(lines)
         fixes.append(
-            f"Replaced {fixed_count} semicolon(s) with commas in object "
-            f"literal(s)"
+            f"Replaced {fixed_count} semicolon(s) with commas in object literal(s)"
         )
         logger.debug(
             "Fixed %d object literal semicolons",
             fixed_count,
             extra={
-                "event": "js_object_semicolons_fixed",
+                "event": "javascript.object_semicolons_fixed",
                 "file": _current_filename.get(),
                 "count": fixed_count,
             },
@@ -234,7 +238,7 @@ def _js_fix_object_semicolons(content: str, fixes: list[str]) -> str:
 def _js_fix_double_semicolons(content: str, fixes: list[str]) -> str:
     """Replace `;;` with `;` — always unintentional in LLM output."""
     # Avoid touching `for (;;)` loops — only fix ;; at end of statements
-    pattern = re.compile(r'(?<!\()(;;)(?!\s*\))')
+    pattern = re.compile(r"(?<!\()(;;)(?!\s*\))")
     new_content = pattern.sub(";", content)
     if new_content != content:
         count = content.count(";;") - new_content.count(";;")
@@ -243,7 +247,7 @@ def _js_fix_double_semicolons(content: str, fixes: list[str]) -> str:
             "Removed %d double semicolons",
             count,
             extra={
-                "event": "js_double_semicolons_fixed",
+                "event": "javascript.double_semicolons_fixed",
                 "file": _current_filename.get(),
                 "count": count,
             },
@@ -267,18 +271,26 @@ def _js_insert_missing_semicolons(content: str, fixes: list[str]) -> str:
     semi_count = 0
 
     # Finding #16: identify lines inside template literals using the
-    # context-aware parser instead of manual backtick counting
+    # context-aware parser.  Track template depth via context transitions
+    # on backtick chars — a CODE→STRING transition is an opening backtick,
+    # a STRING→STRING transition on backtick is a closing backtick.
     template_lines: set[int] = set()
     current_line = 0
-    in_template_body = False
+    template_depth = 0
+    prev_ctx = CharContext.CODE
     for _idx, ch, ctx in _iter_code_chars(content, "javascript"):
         if ch == "\n":
             current_line += 1
+            prev_ctx = ctx
             continue
-        if ctx == CharContext.STRING and in_template_body:
+        if template_depth > 0 and ctx == CharContext.STRING:
             template_lines.add(current_line)
         if ch == "`" and ctx == CharContext.STRING:
-            in_template_body = not in_template_body
+            if prev_ctx != CharContext.STRING:
+                template_depth += 1
+            else:
+                template_depth = max(0, template_depth - 1)
+        prev_ctx = ctx
 
     for i, line in enumerate(lines):
         stripped = line.strip()
@@ -310,9 +322,22 @@ def _js_insert_missing_semicolons(content: str, fixes: list[str]) -> str:
         parts = stripped.split()
         first_word = parts[0] if parts else ""
         if first_word in (
-            "if", "else", "for", "while", "do", "switch", "case",
-            "default:", "try", "catch", "finally", "class", "function",
-            "export", "import", "from",
+            "if",
+            "else",
+            "for",
+            "while",
+            "do",
+            "switch",
+            "case",
+            "default:",
+            "try",
+            "catch",
+            "finally",
+            "class",
+            "function",
+            "export",
+            "import",
+            "from",
         ):
             continue
 
@@ -328,7 +353,7 @@ def _js_insert_missing_semicolons(content: str, fixes: list[str]) -> str:
             "Added %d missing JS semicolons",
             semi_count,
             extra={
-                "event": "js_semicolons_added",
+                "event": "javascript.semicolons_added",
                 "file": _current_filename.get(),
                 "count": semi_count,
             },
@@ -404,7 +429,7 @@ def _js_fix_unclosed_strings(content: str, fixes: list[str]) -> str:
             "Closed %d unclosed JS string literals",
             fixed_count,
             extra={
-                "event": "js_unclosed_strings_fixed",
+                "event": "javascript.unclosed_strings_fixed",
                 "file": _current_filename.get(),
                 "count": fixed_count,
             },
@@ -425,7 +450,7 @@ def _js_fix_innerhtml(content: str, fixes: list[str]) -> str:
     """
     # Match: something.innerHTML = <value without HTML tags>
     pattern = re.compile(
-        r'(\.innerHTML)(\s*=\s*)([^;]+;?)',
+        r"(\.innerHTML)(\s*=\s*)([^;]+;?)",
         re.MULTILINE,
     )
 
@@ -443,14 +468,12 @@ def _js_fix_innerhtml(content: str, fixes: list[str]) -> str:
     new_content = pattern.sub(replace_if_safe, content)
 
     if fixed_count:
-        fixes.append(
-            f"Replaced {fixed_count} innerHTML assignment(s) with textContent"
-        )
+        fixes.append(f"Replaced {fixed_count} innerHTML assignment(s) with textContent")
         logger.debug(
             "Replaced %d innerHTML assignments",
             fixed_count,
             extra={
-                "event": "js_innerhtml_fixed",
+                "event": "javascript.innerhtml_fixed",
                 "file": _current_filename.get(),
                 "count": fixed_count,
             },
@@ -479,7 +502,7 @@ def fix_javascript(content: str) -> FixResult:
     logger.debug(
         "JavaScript fixer starting",
         extra={
-            "event": "js_fixer_start",
+            "event": "javascript.fixer_start",
             "file": _current_filename.get(),
             "content_length": len(content),
         },

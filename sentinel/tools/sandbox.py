@@ -16,7 +16,25 @@ from dataclasses import dataclass
 
 import httpx
 
-logger = logging.getLogger("sentinel.audit")
+from sentinel.crypto.blind_index import log_hash
+
+# OCI default capabilities granted to unprivileged containers (bare names,
+# no CAP_ prefix).  Used by _verify_hardening to confirm CapDrop=["ALL"].
+_DEFAULT_CAPS_BARE = frozenset(
+    {
+        "CHOWN",
+        "DAC_OVERRIDE",
+        "FOWNER",
+        "FSETID",
+        "KILL",
+        "NET_BIND_SERVICE",
+        "SETFCAP",
+        "SETPCAP",
+        "SYS_CHROOT",
+    }
+)
+
+logger = logging.getLogger(__name__)
 
 
 def _demux_stream(raw: bytes) -> str:
@@ -31,6 +49,13 @@ def _demux_stream(raw: bytes) -> str:
     If the data doesn't look like multiplexed output (no valid header),
     return it as-is (plain text fallback).
     """
+    logger.debug(
+        "_demux_stream called",
+        extra={
+            "event": "sandbox._demux_stream",
+            "raw_len": len(raw) if hasattr(raw, "__len__") else 0,
+        },
+    )  # auto:entry
     if len(raw) < 8:
         return raw.decode("utf-8", errors="replace")
 
@@ -63,6 +88,7 @@ def _demux_stream(raw: bytes) -> str:
 @dataclass
 class SandboxResult:
     """Result from a sandboxed shell command execution."""
+
     stdout: str
     stderr: str
     exit_code: int
@@ -94,6 +120,10 @@ class PodmanSandbox:
         cpu_quota: int,
         workspace_volume: str,
         output_limit: int,
+        # Q11-U1 documented exception: constructor default is a test-only
+        # fallback. Production callers pass settings.sandbox_api_timeout via
+        # sentinel/api/init/orchestrator.py (constructor kwarg). Direct
+        # instantiation in tests can override at the call site.
         api_timeout: int = 30,
     ):
         self._socket_path = socket_path
@@ -125,6 +155,12 @@ class PodmanSandbox:
     def _create_client(self) -> httpx.AsyncClient:
         """Create a fresh httpx client for the Podman socket."""
         transport = httpx.AsyncHTTPTransport(uds=self._socket_path)
+        # Q11-U1 documented exception: +10s buffer is an envelope margin
+        # over the settings-backed inner deadline (self._max_timeout from
+        # settings.sandbox_max_timeout). Making the buffer separately
+        # configurable risks invalid combinations (outer < inner) and
+        # invites operators to tune the wrong knob; the inner-vs-outer
+        # contract is a robustness invariant, not a workload knob.
         return httpx.AsyncClient(
             transport=transport,
             base_url="http://podman",  # hostname is ignored for UDS
@@ -140,8 +176,12 @@ class PodmanSandbox:
         if self._client is not None:
             try:
                 await self._client.aclose()
-            except Exception:
-                pass
+            except Exception:  # catch-all: HTTP client close best-effort
+                logger.debug(
+                    "reset_client aclose failed",
+                    extra={"event": "sandbox.reset_client_error"},
+                    exc_info=True,
+                )
             self._client = None
 
     async def close(self) -> None:
@@ -185,7 +225,9 @@ class PodmanSandbox:
 
         security_opt = hc.get("SecurityOpt") or []
         if "no-new-privileges" not in security_opt:
-            failures.append(f"SecurityOpt={security_opt!r}, missing 'no-new-privileges'")
+            failures.append(
+                f"SecurityOpt={security_opt!r}, missing 'no-new-privileges'"
+            )
 
         if not hc.get("Memory") or hc["Memory"] <= 0:
             failures.append(f"Memory={hc.get('Memory')!r}, expected > 0")
@@ -193,9 +235,7 @@ class PodmanSandbox:
         # Finding #4: Parse bind strings ("host:container[:options]") and validate
         # the container target is exactly /workspace, not just a substring match.
         binds = hc.get("Binds") or []
-        has_workspace = any(
-            b.split(":")[1] == "/workspace" for b in binds if ":" in b
-        )
+        has_workspace = any(b.split(":")[1] == "/workspace" for b in binds if ":" in b)
         if not has_workspace:
             failures.append(f"Binds={binds!r}, missing /workspace mount")
 
@@ -216,17 +256,12 @@ class PodmanSandbox:
         # These 9 caps are the OCI default set granted to unprivileged
         # containers. If Podman adds more defaults in future, this set may
         # need updating — but a superset in the drop list is fine (issubset).
-        _DEFAULT_CAPS_BARE = {
-            "CHOWN", "DAC_OVERRIDE", "FOWNER", "FSETID",
-            "KILL", "NET_BIND_SERVICE", "SETFCAP", "SETPCAP",
-            "SYS_CHROOT",
-        }
         cap_drop = hc.get("CapDrop") or []
         # Strip "CAP_" prefix if present, uppercase for comparison
-        cap_drop_normalised = {
-            c.upper().removeprefix("CAP_") for c in cap_drop
-        }
-        if "ALL" not in cap_drop_normalised and not _DEFAULT_CAPS_BARE.issubset(cap_drop_normalised):
+        cap_drop_normalised = {c.upper().removeprefix("CAP_") for c in cap_drop}
+        if "ALL" not in cap_drop_normalised and not _DEFAULT_CAPS_BARE.issubset(
+            cap_drop_normalised
+        ):
             failures.append(
                 f"CapDrop={cap_drop!r} — expected 'ALL' or all default caps dropped"
             )
@@ -239,27 +274,35 @@ class PodmanSandbox:
                     params={"force": "true"},
                     timeout=self._api_timeout,
                 )
-            except Exception as del_exc:
+            except Exception as del_exc:  # catch-all: container cleanup best-effort
                 logger.warning(
                     "Failed to delete unhardened container: %s",
                     del_exc,
                     extra={
-                        "event": "hardening_delete_failed",
+                        "event": "sandbox.hardening_delete_failed",
                         "container_id": container_id[:12],
                         "error": str(del_exc),
                     },
+                    exc_info=True,
                 )
             detail = "; ".join(failures)
             # Finding #6: Log the HostConfig subset for post-incident investigation
             logger.debug(
                 "Hardening failure — HostConfig details",
                 extra={
-                    "event": "sandbox_hardening_failed_detail",
+                    "event": "sandbox.hardening_failed_detail",
                     "container_id": container_id[:12],
                     "host_config": {
-                        k: hc.get(k) for k in (
-                            "NetworkMode", "ReadonlyRootfs", "SecurityOpt",
-                            "Memory", "Binds", "CapDrop", "CapAdd", "Tmpfs",
+                        k: hc.get(k)
+                        for k in (
+                            "NetworkMode",
+                            "ReadonlyRootfs",
+                            "SecurityOpt",
+                            "Memory",
+                            "Binds",
+                            "CapDrop",
+                            "CapAdd",
+                            "Tmpfs",
                         )
                     },
                 },
@@ -267,19 +310,17 @@ class PodmanSandbox:
             logger.error(
                 "Sandbox hardening verification FAILED — refusing to start",
                 extra={
-                    "event": "sandbox_hardening_failed",
+                    "event": "sandbox.hardening_failed",
                     "container_id": container_id[:12],
                     "failures": failures,
                 },
             )
-            raise ToolError(
-                f"sandbox container failed hardening check: {detail}"
-            )
+            raise ToolError(f"sandbox container failed hardening check: {detail}")
 
         logger.info(
             "Sandbox hardening verified",
             extra={
-                "event": "sandbox_hardening_ok",
+                "event": "sandbox.hardening_verified",
                 "container_id": container_id[:12],
             },
         )
@@ -293,7 +334,10 @@ class PodmanSandbox:
             if resp.status_code != 200:
                 logger.warning(
                     "Podman API health check failed",
-                    extra={"event": "sandbox_health_failed", "status": resp.status_code},
+                    extra={
+                        "event": "sandbox.health_failed",
+                        "status": resp.status_code,
+                    },
                 )
                 return False
 
@@ -306,7 +350,10 @@ class PodmanSandbox:
             if resp.status_code != 200:
                 logger.warning(
                     "Podman image list failed",
-                    extra={"event": "sandbox_image_check_failed", "status": resp.status_code},
+                    extra={
+                        "event": "sandbox.image_check_failed",
+                        "status": resp.status_code,
+                    },
                 )
                 return False
 
@@ -314,13 +361,13 @@ class PodmanSandbox:
             if not images:
                 logger.warning(
                     "Sandbox image not found",
-                    extra={"event": "sandbox_image_missing", "image": self._image},
+                    extra={"event": "sandbox.image_missing", "image": self._image},
                 )
                 return False
 
             logger.info(
                 "Sandbox health check passed",
-                extra={"event": "sandbox_health_ok", "image": self._image},
+                extra={"event": "sandbox.health_ok", "image": self._image},
             )
             return True
 
@@ -328,23 +375,33 @@ class PodmanSandbox:
             logger.warning(
                 "Sandbox health check failed: %s",
                 exc,
-                extra={"event": "sandbox_health_error", "error": str(exc)},
+                extra={"event": "sandbox.health_error", "error": str(exc)},
+                exc_info=True,
             )
             return False
 
     async def cleanup_stale(self) -> int:
         """Remove any leftover sentinel-sandbox-* containers from previous runs."""
+        logger.debug(
+            "sandbox cleanup_stale called", extra={"event": "sandbox.cleanup_stale"}
+        )
         try:
             client = self._get_client()
             resp = await client.get(
                 "/v5.0.0/containers/json",
-                params={"all": "true", "filters": f'{{"name":["{self._CONTAINER_PREFIX}"]}}'},
+                params={
+                    "all": "true",
+                    "filters": f'{{"name":["{self._CONTAINER_PREFIX}"]}}',
+                },
                 timeout=self._api_timeout,
             )
             if resp.status_code != 200:
                 logger.warning(
                     "Failed to list stale sandbox containers",
-                    extra={"event": "sandbox_cleanup_list_failed", "status": resp.status_code},
+                    extra={
+                        "event": "sandbox.cleanup_list_failed",
+                        "status": resp.status_code,
+                    },
                 )
                 return 0
 
@@ -361,18 +418,25 @@ class PodmanSandbox:
                     removed += 1
                     logger.info(
                         "Removed stale sandbox container",
-                        extra={"event": "sandbox_cleanup_removed", "container_id": cid[:12]},
+                        extra={
+                            "event": "sandbox.cleanup_removed",
+                            "container_id": cid[:12],
+                        },
                     )
                 else:
                     logger.warning(
                         "Failed to remove stale container",
-                        extra={"event": "sandbox_cleanup_failed", "container_id": cid[:12], "status": resp.status_code},
+                        extra={
+                            "event": "sandbox.cleanup_failed",
+                            "container_id": cid[:12],
+                            "status": resp.status_code,
+                        },
                     )
 
             if removed:
                 logger.info(
                     "Sandbox stale cleanup complete",
-                    extra={"event": "sandbox_cleanup_done", "removed": removed},
+                    extra={"event": "sandbox.cleanup_done", "removed": removed},
                 )
             return removed
 
@@ -380,9 +444,313 @@ class PodmanSandbox:
             logger.warning(
                 "Sandbox cleanup failed: %s",
                 exc,
-                extra={"event": "sandbox_cleanup_error", "error": str(exc)},
+                extra={"event": "sandbox.cleanup_error", "error": str(exc)},
+                exc_info=True,
             )
             return 0
+
+    async def _create_container(
+        self,
+        command: str,
+        container_name: str,
+        client: httpx.AsyncClient,
+        *,
+        command_hash: str = "",
+    ) -> str:
+        """Create a Podman container for the given command.
+
+        Builds the privilege-drop wrapper, creates the container via the
+        Podman API, and returns the container ID. Hardening verification
+        is called separately in run() so container_id is set for cleanup.
+        Raises ToolError if creation fails.
+        """
+        from sentinel.tools.executor import ToolError
+
+        # Field names MUST use Docker API PascalCase — Podman's compat
+        # API silently ignores snake_case fields (e.g. host_config → no
+        # volume mounts, no security settings).
+        # Privilege-drop wrapper: container starts as root (needed to
+        # chmod the workspace volume), then drops to nobody (65534)
+        # before executing the user command.  setpriv is a pure
+        # syscall wrapper (no PAM/shadow) — works on read-only rootfs
+        # and with NoNewPrivileges (privilege DROP is always allowed).
+        # Result: /etc/shadow is unreadable, user code can't escalate,
+        # but /workspace stays writable for build artefacts.
+        # Finding #7: chmod 1777 runs as root on every invocation (by design).
+        # The sticky bit prevents users from deleting each other's files.
+        # This runs before hardening-verified user command; the root window
+        # between container start and setpriv is minimal and mitigated by
+        # CapDrop=ALL + ReadonlyRootfs + no-new-privileges.
+        wrapped_cmd = (
+            "chmod 1777 /workspace 2>/dev/null; "
+            "exec setpriv --reuid=65534 --regid=65534 --clear-groups "
+            f"sh -c {shlex.quote(command)}"
+        )
+        create_body = {
+            "Image": self._image,
+            "Cmd": ["sh", "-c", wrapped_cmd],
+            "Name": container_name,
+            # BH3-152: NetworkDisabled is belt-and-suspenders with
+            # NetworkMode:"none" below. Podman's compat API silently
+            # ignores NetworkDisabled, but we keep it for Docker compat
+            # and defence-in-depth if the API behaviour changes.
+            "NetworkDisabled": True,
+            "HostConfig": {
+                "NetworkMode": "none",
+                "ReadonlyRootfs": True,
+                # BH3-152: NoNewPrivileges is belt-and-suspenders with
+                # SecurityOpt:["no-new-privileges"] below. Podman's compat
+                # API ignores NoNewPrivileges, but SecurityOpt works.
+                # Both are kept for defence-in-depth.
+                "NoNewPrivileges": True,
+                "Memory": self._memory_limit,
+                "CpuQuota": self._cpu_quota,
+                "CapDrop": ["ALL"],
+                # CAP_SETUID/SETGID needed for setpriv privilege drop.
+                # Cleared by kernel when UID changes 0 → 65534 (non-root
+                # processes lose all caps). User command runs with zero caps.
+                "CapAdd": ["CAP_SETUID", "CAP_SETGID"],
+                "SecurityOpt": ["no-new-privileges"],
+                "Binds": [
+                    f"{self._workspace_volume}:/workspace:rw",
+                ],
+                "Tmpfs": {"/tmp": "size=100M,noexec"},
+            },
+            "WorkingDir": "/workspace",
+        }
+
+        resp = await client.post(
+            "/v5.0.0/containers/create",
+            json=create_body,
+            timeout=self._api_timeout,
+        )
+        if resp.status_code not in (200, 201):
+            raise ToolError(
+                f"sandbox container create failed: {resp.status_code} {resp.text}"
+            )
+
+        container_id = resp.json().get("Id", "")
+        logger.info(
+            "Sandbox container created",
+            extra={
+                "event": "sandbox.created",
+                "container_id": container_id[:12],
+                "command_len": len(command),
+                "command_hash": command_hash,
+            },
+        )
+        # Finding #11: Log the wrapped command length (including chmod +
+        # setpriv wrapper) at debug level for audit trail.
+        logger.debug(
+            "Sandbox wrapped command",
+            extra={
+                "event": "sandbox.wrapped_cmd",
+                "container_id": container_id[:12],
+                "wrapped_cmd_len": len(wrapped_cmd),
+            },
+        )
+
+        return container_id
+
+    async def _start_and_wait(
+        self,
+        container_id: str,
+        effective_timeout: int,
+        client: httpx.AsyncClient,
+    ) -> tuple[int, bool]:
+        """Start the container and wait for completion with timeout.
+
+        Returns (exit_code, timed_out). If the container times out,
+        it is killed before returning.
+        """
+        from sentinel.tools.executor import ToolError
+
+        resp = await client.post(
+            f"/v5.0.0/containers/{container_id}/start",
+            timeout=self._api_timeout,
+        )
+        if resp.status_code not in (200, 204):
+            raise ToolError(
+                f"sandbox container start failed: {resp.status_code} {resp.text}"
+            )
+
+        try:
+            resp = await asyncio.wait_for(
+                client.post(
+                    f"/v5.0.0/containers/{container_id}/wait",
+                    params={"condition": "not-running"},
+                ),
+                timeout=effective_timeout,
+            )
+            return resp.json().get("StatusCode", -1), False
+        except TimeoutError:
+            # Finding #8: Kill the container and check response status
+            logger.warning(
+                "_start_and_wait: TimeoutError",
+                extra={"event": "sandbox.start_and_wait_timeout"},
+                exc_info=True,
+            )
+            await self._kill_timed_out_container(
+                container_id, effective_timeout, client
+            )
+            return -1, True
+
+    async def _kill_timed_out_container(
+        self,
+        container_id: str,
+        effective_timeout: int,
+        client: httpx.AsyncClient,
+    ) -> None:
+        """Kill a container that exceeded its timeout and log the event."""
+        try:
+            kill_resp = await client.post(
+                f"/v5.0.0/containers/{container_id}/kill",
+                timeout=self._api_timeout,
+            )
+            if kill_resp.status_code not in (200, 204):
+                logger.warning(
+                    "Kill-on-timeout returned unexpected status",
+                    extra={
+                        "event": "sandbox.kill_failed",
+                        "container_id": container_id[:12],
+                        "status_code": kill_resp.status_code,
+                    },
+                )
+        except Exception as kill_exc:  # catch-all: container kill best-effort
+            logger.warning(
+                "Failed to kill timed-out container: %s",
+                kill_exc,
+                extra={
+                    "event": "sandbox.kill_error",
+                    "container_id": container_id[:12],
+                    "error": str(kill_exc),
+                },
+                exc_info=True,
+            )
+        logger.warning(
+            "Sandbox command timed out, container killed",
+            extra={
+                "event": "sandbox.timeout",
+                "container_id": container_id[:12],
+                "timeout": effective_timeout,
+            },
+        )
+
+    async def _collect_logs(
+        self,
+        container_id: str,
+        client: httpx.AsyncClient,
+    ) -> tuple[str, str]:
+        """Fetch stdout and stderr from the container's log API.
+
+        The Podman logs API returns Docker-style multiplexed stream
+        frames (8-byte header per frame). Read raw bytes and demux.
+        Finding #9: After a timeout kill, Podman's log buffer may not be
+        fully flushed — output could be incomplete. This is a Podman
+        implementation detail, not actionable from our side.
+        """
+        stdout_resp = await client.get(
+            f"/v5.0.0/containers/{container_id}/logs",
+            params={"stdout": "true", "stderr": "false"},
+            timeout=self._api_timeout,
+        )
+        stderr_resp = await client.get(
+            f"/v5.0.0/containers/{container_id}/logs",
+            params={"stdout": "false", "stderr": "true"},
+            timeout=self._api_timeout,
+        )
+
+        stdout = (
+            _demux_stream(stdout_resp.content)[: self._output_limit]
+            if stdout_resp.status_code == 200
+            else ""
+        )
+        stderr = (
+            _demux_stream(stderr_resp.content)[: self._output_limit]
+            if stderr_resp.status_code == 200
+            else ""
+        )
+
+        logger.debug(
+            "Sandbox logs collected",
+            extra={
+                "event": "sandbox.logs_collected",
+                "container_id": container_id[:12],
+                "stdout_len": len(stdout),
+                "stderr_len": len(stderr),
+            },
+        )
+        return stdout, stderr
+
+    async def _check_oom_killed(
+        self,
+        container_id: str,
+        client: httpx.AsyncClient,
+    ) -> bool:
+        """Inspect container state and return whether it was OOM-killed."""
+        inspect_resp = await client.get(
+            f"/v5.0.0/containers/{container_id}/json",
+            timeout=self._api_timeout,
+        )
+        if inspect_resp.status_code == 200:
+            state = inspect_resp.json().get("State", {})
+            return state.get("OOMKilled", False)
+        return False
+
+    async def _remove_container(
+        self,
+        container_id: str,
+        client: httpx.AsyncClient,
+    ) -> None:
+        """Force-delete a container. Always called in finally blocks.
+
+        Finding #10: 404 means already deleted (e.g. hardening failure
+        path) — downgrade to debug, not a real failure.
+        """
+        try:
+            resp = await client.delete(
+                f"/v5.0.0/containers/{container_id}",
+                params={"force": "true"},
+                timeout=self._api_timeout,
+            )
+            resp.raise_for_status()
+            logger.info(
+                "Sandbox container removed",
+                extra={
+                    "event": "sandbox.removed",
+                    "container_id": container_id[:12],
+                },
+            )
+        except httpx.HTTPStatusError as exc:
+            logger.exception(
+                "_remove_container: httpx.HTTPStatusError",
+                extra={"event": "sandbox._remove_container_httpstatuserror"},
+            )  # auto:except
+            level = (
+                logging.DEBUG if exc.response.status_code == 404 else logging.WARNING
+            )
+            logger.log(
+                level,
+                "Failed to remove sandbox container: %s",
+                exc,
+                extra={
+                    "event": "sandbox.remove_failed",
+                    "container_id": container_id[:12],
+                    "error": str(exc),
+                },
+                exc_info=True,
+            )
+        except Exception as exc:  # catch-all: container remove best-effort
+            logger.warning(
+                "Failed to remove sandbox container: %s",
+                exc,
+                extra={
+                    "event": "sandbox.remove_failed",
+                    "container_id": container_id[:12],
+                    "error": str(exc),
+                },
+                exc_info=True,
+            )
 
     async def run(self, command: str, timeout: int | None = None) -> SandboxResult:
         """Run a command in a disposable Podman container.
@@ -391,191 +759,42 @@ class PodmanSandbox:
         and destroys the container. Container is always cleaned up,
         even on errors.
         """
-        from sentinel.tools.executor import ToolError
-
         effective_timeout = min(
             timeout if timeout is not None else self._default_timeout,
             self._max_timeout,
         )
         container_name = f"{self._CONTAINER_PREFIX}{uuid.uuid4().hex[:12]}"
+        # FL-C76-a2 (D38) primitive alignment: keyed-HMAC log_hash (16-char hex)
+        # in place of public SHA-256. Closes brute-force surface against the
+        # workspace-path corpus while preserving cross-tier correlation
+        # (eval.command_returns cmd_hash ↔ sandbox.completed command_hash) in
+        # production-key mode. In dev mode without HMAC key, returns "nokey"
+        # sentinel — correlation lost, secrecy preserved (per design §Site 4
+        # log_hash dev-mode degradation note).
+        command_hash = log_hash(command)
         # Finding #3: Get client, resetting if stale from a prior connection failure
         try:
             client = self._get_client()
         except Exception:
+            logger.exception(
+                "run: Exception", extra={"event": "sandbox.run_error"}
+            )  # auto:except
             await self._reset_client()
             client = self._get_client()
         container_id = None
 
         try:
-            # 1. Create container
-            # Field names MUST use Docker API PascalCase — Podman's compat
-            # API silently ignores snake_case fields (e.g. host_config → no
-            # volume mounts, no security settings).
-            # Privilege-drop wrapper: container starts as root (needed to
-            # chmod the workspace volume), then drops to nobody (65534)
-            # before executing the user command.  setpriv is a pure
-            # syscall wrapper (no PAM/shadow) — works on read-only rootfs
-            # and with NoNewPrivileges (privilege DROP is always allowed).
-            # Result: /etc/shadow is unreadable, user code can't escalate,
-            # but /workspace stays writable for build artefacts.
-            # Finding #7: chmod 1777 runs as root on every invocation (by design).
-            # The sticky bit prevents users from deleting each other's files.
-            # This runs before hardening-verified user command; the root window
-            # between container start and setpriv is minimal and mitigated by
-            # CapDrop=ALL + ReadonlyRootfs + no-new-privileges.
-            wrapped_cmd = (
-                "chmod 1777 /workspace 2>/dev/null; "
-                "exec setpriv --reuid=65534 --regid=65534 --clear-groups "
-                f"sh -c {shlex.quote(command)}"
+            container_id = await self._create_container(
+                command, container_name, client, command_hash=command_hash
             )
-            create_body = {
-                "Image": self._image,
-                "Cmd": ["sh", "-c", wrapped_cmd],
-                "Name": container_name,
-                # BH3-152: NetworkDisabled is belt-and-suspenders with
-                # NetworkMode:"none" below. Podman's compat API silently
-                # ignores NetworkDisabled, but we keep it for Docker compat
-                # and defence-in-depth if the API behaviour changes.
-                "NetworkDisabled": True,
-                "HostConfig": {
-                    "NetworkMode": "none",
-                    "ReadonlyRootfs": True,
-                    # BH3-152: NoNewPrivileges is belt-and-suspenders with
-                    # SecurityOpt:["no-new-privileges"] below. Podman's compat
-                    # API ignores NoNewPrivileges, but SecurityOpt works.
-                    # Both are kept for defence-in-depth.
-                    "NoNewPrivileges": True,
-                    "Memory": self._memory_limit,
-                    "CpuQuota": self._cpu_quota,
-                    "CapDrop": ["ALL"],
-                    # CAP_SETUID/SETGID needed for setpriv privilege drop.
-                    # Cleared by kernel when UID changes 0 → 65534 (non-root
-                    # processes lose all caps). User command runs with zero caps.
-                    "CapAdd": ["CAP_SETUID", "CAP_SETGID"],
-                    "SecurityOpt": ["no-new-privileges"],
-                    "Binds": [
-                        f"{self._workspace_volume}:/workspace:rw",
-                    ],
-                    "Tmpfs": {"/tmp": "size=100M,noexec"},
-                },
-                "WorkingDir": "/workspace",
-            }
-
-            resp = await client.post(
-                "/v5.0.0/containers/create",
-                json=create_body,
-                timeout=self._api_timeout,
-            )
-            if resp.status_code not in (200, 201):
-                raise ToolError(f"sandbox container create failed: {resp.status_code} {resp.text}")
-
-            container_id = resp.json().get("Id", "")
-            logger.info(
-                "Sandbox container created",
-                extra={
-                    "event": "sandbox_created",
-                    "container_id": container_id[:12],
-                    "command": command[:200],
-                },
-            )
-            # Finding #11: Log the full wrapped command (including chmod +
-            # setpriv wrapper) at debug level for audit trail.
-            logger.debug(
-                "Sandbox wrapped command",
-                extra={
-                    "event": "sandbox_wrapped_cmd",
-                    "container_id": container_id[:12],
-                    "wrapped_cmd": wrapped_cmd,
-                },
-            )
-
-            # 1b. Verify hardening was applied (catches silent API field ignores)
+            # Verify hardening AFTER container_id is set so the finally
+            # block can clean up if hardening fails.
             await self._verify_hardening(container_id)
-
-            # 2. Start container
-            resp = await client.post(
-                f"/v5.0.0/containers/{container_id}/start",
-                timeout=self._api_timeout,
+            exit_code, timed_out = await self._start_and_wait(
+                container_id, effective_timeout, client
             )
-            if resp.status_code not in (200, 204):
-                raise ToolError(f"sandbox container start failed: {resp.status_code} {resp.text}")
-
-            # 3. Wait for container to finish (with timeout)
-            timed_out = False
-            try:
-                resp = await asyncio.wait_for(
-                    client.post(
-                        f"/v5.0.0/containers/{container_id}/wait",
-                        params={"condition": "not-running"},
-                    ),
-                    timeout=effective_timeout,
-                )
-                exit_code = resp.json().get("StatusCode", -1)
-            except asyncio.TimeoutError:
-                timed_out = True
-                exit_code = -1
-                # Finding #8: Kill the container and check response status
-                try:
-                    kill_resp = await client.post(
-                        f"/v5.0.0/containers/{container_id}/kill",
-                        timeout=self._api_timeout,
-                    )
-                    if kill_resp.status_code not in (200, 204):
-                        logger.warning(
-                            "Kill-on-timeout returned unexpected status",
-                            extra={
-                                "event": "sandbox_kill_failed",
-                                "container_id": container_id[:12],
-                                "status_code": kill_resp.status_code,
-                            },
-                        )
-                except Exception as kill_exc:
-                    logger.warning(
-                        "Failed to kill timed-out container: %s", kill_exc,
-                        extra={
-                            "event": "sandbox_kill_error",
-                            "container_id": container_id[:12],
-                            "error": str(kill_exc),
-                        },
-                    )
-                logger.warning(
-                    "Sandbox command timed out, container killed",
-                    extra={
-                        "event": "sandbox_timeout",
-                        "container_id": container_id[:12],
-                        "timeout": effective_timeout,
-                    },
-                )
-
-            # 4. Get logs (stdout and stderr separately)
-            # The Podman logs API returns Docker-style multiplexed stream
-            # frames (8-byte header per frame). Read raw bytes and demux.
-            # Finding #9: After a timeout kill, Podman's log buffer may not be
-            # fully flushed — output could be incomplete. This is a Podman
-            # implementation detail, not actionable from our side.
-            stdout_resp = await client.get(
-                f"/v5.0.0/containers/{container_id}/logs",
-                params={"stdout": "true", "stderr": "false"},
-                timeout=self._api_timeout,
-            )
-            stderr_resp = await client.get(
-                f"/v5.0.0/containers/{container_id}/logs",
-                params={"stdout": "false", "stderr": "true"},
-                timeout=self._api_timeout,
-            )
-
-            stdout = _demux_stream(stdout_resp.content)[:self._output_limit] if stdout_resp.status_code == 200 else ""
-            stderr = _demux_stream(stderr_resp.content)[:self._output_limit] if stderr_resp.status_code == 200 else ""
-
-            # 5. Check OOM kill
-            oom_killed = False
-            inspect_resp = await client.get(
-                f"/v5.0.0/containers/{container_id}/json",
-                timeout=self._api_timeout,
-            )
-            if inspect_resp.status_code == 200:
-                state = inspect_resp.json().get("State", {})
-                oom_killed = state.get("OOMKilled", False)
+            stdout, stderr = await self._collect_logs(container_id, client)
+            oom_killed = await self._check_oom_killed(container_id, client)
 
             result = SandboxResult(
                 stdout=stdout,
@@ -589,51 +808,18 @@ class PodmanSandbox:
             logger.info(
                 "Sandbox command complete",
                 extra={
-                    "event": "sandbox_complete",
+                    "event": "sandbox.completed",
                     "container_id": container_id[:12],
                     "exit_code": exit_code,
                     "timed_out": timed_out,
                     "oom_killed": oom_killed,
                     "stdout_len": len(stdout),
                     "stderr_len": len(stderr),
+                    "command_hash": command_hash,
                 },
             )
             return result
 
         finally:
-            # 6. Always delete the container
             if container_id:
-                try:
-                    await client.delete(
-                        f"/v5.0.0/containers/{container_id}",
-                        params={"force": "true"},
-                        timeout=self._api_timeout,
-                    )
-                    logger.info(
-                        "Sandbox container removed",
-                        extra={"event": "sandbox_removed", "container_id": container_id[:12]},
-                    )
-                except httpx.HTTPStatusError as exc:
-                    # Finding #10: 404 means already deleted (e.g. hardening
-                    # failure path) — downgrade to debug, not a real failure.
-                    level = logging.DEBUG if exc.response.status_code == 404 else logging.WARNING
-                    logger.log(
-                        level,
-                        "Failed to remove sandbox container: %s",
-                        exc,
-                        extra={
-                            "event": "sandbox_remove_failed",
-                            "container_id": container_id[:12],
-                            "error": str(exc),
-                        },
-                    )
-                except Exception as exc:
-                    logger.warning(
-                        "Failed to remove sandbox container: %s",
-                        exc,
-                        extra={
-                            "event": "sandbox_remove_failed",
-                            "container_id": container_id[:12],
-                            "error": str(exc),
-                        },
-                    )
+                await self._remove_container(container_id, client)

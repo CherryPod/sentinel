@@ -7,6 +7,7 @@ All models use shared validation via _normalize_text() to enforce:
 - Non-empty after stripping
 """
 
+import logging
 import re
 import unicodedata
 
@@ -14,19 +15,38 @@ from pydantic import BaseModel, field_validator
 
 from sentinel.core.config import settings
 
+logger = logging.getLogger(__name__)
+
+
 # ── Input validation constants ────────────────────────────────────
 MAX_TEXT_LENGTH = 50_000
 MIN_TASK_REQUEST_LENGTH = 3
 MAX_REASON_LENGTH = 1_000
+MIN_TIMEOUT_SECONDS = 60
+MAX_TIMEOUT_SECONDS = 7_200
+MIN_SECRET_LENGTH = 16
+MAX_ROUTINE_ITERATIONS = 50
 _CONSECUTIVE_NEWLINES = re.compile(r"\n{3,}")
 
 # Valid source values for task requests. Unknown values default to "api"
 # to prevent session-key rotation (different source = different session = reset risk scores).
-_VALID_TASK_SOURCES = frozenset({"api", "signal", "telegram", "webhook", "websocket", "mcp", "a2a"})
+_VALID_TASK_SOURCES = frozenset(
+    {"api", "signal", "telegram", "webhook", "websocket", "mcp", "a2a"}
+)
 
 
-def _normalize_text(v: str, *, min_length: int = 1, max_length: int = MAX_TEXT_LENGTH, field_name: str = "Text") -> str:
+def _normalize_text(
+    v: str,
+    *,
+    min_length: int = 1,
+    max_length: int = MAX_TEXT_LENGTH,
+    field_name: str = "Text",
+) -> str:
     """Shared validation: strip, NFC normalize, collapse newlines, enforce length."""
+    logger.debug(
+        "_normalize_text called",
+        extra={"event": "models._normalize_text", "v_length": len(v)},
+    )
     v = v.strip()
     v = unicodedata.normalize("NFC", v)
     v = _CONSECUTIVE_NEWLINES.sub("\n\n", v)
@@ -65,7 +85,9 @@ class ProcessRequest(BaseModel):
         # No minimum — can be empty string if explicitly provided, but enforce max
         v = unicodedata.normalize("NFC", v)
         if len(v) > MAX_TEXT_LENGTH:
-            raise ValueError(f"Untrusted data too long (maximum {MAX_TEXT_LENGTH:,} characters)")
+            raise ValueError(
+                f"Untrusted data too long (maximum {MAX_TEXT_LENGTH:,} characters)"
+            )
         return v
 
 
@@ -77,17 +99,54 @@ class TaskRequest(BaseModel):
     @field_validator("request")
     @classmethod
     def validate_request(cls, v: str) -> str:
-        return _normalize_text(v, min_length=MIN_TASK_REQUEST_LENGTH, field_name="Request")
+        return _normalize_text(
+            v, min_length=MIN_TASK_REQUEST_LENGTH, field_name="Request"
+        )
 
     @field_validator("source")
     @classmethod
     def validate_source(cls, v: str) -> str:
-        # In benchmark mode, allow arbitrary source values so the stress test
-        # can create unique sessions per prompt (bypasses H-003 restriction).
-        if settings.benchmark_mode:
+        # Q3-F3: always enforce the allowlist so a caller cannot craft a prefix
+        # that collides with another transport's source_key shape. Benchmark
+        # harnesses need unique sessions per prompt, so non-allowlisted values
+        # in benchmark mode are namespaced under "benchmark:" rather than passed
+        # through raw — preserves stress-test uniqueness without reopening the
+        # attacker-controlled prefix surface.
+        if v in _VALID_TASK_SOURCES:
             return v
-        if v not in _VALID_TASK_SOURCES:
-            return "api"
+        if settings.benchmark_mode:
+            return f"benchmark:{v}"
+        return "api"
+
+
+class LoopRequest(BaseModel):
+    request: str
+    max_iterations: int = 5
+    timeout_seconds: int = 3600
+
+    @field_validator("request")
+    @classmethod
+    def validate_request(cls, v: str) -> str:
+        return _normalize_text(
+            v, min_length=MIN_TASK_REQUEST_LENGTH, field_name="Request"
+        )
+
+    @field_validator("max_iterations")
+    @classmethod
+    def validate_max_iterations(cls, v: int) -> int:
+        if v < 1 or v > settings.loop_max_per_request:
+            raise ValueError(
+                f"max_iterations must be 1-{settings.loop_max_per_request}"
+            )
+        return v
+
+    @field_validator("timeout_seconds")
+    @classmethod
+    def validate_timeout(cls, v: int) -> int:
+        if v < MIN_TIMEOUT_SECONDS or v > MAX_TIMEOUT_SECONDS:
+            raise ValueError(
+                f"timeout_seconds must be {MIN_TIMEOUT_SECONDS}-{MAX_TIMEOUT_SECONDS}"
+            )
         return v
 
 
@@ -99,7 +158,9 @@ class ApprovalDecision(BaseModel):
     @classmethod
     def validate_reason(cls, v: str) -> str:
         if len(v) > MAX_REASON_LENGTH:
-            raise ValueError(f"Reason too long (maximum {MAX_REASON_LENGTH:,} characters)")
+            raise ValueError(
+                f"Reason too long (maximum {MAX_REASON_LENGTH:,} characters)"
+            )
         return v
 
 
@@ -138,13 +199,26 @@ class CreateRoutineRequest(BaseModel):
     @field_validator("action_config")
     @classmethod
     def validate_action_config(cls, v: dict) -> dict:
+        logger.debug(
+            "validate_action_config called",
+            extra={
+                "event": "models.validate_action_config",
+                "v_len": len(v) if hasattr(v, "__len__") else 0,
+            },
+        )
         if "prompt" not in v or not v["prompt"]:
             raise ValueError("action_config must contain a non-empty 'prompt' key")
         # Finding #9: Validate max_iterations at creation time
         max_iter = v.get("max_iterations")
         if max_iter is not None:
-            if not isinstance(max_iter, int) or max_iter < 1 or max_iter > 50:
-                raise ValueError("max_iterations must be an integer between 1 and 50")
+            if (
+                not isinstance(max_iter, int)
+                or max_iter < 1
+                or max_iter > MAX_ROUTINE_ITERATIONS
+            ):
+                raise ValueError(
+                    f"max_iterations must be an integer between 1 and {MAX_ROUTINE_ITERATIONS}"
+                )
         # Finding #1: Validate approval_mode values
         approval = v.get("approval_mode")
         if approval is not None and approval not in ("auto", "full"):
@@ -184,8 +258,14 @@ class UpdateRoutineRequest(BaseModel):
             # Finding #9: Validate max_iterations at update time
             max_iter = v.get("max_iterations")
             if max_iter is not None:
-                if not isinstance(max_iter, int) or max_iter < 1 or max_iter > 50:
-                    raise ValueError("max_iterations must be an integer between 1 and 50")
+                if (
+                    not isinstance(max_iter, int)
+                    or max_iter < 1
+                    or max_iter > MAX_ROUTINE_ITERATIONS
+                ):
+                    raise ValueError(
+                        f"max_iterations must be an integer between 1 and {MAX_ROUTINE_ITERATIONS}"
+                    )
             # Finding #1: Validate approval_mode values
             approval = v.get("approval_mode")
             if approval is not None and approval not in ("auto", "full"):
@@ -205,6 +285,6 @@ class RegisterWebhookRequest(BaseModel):
     @field_validator("secret")
     @classmethod
     def validate_secret(cls, v: str) -> str:
-        if len(v) < 16:
-            raise ValueError("Secret must be at least 16 characters")
+        if len(v) < MIN_SECRET_LENGTH:
+            raise ValueError(f"Secret must be at least {MIN_SECRET_LENGTH} characters")
         return v

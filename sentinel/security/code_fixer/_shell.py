@@ -11,6 +11,7 @@ Moved from monolith lines 1094-1220. Finding fixes applied:
   #46: documented shebang prepend as intentional
   #55: $VAR warning iterates post-fix lines, not pre-fix
 """
+
 import logging
 import re
 
@@ -40,34 +41,51 @@ _SHEBANG_FIXES = {
 
 _UNSAFE_SHELL_PATTERNS = [
     # Short-form flags: rm -rf / or rm -rf /*
-    (re.compile(r'rm\s+(-[a-zA-Z]*r[a-zA-Z]*\s+)?(-[a-zA-Z]*f[a-zA-Z]*\s+)?/\s*$',
-                re.MULTILINE),
-     "Dangerous command: rm -rf / (recursive delete of root)"),
-    (re.compile(r'rm\s+(-[a-zA-Z]*r[a-zA-Z]*\s+)?(-[a-zA-Z]*f[a-zA-Z]*\s+)?/\*',
-                re.MULTILINE),
-     "Dangerous command: rm -rf /* (recursive delete of all files)"),
+    (
+        re.compile(
+            r"rm\s+(-[a-zA-Z]*r[a-zA-Z]*\s+)?(-[a-zA-Z]*f[a-zA-Z]*\s+)?/\s*$",
+            re.MULTILINE,
+        ),
+        "Dangerous command: rm -rf / (recursive delete of root)",
+    ),
+    (
+        re.compile(
+            r"rm\s+(-[a-zA-Z]*r[a-zA-Z]*\s+)?(-[a-zA-Z]*f[a-zA-Z]*\s+)?/\*",
+            re.MULTILINE,
+        ),
+        "Dangerous command: rm -rf /* (recursive delete of all files)",
+    ),
     # Finding #33: long-form flag patterns
-    (re.compile(r'rm\s+--recursive\s+--force\s+/\s*$', re.MULTILINE),
-     "Dangerous command: rm --recursive --force / (recursive delete of root)"),
-    (re.compile(r'rm\s+--recursive\s+--force\s+/\*', re.MULTILINE),
-     "Dangerous command: rm --recursive --force /* (recursive delete of all files)"),
-    (re.compile(r'rm\s+--force\s+--recursive\s+/\s*$', re.MULTILINE),
-     "Dangerous command: rm --force --recursive / (recursive delete of root)"),
-    (re.compile(r'rm\s+--force\s+--recursive\s+/\*', re.MULTILINE),
-     "Dangerous command: rm --force --recursive /* (recursive delete of all files)"),
-    (re.compile(r'chmod\s+777\b'),
-     "chmod 777 sets world-writable permissions"),
+    (
+        re.compile(r"rm\s+--recursive\s+--force\s+/\s*$", re.MULTILINE),
+        "Dangerous command: rm --recursive --force / (recursive delete of root)",
+    ),
+    (
+        re.compile(r"rm\s+--recursive\s+--force\s+/\*", re.MULTILINE),
+        "Dangerous command: rm --recursive --force /* (recursive delete of all files)",
+    ),
+    (
+        re.compile(r"rm\s+--force\s+--recursive\s+/\s*$", re.MULTILINE),
+        "Dangerous command: rm --force --recursive / (recursive delete of root)",
+    ),
+    (
+        re.compile(r"rm\s+--force\s+--recursive\s+/\*", re.MULTILINE),
+        "Dangerous command: rm --force --recursive /* (recursive delete of all files)",
+    ),
+    (re.compile(r"chmod\s+777\b"), "chmod 777 sets world-writable permissions"),
     # Finding #34: broadened eval detection — matches eval $, eval "$, eval '$
-    (re.compile(r'eval\s+["\']?\$'),
-     "eval with variable input — potential code injection"),
-    (re.compile(r':\(\)\s*\{.*\|.*&\s*\}\s*;'),
-     "Fork bomb detected"),
+    (
+        re.compile(r'eval\s+["\']?\$'),
+        "eval with variable input — potential code injection",
+    ),
+    (re.compile(r":\(\)\s*\{.*\|.*&\s*\}\s*;"), "Fork bomb detected"),
 ]
 
 
 # ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
+
 
 def fix_shell(content: str) -> FixResult:
     """Shell script fixes: shebang, unclosed quotes, block closers, unsafe patterns.
@@ -79,6 +97,15 @@ def fix_shell(content: str) -> FixResult:
     result = FixResult(content=content)
     original = content
     fname = _current_filename.get()
+
+    logger.debug(
+        "Shell fixer starting",
+        extra={
+            "event": "shell.fixer_start",
+            "file": fname,
+            "content_length": len(content),
+        },
+    )
 
     # Finding #9: detect heredocs early — skip quote fixing for heredoc files
     has_heredoc = "<<" in content
@@ -93,7 +120,7 @@ def fix_shell(content: str) -> FixResult:
         logger.debug(
             "Added missing shebang",
             extra={
-                "event": "fixer_detail",
+                "event": "shell.shebang_fix",
                 "fixer": "fix_shell",
                 "file": fname,
             },
@@ -132,7 +159,7 @@ def fix_shell(content: str) -> FixResult:
             logger.debug(
                 "Closed unclosed double quotes",
                 extra={
-                    "event": "fixer_detail",
+                    "event": "shell.quoting_fix",
                     "fixer": "fix_shell",
                     "file": fname,
                     "count": fixed_count,
@@ -148,8 +175,17 @@ def fix_shell(content: str) -> FixResult:
         # Find single-quoted sections and check for $
         in_single = False
         for j, ch in enumerate(line):
-            if ch == "'" and (j == 0 or line[j - 1] != "\\"):
-                in_single = not in_single
+            if ch == "'":
+                # Count consecutive backslashes before this quote.
+                # Even count (0, 2, 4...) = quote is real.
+                # Odd count (1, 3...) = quote is escaped by preceding \.
+                num_backslashes = 0
+                k = j - 1
+                while k >= 0 and line[k] == "\\":
+                    num_backslashes += 1
+                    k -= 1
+                if num_backslashes % 2 == 0:
+                    in_single = not in_single
             elif ch == "$" and in_single:
                 result.warnings.append(
                     f"Line {i + 1}: $variable inside single quotes won't expand"
@@ -161,12 +197,12 @@ def fix_shell(content: str) -> FixResult:
     if first_line.startswith("#!"):
         for wrong, right in _SHEBANG_FIXES.items():
             if first_line.strip() == wrong:
-                content = right + content[len(first_line):]
+                content = right + content[len(first_line) :]
                 result.fixes_applied.append(f"Fixed shebang: {wrong} → {right}")
                 logger.debug(
                     "Fixed shebang typo",
                     extra={
-                        "event": "fixer_detail",
+                        "event": "shell.shebang_fix",
                         "fixer": "fix_shell",
                         "file": fname,
                         "wrong": wrong,
@@ -202,42 +238,51 @@ def fix_shell(content: str) -> FixResult:
             code_line = "".join(code_chars).strip()
 
             # Match keywords with word boundaries to avoid 'ifdef', 'ifconfig' etc.
-            if re.match(r'if\b', code_line):
+            if re.match(r"if\b", code_line):
                 if_count += 1
-            if re.match(r'fi\b', code_line):
+            if re.match(r"fi\b", code_line):
                 fi_count += 1
-            if re.match(r'then\b', code_line) or '; then' in code_line:
+            if re.match(r"then\b", code_line) or "; then" in code_line:
                 then_count += 1
-            if re.match(r'(for|while)\b', code_line):
+            if re.match(r"(for|while)\b", code_line):
                 for_while_count += 1
-            if re.match(r'done\b', code_line):
+            if re.match(r"done\b", code_line):
                 done_count += 1
-            if re.match(r'do\b', code_line) or '; do' in code_line:
+            if re.match(r"do\b", code_line) or "; do" in code_line:
                 do_count += 1
 
-        if (if_count > 0 and then_count > 0
-                and fi_count == if_count - 1 and if_count - fi_count == 1):
+        if (
+            if_count > 0
+            and then_count > 0
+            and fi_count == if_count - 1
+            and if_count - fi_count == 1
+        ):
             content = content.rstrip("\n") + "\nfi\n"
             result.fixes_applied.append("Added missing 'fi' (unclosed if block)")
             logger.debug(
                 "Added missing fi",
                 extra={
-                    "event": "fixer_detail",
+                    "event": "shell.fi_added",
                     "fixer": "fix_shell",
                     "file": fname,
                     "if_count": if_count,
                     "fi_count": fi_count,
                 },
             )
-        elif (for_while_count > 0 and do_count > 0
-                and done_count == for_while_count - 1
-                and for_while_count - done_count == 1):
+        elif (
+            for_while_count > 0
+            and do_count > 0
+            and done_count == for_while_count - 1
+            and for_while_count - done_count == 1
+        ):
             content = content.rstrip("\n") + "\ndone\n"
-            result.fixes_applied.append("Added missing 'done' (unclosed for/while block)")
+            result.fixes_applied.append(
+                "Added missing 'done' (unclosed for/while block)"
+            )
             logger.debug(
                 "Added missing done",
                 extra={
-                    "event": "fixer_detail",
+                    "event": "shell.done_added",
                     "fixer": "fix_shell",
                     "file": fname,
                     "loop_count": for_while_count,
@@ -246,18 +291,26 @@ def fix_shell(content: str) -> FixResult:
             )
 
     # v2.5: Unsafe pattern detection (detect only — don't modify content)
+    unsafe_found = False
     for pattern, message in _UNSAFE_SHELL_PATTERNS:
         if pattern.search(content):
             result.errors_found.append(message)
+            unsafe_found = True
             logger.debug(
                 "Unsafe shell pattern detected",
                 extra={
-                    "event": "fixer_detail",
+                    "event": "shell.unsafe_pattern",
                     "fixer": "fix_shell",
                     "file": fname,
                     "pattern": message,
                 },
             )
+
+    if not unsafe_found:
+        logger.debug(
+            "No unsafe shell patterns detected",
+            extra={"event": "shell.unsafe_patterns_clean", "file": fname},
+        )
 
     result.content = content
     result.changed = content != original

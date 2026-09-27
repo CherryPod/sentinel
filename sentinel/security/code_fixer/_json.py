@@ -3,6 +3,7 @@
 Fix common LLM JSON errors: Python booleans, single quotes, trailing commas,
 NaN/Infinity. Uses json-repair library when available, with regex fallback.
 """
+
 import json
 import logging
 import re
@@ -15,6 +16,11 @@ logger = logging.getLogger(__name__)
 try:
     from json_repair import repair_json as _json_repair  # type: ignore[import-untyped]
 except ImportError:
+    logger.warning(
+        "json-repair library not available",
+        extra={"event": "json_fixer.json_repair_import_error"},
+        exc_info=True,
+    )
     _json_repair = None  # type: ignore[assignment]
 
 
@@ -22,9 +28,8 @@ except ImportError:
 # Context-aware replacement helper
 # ---------------------------------------------------------------------------
 
-def _replace_outside_strings(
-    content: str, replacements: list[tuple[str, str]]
-) -> str:
+
+def _replace_outside_strings(content: str, replacements: list[tuple[str, str]]) -> str:
     """Replace patterns only in CODE context (outside JSON strings).
 
     Finding #2 (HIGH), #7, #30: boolean/NaN/Infinity replacement and
@@ -41,8 +46,12 @@ def _replace_outside_strings(
             if ctx == CharContext.STRING:
                 string_positions.add(idx)
 
-        # Apply in reverse order to preserve positions within this pattern
-        for m in reversed(list(re.finditer(r"\b" + re.escape(pattern) + r"\b", result))):
+        # Apply in reverse order to preserve positions within this pattern.
+        # Use lookaround instead of \b — \b before non-word chars like "-"
+        # never matches (both sides are non-word), so "-Infinity" was missed.
+        escaped = re.escape(pattern)
+        regex = r"(?<!\w)" + escaped + r"(?!\w)"
+        for m in reversed(list(re.finditer(regex, result))):
             if any(pos in string_positions for pos in range(m.start(), m.end())):
                 continue
             result = result[: m.start()] + replacement + result[m.end() :]
@@ -52,6 +61,7 @@ def _replace_outside_strings(
 # ---------------------------------------------------------------------------
 # Layer 3: JSON repair
 # ---------------------------------------------------------------------------
+
 
 def fix_json(content: str) -> FixResult:
     """Fix common LLM JSON errors using json-repair (v2) with regex fallback.
@@ -75,20 +85,30 @@ def fix_json(content: str) -> FixResult:
             json.loads(content)
             return result
         except json.JSONDecodeError:
-            pass
+            logger.warning(
+                "fix_json: json.JSONDecodeError",
+                extra={"event": "json_fixer.initial_parse_failed"},
+                exc_info=True,
+            )
 
     # Finding #2 (HIGH): Python booleans -> JSON booleans, NaN/Infinity -> null.
     # Uses context-aware replacement to skip values inside JSON strings.
     # json-repair doesn't know Python's True/False/None — it treats None
     # as a string "None". Do this substitution before json-repair.
-    content = _replace_outside_strings(content, [
-        ("True", "true"),
-        ("False", "false"),
-        ("None", "null"),
-        ("NaN", "null"),
-        ("Infinity", "null"),
-        ("-Infinity", "null"),
-    ])
+    content = _replace_outside_strings(
+        content,
+        [
+            ("True", "true"),
+            ("False", "false"),
+            ("None", "null"),
+            ("NaN", "null"),
+            (
+                "-Infinity",
+                "null",
+            ),  # Must precede "Infinity" — \bInfinity\b matches inside -Infinity
+            ("Infinity", "null"),
+        ],
+    )
     if content != original:
         result.fixes_applied.append("Python bools/None/NaN -> JSON")
 
@@ -101,7 +121,7 @@ def fix_json(content: str) -> FixResult:
             logger.debug(
                 "JSON fixes applied (bool/None/NaN conversion)",
                 extra={
-                    "event": "fixer_applied",
+                    "event": "json_fixer.fixer_applied",
                     "fixer": "fix_json",
                     "file": _current_filename.get(),
                     "fix_description": ", ".join(result.fixes_applied),
@@ -109,7 +129,11 @@ def fix_json(content: str) -> FixResult:
             )
         return result
     except json.JSONDecodeError:
-        pass
+        logger.warning(
+            "fix_json: json.JSONDecodeError",
+            extra={"event": "json_fixer.post_bool_fix_failed"},
+            exc_info=True,
+        )
 
     # v2: Try json-repair library (handles nested brackets, NaN, etc.)
     if _json_repair is not None:
@@ -128,7 +152,7 @@ def fix_json(content: str) -> FixResult:
                     logger.debug(
                         "JSON fixed by json-repair library",
                         extra={
-                            "event": "fixer_applied",
+                            "event": "json_fixer.fixer_applied",
                             "fixer": "fix_json",
                             "file": _current_filename.get(),
                             "fix_description": "json-repair: fixed malformed JSON",
@@ -136,18 +160,26 @@ def fix_json(content: str) -> FixResult:
                     )
                     return result
                 except json.JSONDecodeError:
-                    pass  # json-repair output still invalid — fall through to regex
-        except Exception as exc:
+                    logger.warning(
+                        "fix_json: json.JSONDecodeError",
+                        extra={"event": "json_fixer.post_repair_failed"},
+                        exc_info=True,
+                    )
+                    # json-repair output still invalid — fall through to regex
+        except (
+            Exception
+        ) as exc:  # catch-all: untrusted input parsing (json-repair library)
             # Finding #36: log instead of silently swallowing
             logger.warning(
                 "json-repair library crashed, falling through to regex",
                 extra={
-                    "event": "validation_rejected",
+                    "event": "json.repair_crashed",
                     "fixer": "fix_json",
                     "file": _current_filename.get(),
                     "validator": "json_repair",
                     "error_summary": str(exc),
                 },
+                exc_info=True,
             )
 
     # Regex fallback (v1 approach) — Python bools already handled above.
@@ -162,7 +194,12 @@ def fix_json(content: str) -> FixResult:
             content = candidate
             result.fixes_applied.append("Single quotes -> double quotes")
         except json.JSONDecodeError:
-            pass  # replacement produced invalid JSON — skip
+            logger.warning(
+                "fix_json: json.JSONDecodeError",
+                extra={"event": "json_fixer.single_quote_failed"},
+                exc_info=True,
+            )
+            # replacement produced invalid JSON — skip
 
     # Trailing commas before } or ]
     before_comma = content
@@ -174,6 +211,11 @@ def fix_json(content: str) -> FixResult:
     try:
         json.loads(content)
     except json.JSONDecodeError as e:
+        logger.warning(
+            "fix_json: json.JSONDecodeError",
+            extra={"event": "json_fixer.final_validation_failed", "error": str(e)},
+            exc_info=True,
+        )
         result.errors_found.append(f"JSONDecodeError after repair: {e}")
 
     result.content = content
@@ -183,7 +225,7 @@ def fix_json(content: str) -> FixResult:
         logger.debug(
             "JSON fixes applied (regex fallback)",
             extra={
-                "event": "fixer_applied",
+                "event": "json_fixer.fixer_applied",
                 "fixer": "fix_json",
                 "file": _current_filename.get(),
                 "fix_description": ", ".join(result.fixes_applied),

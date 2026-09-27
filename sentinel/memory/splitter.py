@@ -4,7 +4,11 @@ Splits text on paragraph → sentence → word boundaries with configurable
 overlap. Target ~380 words per chunk (≈512 tokens at ~1.35 words/token).
 """
 
+import logging
 import re
+
+logger = logging.getLogger(__name__)
+
 
 # Sentence-ending punctuation followed by whitespace
 _SENTENCE_BOUNDARY = re.compile(r"(?<=[.!?])\s+")
@@ -25,6 +29,15 @@ def split_text(
 
     Returns list of chunk strings. Empty/whitespace-only text returns [].
     """
+    logger.debug(
+        "split_text called",
+        extra={
+            "event": "splitter.split_text",
+            "text_len": len(text) if hasattr(text, "__len__") else 0,
+            "target_words": target_words,
+            "overlap_words": overlap_words,
+        },
+    )
     text = text.strip()
     if not text:
         return []
@@ -75,7 +88,19 @@ def _merge_segments(
     overlap_words: int,
 ) -> list[str]:
     """Merge small segments into chunks, adding overlap between chunks."""
+    logger.debug(
+        "_merge_segments called",
+        extra={
+            "event": "splitter._merge_segments",
+            "segments_len": len(segments) if hasattr(segments, "__len__") else 0,
+            "target_words": target_words,
+            "overlap_words": overlap_words,
+        },
+    )
     if not segments:
+        logger.debug(
+            "_merge_segments: match", extra={"event": "splitter._merge_segments.match"}
+        )
         return []
 
     chunks: list[str] = []
@@ -86,17 +111,32 @@ def _merge_segments(
 
         # If adding this segment exceeds target, flush current chunk
         if current_words and len(current_words) + len(seg_words) > target_words:
+            logger.debug(
+                "_merge_segments: match",
+                extra={"event": "splitter._merge_segments.match"},
+            )
             chunks.append(" ".join(current_words))
             # Overlap: carry last N words into next chunk
             if overlap_words > 0 and len(current_words) > overlap_words:
+                logger.debug(
+                    "_merge_segments: match",
+                    extra={"event": "splitter._merge_segments.match"},
+                )
                 current_words = current_words[-overlap_words:]
             else:
+                logger.debug(
+                    "_merge_segments: clean",
+                    extra={"event": "splitter._merge_segments.clean"},
+                )
                 current_words = []
 
         current_words.extend(seg_words)
 
     # Flush remaining words
     if current_words:
+        logger.debug(
+            "_merge_segments: match", extra={"event": "splitter._merge_segments.match"}
+        )
         chunks.append(" ".join(current_words))
 
     return chunks

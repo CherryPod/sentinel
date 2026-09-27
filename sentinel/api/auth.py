@@ -1,16 +1,17 @@
+"""PIN authentication and failure tracking for Sentinel API.
+
+PinVerifier — PBKDF2-HMAC-SHA256 PIN hashing with constant-time comparison.
+_FailureTracker — per-IP failed attempt tracking with lockout.
+"""
+
 import hashlib
 import hmac
 import logging
 import os
 import threading
 import time
-from collections.abc import Callable
 
-from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.requests import Request
-from starlette.responses import JSONResponse
-
-logger = logging.getLogger("sentinel.audit")
+logger = logging.getLogger(__name__)
 
 # PBKDF2 settings for PIN hashing (H-002)
 _PBKDF2_ITERATIONS = 600_000
@@ -29,13 +30,19 @@ class PinVerifier:
     def __init__(self, pin: str):
         self._salt = os.urandom(_SALT_LENGTH)
         self._hash = hashlib.pbkdf2_hmac(
-            _PBKDF2_HASH, pin.encode("utf-8"), self._salt, _PBKDF2_ITERATIONS,
+            _PBKDF2_HASH,
+            pin.encode("utf-8"),
+            self._salt,
+            _PBKDF2_ITERATIONS,
         )
 
     def verify(self, supplied: str) -> bool:
         """Verify a supplied PIN against the stored hash (constant-time)."""
         supplied_hash = hashlib.pbkdf2_hmac(
-            _PBKDF2_HASH, supplied.encode("utf-8"), self._salt, _PBKDF2_ITERATIONS,
+            _PBKDF2_HASH,
+            supplied.encode("utf-8"),
+            self._salt,
+            _PBKDF2_ITERATIONS,
         )
         return hmac.compare_digest(supplied_hash, self._hash)
 
@@ -43,30 +50,64 @@ class PinVerifier:
         """Serialise hash+salt for DB storage. Format: hex(salt):hex(hash)"""
         return self._salt.hex() + ":" + self._hash.hex()
 
+    # Fixed salt for dummy verification — ensures user-not-found takes the same
+    # wall-clock time as user-found, preventing timing side-channel leaks.
+    _DUMMY_SALT = b"\x00" * _SALT_LENGTH
+    _DUMMY_HASH = b"\x00" * 32
+
+    @classmethod
+    def dummy_verify(cls, supplied: str) -> None:
+        """Run a PBKDF2 computation that takes the same time as a real verify.
+
+        Call this on the user-not-found path to prevent timing side-channels
+        from revealing whether a username exists.
+        """
+        dummy_hash = hashlib.pbkdf2_hmac(
+            _PBKDF2_HASH,
+            supplied.encode("utf-8"),
+            cls._DUMMY_SALT,
+            _PBKDF2_ITERATIONS,
+        )
+        # Constant-time compare against dummy to match real verify's code path
+        hmac.compare_digest(dummy_hash, cls._DUMMY_HASH)
+
     @classmethod
     def from_stored(cls, stored: str) -> "PinVerifier":
         """Reconstruct from DB-stored format (hex(salt):hex(hash))."""
+        logger.debug(
+            "from_stored called",
+            extra={"event": "auth.from_stored", "stored_length": len(stored)},
+        )
         salt_hex, hash_hex = stored.split(":", 1)
         obj = object.__new__(cls)
         obj._salt = bytes.fromhex(salt_hex)
         obj._hash = bytes.fromhex(hash_hex)
         return obj
 
-# Lockout settings
-_MAX_FAILED_ATTEMPTS = 5
-_LOCKOUT_SECONDS = 60
-
 
 class _FailureTracker:
-    """Thread-safe per-IP failed PIN attempt tracker with lockout."""
+    """Thread-safe per-IP failed PIN attempt tracker with lockout.
+
+    Thresholds are configurable via constructor args. The module-level
+    singleton (created by create_failure_tracker()) reads them from
+    Settings so they can be set via SENTINEL_LOGIN_MAX_FAILED_ATTEMPTS
+    and SENTINEL_LOGIN_LOCKOUT_SECONDS environment variables.
+    """
 
     _PRUNE_INTERVAL = 100  # Prune stale entries every N lookups
 
-    def __init__(self):
+    def __init__(self, *, max_attempts: int = 5, lockout_seconds: int = 60):
+        self._max_attempts = max_attempts
+        self._lockout_seconds = lockout_seconds
         self._lock = threading.Lock()
         # {ip: (fail_count, last_fail_time)}
         self._attempts: dict[str, tuple[int, float]] = {}
         self._lookup_count = 0
+
+    @property
+    def lockout_seconds(self) -> int:
+        """Total lockout duration in seconds."""
+        return self._lockout_seconds
 
     def _prune_stale(self) -> None:
         """Remove entries older than lockout window. Called under lock."""
@@ -74,10 +115,11 @@ class _FailureTracker:
         self._attempts = {
             ip: (count, ts)
             for ip, (count, ts) in self._attempts.items()
-            if now - ts < _LOCKOUT_SECONDS * 2
+            if now - ts < self._lockout_seconds * 2
         }
 
     def is_locked_out(self, ip: str) -> bool:
+        """Check if an IP is currently locked out due to repeated failures."""
         with self._lock:
             self._lookup_count += 1
             if self._lookup_count >= self._PRUNE_INTERVAL:
@@ -88,15 +130,22 @@ class _FailureTracker:
             if record is None:
                 return False
             count, last_fail = record
-            if count >= _MAX_FAILED_ATTEMPTS:
-                if time.monotonic() - last_fail < _LOCKOUT_SECONDS:
+            if count >= self._max_attempts:
+                if time.monotonic() - last_fail < self._lockout_seconds:
                     return True
                 # Lockout expired — reset
                 del self._attempts[ip]
                 return False
             return False
 
+    def get_failure_count(self, ip: str) -> int:
+        """Return current failure count for *ip*, or 0 if no record."""
+        with self._lock:
+            record = self._attempts.get(ip)
+            return record[0] if record is not None else 0
+
     def record_failure(self, ip: str) -> int:
+        """Record a failed login attempt. Returns the new failure count."""
         with self._lock:
             record = self._attempts.get(ip)
             now = time.monotonic()
@@ -105,99 +154,23 @@ class _FailureTracker:
                 return 1
             count, last_fail = record
             # Reset if lockout period has passed
-            if count >= _MAX_FAILED_ATTEMPTS and now - last_fail >= _LOCKOUT_SECONDS:
+            if count >= self._max_attempts and now - last_fail >= self._lockout_seconds:
                 self._attempts[ip] = (1, now)
                 return 1
             self._attempts[ip] = (count + 1, now)
             return count + 1
 
     def clear(self, ip: str) -> None:
+        """Clear failure count for an IP (called on successful login)."""
         with self._lock:
             self._attempts.pop(ip, None)
 
 
-class PinAuthMiddleware(BaseHTTPMiddleware):
-    """PIN authentication via X-Sentinel-Pin header.
+def create_failure_tracker() -> _FailureTracker:
+    """Create a _FailureTracker using thresholds from application settings."""
+    from sentinel.core.config import settings
 
-    Uses PinVerifier (PBKDF2 hash) so the plaintext PIN is never held in
-    memory beyond startup. Constant-time comparison prevents timing attacks,
-    and per-IP lockout throttles brute force.
-    """
-
-    def __init__(self, app, pin_verifier_getter: Callable[[], PinVerifier | None]):
-        super().__init__(app)
-        self._pin_verifier_getter = pin_verifier_getter
-        self._failures = _FailureTracker()
-
-    async def dispatch(self, request: Request, call_next):
-        verifier = self._pin_verifier_getter()
-        remote = request.client.host if request.client else "unknown"
-
-        # PIN disabled (None) — pass through
-        if verifier is None:
-            return await call_next(request)
-
-        # Health, WebSocket, MCP, and static UI assets are exempt.
-        # Static assets must load without PIN so the JS can show the PIN overlay.
-        # API endpoints enforce PIN separately via X-Sentinel-Pin header.
-        # MCP exempt by design — intended for local Claude Code / tool integration
-        # (streamable HTTP on localhost). If exposed on 0.0.0.0, add MCP-specific auth.
-        path = request.url.path
-        _EXEMPT_PATHS = ("/health", "/api/health", "/ws", "/.well-known/agent.json", "/api/auth/login")
-        _EXEMPT_EXTENSIONS = (".html", ".js", ".css", ".png", ".ico", ".svg", ".woff", ".woff2")
-        if (
-            path in _EXEMPT_PATHS
-            or path.startswith("/mcp")
-            or path.startswith("/sites")
-            or path == "/"
-            or any(path.endswith(ext) for ext in _EXEMPT_EXTENSIONS)
-        ):
-            return await call_next(request)
-
-        # Check lockout before doing any comparison
-        if self._failures.is_locked_out(remote):
-            logger.warning(
-                "PIN auth locked out",
-                extra={
-                    "event": "pin_auth_lockout",
-                    "path": request.url.path,
-                    "remote": remote,
-                },
-            )
-            return JSONResponse(
-                status_code=429,
-                content={"detail": "Too many failed attempts — try again later"},
-            )
-
-        supplied = request.headers.get("x-sentinel-pin", "")
-        if not verifier.verify(supplied):
-            fail_count = self._failures.record_failure(remote)
-            logger.warning(
-                "PIN auth failed",
-                extra={
-                    "event": "pin_auth_failed",
-                    "path": request.url.path,
-                    "method": request.method,
-                    "remote": remote,
-                    "pin_supplied": bool(supplied),
-                    "fail_count": fail_count,
-                    "locked_out": fail_count >= _MAX_FAILED_ATTEMPTS,
-                },
-            )
-            return JSONResponse(
-                status_code=401,
-                content={"detail": "Invalid or missing PIN"},
-            )
-
-        # Successful auth — clear any failure record
-        self._failures.clear(remote)
-        logger.debug(
-            "PIN auth passed",
-            extra={
-                "event": "pin_auth_success",
-                "path": request.url.path,
-                "method": request.method,
-                "remote": remote,
-            },
-        )
-        return await call_next(request)
+    return _FailureTracker(
+        max_attempts=settings.login_max_failed_attempts,
+        lockout_seconds=settings.login_lockout_seconds,
+    )

@@ -1,0 +1,126 @@
+/* Login page styles — extracted from login.html <style> block */
+
+/* Intentional override: reset.css sets body to flex row;
+   login needs centred layout for the card */
+body {
+    align-items: center;
+    justify-content: center;
+}
+
+.login-card {
+    position: relative;
+    overflow: hidden;
+    background: var(--bg-card);
+    border: 1px solid var(--border-card);
+    border-radius: var(--radius-2xl);
+    padding: var(--space-10) var(--space-8);
+    text-align: center;
+    min-width: 320px;
+    max-width: 400px;
+    box-shadow: var(--shadow-md);
+}
+
+.login-card::before {
+    content: '';
+    position: absolute;
+    top: 0;
+    right: 0;
+    left: 0;
+    height: 4px;
+    background: linear-gradient(90deg, var(--accent), var(--rose));
+}
+
+.login-cherry {
+    display: flex;
+    justify-content: center;
+    color: var(--color-brand-mark);
+    margin-bottom: var(--space-3);
+}
+
+.login-brand {
+    font-size: var(--text-base);
+    font-weight: 700;
+    color: var(--accent);
+    margin-bottom: var(--space-2);
+}
+
+.login-title {
+    font-size: var(--text-3xl);
+    font-weight: 600;
+    margin-bottom: var(--space-1);
+    color: var(--text-primary);
+}
+
+.login-subtitle {
+    font-size: var(--text-base);
+    color: var(--text-secondary);
+    margin-bottom: var(--space-7);
+}
+
+.login-field {
+    display: block;
+    width: 100%;
+    padding: var(--space-3) var(--space-4);
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    color: var(--text-primary);
+    font-family: inherit;
+    font-size: var(--text-md);
+    outline: none;
+    margin-bottom: var(--space-4);
+    transition: border-color var(--duration-normal), box-shadow var(--duration-normal);
+}
+
+.login-field::placeholder {
+    color: var(--text-muted);
+}
+
+.login-field:focus {
+    border-color: var(--accent);
+    box-shadow: var(--shadow-focus);
+}
+
+.login-field-pin {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: var(--text-xl);
+    text-align: center;
+    letter-spacing: 6px;
+}
+
+.login-btn {
+    display: block;
+    width: 100%;
+    padding: var(--space-3);
+    margin-top: var(--space-2);
+    background: var(--accent);
+    color: #FFF;
+    border: none;
+    border-radius: var(--radius-lg);
+    font-family: inherit;
+    font-size: var(--text-md);
+    font-weight: 600;
+    cursor: pointer;
+    transition: background-color var(--duration-fast);
+}
+
+.login-btn:hover {
+    background: var(--accent-bold);
+}
+
+.login-btn:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+}
+
+.login-btn:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+}
+
+.login-error {
+    color: var(--red);
+    font-size: var(--text-base);
+    margin-top: var(--space-4);
+    min-height: var(--error-min-height);
+}

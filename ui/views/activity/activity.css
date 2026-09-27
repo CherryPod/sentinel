@@ -1,0 +1,40 @@
+/* ── Activity View — friendly user-meaningful timeline ──────── */
+
+.activity-content {
+    padding-bottom: var(--space-8);
+}
+
+.activity-list {
+    max-width: 720px;
+}
+
+.activity-row {
+    display: flex;
+    align-items: baseline;
+    gap: var(--space-3);
+    padding: var(--space-3) var(--space-4);
+    background: var(--bg-card);
+    border: 1px solid var(--border-card);
+    border-radius: var(--radius-lg);
+    margin-bottom: var(--space-2);
+    font-size: var(--text-base);
+}
+
+.activity-icon { flex-shrink: 0; }
+
+.activity-text {
+    flex: 1;
+    color: var(--text-primary);
+}
+
+.activity-time {
+    flex-shrink: 0;
+    font-size: var(--text-sm);
+    color: var(--text-muted);
+}
+
+.activity-row.stop { border-left: 3px solid var(--orange); }
+.activity-row.error { border-left: 3px solid var(--red); }
+.activity-row.done { border-left: 3px solid var(--green); }
+.activity-row.routine { border-left: 3px solid var(--peri); }
+.activity-row.ask { border-left: 3px solid var(--rose); }

@@ -13,8 +13,11 @@ use that rather than constructing their own instance.
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
+
+logger = logging.getLogger(__name__)
 
 
 class RevocationSet:
@@ -40,14 +43,34 @@ class RevocationSet:
         wall-clock time. Using iat means cleanup() will drop the entry at the
         same point the token would have expired naturally.
         """
-        timestamp = time.time()
+        timestamp = issued_at if issued_at is not None else time.time()
         with self._lock:
             self._revoked[jti] = timestamp
+        logger.debug(
+            "Token revoked", extra={"event": "revocation.revoke", "jti_prefix": jti[:8]}
+        )
 
     def is_revoked(self, jti: str) -> bool:
         """Return True if the JTI has been revoked."""
         with self._lock:
-            return jti in self._revoked
+            revoked = jti in self._revoked
+        if revoked:
+            logger.debug(
+                "Revoked token rejected",
+                extra={
+                    "event": "revocation.rejected",
+                    "jti_prefix": jti[:8],
+                },
+            )
+        else:
+            logger.debug(
+                "Token not revoked",
+                extra={
+                    "event": "revocation.accepted",
+                    "jti_prefix": jti[:8],
+                },
+            )
+        return revoked
 
     def revoke_all_for_user(
         self, jtis: list[str], issued_at: float | None = None
@@ -57,10 +80,17 @@ class RevocationSet:
         issued_at applies to every entry in the batch. Falls back to the
         current wall-clock time if not provided.
         """
-        timestamp = time.time()
+        timestamp = issued_at if issued_at is not None else time.time()
         with self._lock:
             for jti in jtis:
                 self._revoked[jti] = timestamp
+        logger.info(
+            "Batch token revocation",
+            extra={
+                "event": "revocation.revoke_all",
+                "jti_count": len(jtis),
+            },
+        )
 
     def cleanup(self) -> None:
         """Remove entries that are older than ttl_seconds.
@@ -74,6 +104,14 @@ class RevocationSet:
             stale = [jti for jti, ts in self._revoked.items() if ts < cutoff]
             for jti in stale:
                 del self._revoked[jti]
+        logger.debug(
+            "Revocation cleanup",
+            extra={
+                "event": "revocation.cleanup",
+                "pruned": len(stale),
+                "remaining": len(self),
+            },
+        )
 
     def __len__(self) -> int:
         """Return the number of currently tracked revoked JTIs."""

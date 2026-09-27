@@ -20,12 +20,13 @@ ProvenanceStore.record().
 from __future__ import annotations
 
 import logging
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
 
 from sentinel.core.context import current_user_id
 
-logger = logging.getLogger("sentinel.core.rls")
+logger = logging.getLogger(__name__)
 
 
 class RLSPool:
@@ -44,7 +45,7 @@ class RLSPool:
         self._pool = pool
 
     @asynccontextmanager
-    async def acquire(self):
+    async def acquire(self) -> AsyncIterator[Any]:
         """Acquire a connection with RLS context set."""
         async with self._pool.acquire() as conn:
             uid = current_user_id.get()
@@ -61,7 +62,7 @@ class RLSPool:
                 await tr.rollback()
                 raise
 
-    async def close(self):
+    async def close(self) -> None:
         """Close the underlying pool."""
         await self._pool.close()
 

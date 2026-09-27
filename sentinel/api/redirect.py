@@ -4,7 +4,11 @@ Runs as a second uvicorn server on the HTTP port during lifespan startup.
 Only started when TLS is enabled (tls_cert_file is set) and redirect_enabled is True.
 """
 
+import logging
+
 from sentinel.core.config import settings
+
+logger = logging.getLogger(__name__)
 
 
 class HTTPSRedirectApp:
@@ -20,7 +24,7 @@ class HTTPSRedirectApp:
         # Strip any existing port from the host (handle IPv6 like [::1]:8080)
         if host_header.startswith("["):
             bracket_end = host_header.find("]")
-            host = host_header[:bracket_end + 1] if bracket_end != -1 else host_header
+            host = host_header[: bracket_end + 1] if bracket_end != -1 else host_header
         else:
             host = host_header.split(":")[0]
         path = scope.get("path", "/")
@@ -30,15 +34,19 @@ class HTTPSRedirectApp:
         if query:
             location += f"?{query.decode()}"
 
-        await send({
-            "type": "http.response.start",
-            "status": 301,
-            "headers": [
-                [b"location", location.encode()],
-                [b"content-type", b"text/plain"],
-            ],
-        })
-        await send({
-            "type": "http.response.body",
-            "body": b"Redirecting to HTTPS...\n",
-        })
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 301,
+                "headers": [
+                    [b"location", location.encode()],
+                    [b"content-type", b"text/plain"],
+                ],
+            }
+        )
+        await send(
+            {
+                "type": "http.response.body",
+                "body": b"Redirecting to HTTPS...\n",
+            }
+        )

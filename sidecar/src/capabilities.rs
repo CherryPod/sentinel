@@ -77,6 +77,7 @@ impl CapabilitySet {
     }
 
     /// Check that all required capabilities are granted.
+    #[allow(dead_code)] // API completeness — used in tests, available for callers
     pub fn requires_all(&self, required: &[Capability]) -> bool {
         required.iter().all(|cap| self.has(cap))
     }

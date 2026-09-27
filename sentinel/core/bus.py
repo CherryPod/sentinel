@@ -7,16 +7,17 @@ Topics use dotted namespaces with glob-style wildcards:
   - "task.*"            — matches any single segment after "task."
   - "approval.*"        — matches "approval.requested", "approval.decided", etc.
 
-Supported topic prefixes: task, approval, session, channel, routine, memory.
+Supported topic prefixes: task, approval, session, channel, routine, memory, loop.
 """
 
 import asyncio
 import fnmatch
 import logging
 from collections import defaultdict
-from typing import Any, Callable, Coroutine
+from collections.abc import Callable, Coroutine
+from typing import Any
 
-logger = logging.getLogger("sentinel.audit")
+logger = logging.getLogger(__name__)
 
 # Type alias for async event handlers
 EventHandler = Callable[[str, Any], Coroutine[Any, Any, None]]
@@ -26,7 +27,10 @@ class EventBus:
     """Async pub/sub event bus with wildcard topic matching."""
 
     def __init__(self) -> None:
-        # pattern → list of handlers
+        # ASYNCIO SAFETY: _subscribers is mutated by sync methods (subscribe/unsubscribe)
+        # which cannot be interleaved by the event loop. publish() takes a snapshot via
+        # list(self._subscribers.items()) before iterating, so handler-triggered
+        # unsubscribes don't corrupt the iteration. No lock needed in single-threaded loop.
         self._subscribers: dict[str, list[EventHandler]] = defaultdict(list)
 
     def subscribe(self, pattern: str, handler: EventHandler) -> None:
@@ -40,7 +44,7 @@ class EventBus:
             self._subscribers[pattern].append(handler)
             logger.debug(
                 "Event bus subscription",
-                extra={"event": "bus_subscribe", "pattern": pattern},
+                extra={"event": "bus.subscribe", "pattern": pattern},
             )
 
     def unsubscribe(self, pattern: str, handler: EventHandler) -> None:
@@ -55,7 +59,7 @@ class EventBus:
             handlers.remove(handler)
             logger.debug(
                 "Event bus unsubscription",
-                extra={"event": "bus_unsubscribe", "pattern": pattern},
+                extra={"event": "bus.unsubscribe", "pattern": pattern},
             )
             if not handlers:
                 del self._subscribers[pattern]
@@ -78,8 +82,12 @@ class EventBus:
                 matching_handlers.extend(handlers)
 
         logger.info(
-            "bus_publish",
-            extra={"event": "bus_publish", "topic": topic, "subscriber_count": len(matching_handlers), "patterns": list(self._subscribers.keys())},
+            "Event published",
+            extra={
+                "event": "bus.publish",
+                "topic": topic,
+                "subscriber_count": len(matching_handlers),
+            },
         )
 
         if not matching_handlers:
@@ -90,13 +98,13 @@ class EventBus:
             return_exceptions=True,
         )
 
-        for i, result in enumerate(results):
+        for _, result in enumerate(results):
             if isinstance(result, Exception):
                 logger.error(
                     "Event handler error",
                     exc_info=result,
                     extra={
-                        "event": "bus_handler_error",
+                        "event": "bus.handler_error",
                         "topic": topic,
                         "error": str(result),
                     },

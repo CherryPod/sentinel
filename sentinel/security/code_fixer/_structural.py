@@ -14,10 +14,11 @@ JSON via json.loads, YAML via yaml.safe_load, TOML via tomllib.loads, JS/CSS
 via truncation detection), we check for existing errors in errors_found.
 For HTML and Shell, we add new validation.
 """
+
 import logging
 import re
 
-from ._core import CharContext, FixResult, _current_filename, _iter_code_chars
+from ._core import CharContext, _current_filename, _iter_code_chars
 
 logger = logging.getLogger(__name__)
 
@@ -25,12 +26,12 @@ INTEGRITY_FLAG = "structural_integrity_failure"
 
 # Error patterns from existing fixers/detectors that indicate structural failure
 _STRUCTURAL_ERROR_PATTERNS = (
-    "SyntaxError:",           # Python ast.parse
-    "JSONDecodeError",        # JSON json.loads
-    "YAMLError:",             # YAML yaml.safe_load
-    "TOMLDecodeError:",       # TOML tomllib.loads
-    "File appears truncated", # JS/CSS truncation detector
-    "unclosed block comment", # JS/CSS truncation detector
+    "SyntaxError:",  # Python ast.parse
+    "JSONDecodeError",  # JSON json.loads
+    "YAMLError:",  # YAML yaml.safe_load
+    "TOMLDecodeError:",  # TOML tomllib.loads
+    "File appears truncated",  # JS/CSS truncation detector
+    "unclosed block comment",  # JS/CSS truncation detector
 )
 
 
@@ -41,6 +42,13 @@ def _check_shell_balance(content: str) -> str | None:
     catches cases where 2+ are missing (unfixable by the fixer).
     Returns an error message or None if balanced.
     """
+    logger.debug(
+        "Checking shell keyword balance",
+        extra={
+            "event": "structural.shell_balance_check",
+            "content_len": len(content) if content else 0,
+        },
+    )
     has_heredoc = "<<" in content
     if has_heredoc:
         # Heredoc content can contain keywords — skip balance check
@@ -76,13 +84,41 @@ def _check_shell_balance(content: str) -> str | None:
 
     issues = []
     if if_count > fi_count:
+        logger.debug(
+            "_check_shell_balance: if_count_gt_fi_count",
+            extra={
+                "event": "_structural._check_shell_balance.match",
+                "reason": "if_count_gt_fi_count",
+            },
+        )  # auto:neg
         issues.append(f"{if_count - fi_count} unclosed if block(s)")
     if for_while_count > done_count:
+        logger.debug(
+            "_check_shell_balance: for_while_count_gt_done_count",
+            extra={
+                "event": "_structural._check_shell_balance.match",
+                "reason": "for_while_count_gt_done_count",
+            },
+        )  # auto:neg
         issues.append(f"{for_while_count - done_count} unclosed for/while loop(s)")
     if case_count > esac_count:
+        logger.debug(
+            "_check_shell_balance: case_count_gt_esac_count",
+            extra={
+                "event": "_structural._check_shell_balance.match",
+                "reason": "case_count_gt_esac_count",
+            },
+        )  # auto:neg
         issues.append(f"{case_count - esac_count} unclosed case block(s)")
 
     if issues:
+        logger.debug(
+            "_check_shell_balance: issues",
+            extra={
+                "event": "_structural._check_shell_balance.match",
+                "reason": "issues",
+            },
+        )  # auto:neg
         return "Shell keyword imbalance: " + ", ".join(issues)
     return None
 
@@ -95,15 +131,22 @@ def _check_html_structure(content: str) -> str | None:
     try:
         from bs4 import BeautifulSoup
     except ImportError:
-        logger.debug(
-            "structural: BeautifulSoup not available, skipping HTML check",
-            extra={"event": "structural_bs4_missing"},
+        logger.warning(
+            "BeautifulSoup not available, skipping HTML structural check",
+            extra={"event": "structural.bs4_import_error"},
+            exc_info=True,
         )
         return None
 
     try:
         soup = BeautifulSoup(content, "html.parser")
-    except Exception as exc:
+    except (
+        Exception
+    ) as exc:  # catch-all: untrusted input parsing (BeautifulSoup on malformed HTML)
+        logger.exception(
+            "_check_html_structure: Exception",
+            extra={"event": "_structural._check_html_structure_error"},
+        )  # auto:except
         return f"HTML parse error: {exc}"
 
     # Check if BeautifulSoup found any tags at all — if not, this isn't HTML
@@ -130,6 +173,17 @@ def check_structural_integrity(
         existing_errors: Errors already found by fixers/detectors.
     """
     fname = _current_filename.get()
+
+    logger.debug(
+        "Structural integrity check starting",
+        extra={
+            "event": "structural.integrity_check",
+            "file": fname,
+            "ext": ext,
+            "existing_error_count": len(existing_errors),
+        },
+    )
+
     new_errors: list[str] = []
 
     # Check if existing fixer/detector errors indicate structural failure
@@ -141,14 +195,15 @@ def check_structural_integrity(
     if has_structural_error:
         # Find the first matching error for the log message
         triggering_error = next(
-            err for err in existing_errors
+            err
+            for err in existing_errors
             if any(p in err for p in _STRUCTURAL_ERROR_PATTERNS)
         )
         new_errors.append(f"{INTEGRITY_FLAG}: {triggering_error}")
         logger.warning(
             "Structural integrity check failed (existing error)",
             extra={
-                "event": "structural_integrity_check_failed",
+                "event": "structural.integrity_failed",
                 "file": fname,
                 "ext": ext,
                 "trigger": triggering_error,
@@ -173,7 +228,7 @@ def check_structural_integrity(
         logger.warning(
             "Structural integrity check failed",
             extra={
-                "event": "structural_integrity_check_failed",
+                "event": "structural.integrity_failed",
                 "file": fname,
                 "ext": ext,
                 "language_check": check_error,
@@ -183,7 +238,7 @@ def check_structural_integrity(
         logger.debug(
             "Structural integrity check passed",
             extra={
-                "event": "structural_integrity_check_passed",
+                "event": "structural.integrity_passed",
                 "file": fname,
                 "ext": ext,
             },

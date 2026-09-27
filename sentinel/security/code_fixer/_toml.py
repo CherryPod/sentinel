@@ -2,6 +2,7 @@
 
 No common deterministic fixes for TOML — just detection and reporting.
 """
+
 import logging
 import tomllib
 
@@ -9,10 +10,10 @@ from ._core import FixResult, _current_filename
 
 logger = logging.getLogger(__name__)
 
-
 # ---------------------------------------------------------------------------
 # Layer 3: TOML validation
 # ---------------------------------------------------------------------------
+
 
 def fix_toml(content: str) -> FixResult:
     """Validate TOML. No common deterministic fixes — just detection."""
@@ -24,7 +25,7 @@ def fix_toml(content: str) -> FixResult:
         logger.debug(
             "TOML validation error detected",
             extra={
-                "event": "validation_rejected",
+                "event": "toml.validation_rejected",
                 "fixer": "fix_toml",
                 "file": _current_filename.get(),
                 "error_summary": str(e),

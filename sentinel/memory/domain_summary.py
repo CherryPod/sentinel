@@ -14,14 +14,14 @@ import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-from sentinel.core.context import current_user_id
+from sentinel.core.context import require_user_id
 from sentinel.memory.episodic import _categorise_strategy
 
 if TYPE_CHECKING:
     from sentinel.memory.episodic import EpisodicStore
     from sentinel.memory.strategy_store import StrategyPatternStore
 
-logger = logging.getLogger("sentinel.audit")
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -40,6 +40,13 @@ class DomainSummary:
 
 def _row_to_summary(row: Any) -> DomainSummary:
     """Convert an asyncpg Record to a DomainSummary dataclass."""
+    logger.debug(
+        "_row_to_summary called",
+        extra={
+            "event": "domain_summary.row_to_summary",
+            "row_type": type(row).__name__,
+        },
+    )
     patterns = row["patterns_json"]
     if isinstance(patterns, str):
         patterns = json.loads(patterns)
@@ -54,7 +61,7 @@ def _row_to_summary(row: Any) -> DomainSummary:
         total_tasks=row["total_tasks"],
         success_count=row["success_count"],
         summary_text=row["summary_text"],
-        patterns_json=patterns if patterns else [],
+        patterns_json=patterns or [],
         last_task_count=row["last_task_count"],
         updated_at=str(updated),
     )
@@ -71,25 +78,30 @@ class DomainSummaryStore:
     def pool(self) -> Any:
         return self._pool
 
-    async def get(self, domain: str, user_id: int | None = None) -> DomainSummary | None:
+    async def get(
+        self, domain: str, user_id: int | None = None
+    ) -> DomainSummary | None:
         """Fetch a domain summary. Returns None if not found."""
-        resolved_uid = user_id if user_id is not None else current_user_id.get()
+        resolved_uid = require_user_id(user_id, "DomainSummaryStore.get")
 
         if self._pool is not None:
             async with self._pool.acquire() as conn:
+                logger.debug("get: db", extra={"event": "domain_summary.get.db"})
                 row = await conn.fetchrow(
-                    "SELECT * FROM domain_summaries "
-                    "WHERE domain = $1 AND user_id = $2",
-                    domain, resolved_uid,
+                    "SELECT * FROM domain_summaries WHERE domain = $1 AND user_id = $2",
+                    domain,
+                    resolved_uid,
                 )
                 return _row_to_summary(row) if row else None
         else:
+            logger.debug("get: clean", extra={"event": "domain_summary.get.db.clean"})
             return self._mem.get((domain, resolved_uid))
 
     async def upsert(self, summary: DomainSummary) -> None:
         """Insert or update a domain summary."""
         if self._pool is not None:
             async with self._pool.acquire() as conn:
+                logger.debug("upsert: db", extra={"event": "domain_summary.upsert.db"})
                 await conn.execute(
                     "INSERT INTO domain_summaries "
                     "(domain, user_id, total_tasks, success_count, "
@@ -99,18 +111,24 @@ class DomainSummaryStore:
                     "total_tasks = $3, success_count = $4, "
                     "summary_text = $5, patterns_json = $6::jsonb, "
                     "last_task_count = $7, updated_at = NOW()",
-                    summary.domain, summary.user_id,
-                    summary.total_tasks, summary.success_count,
-                    summary.summary_text, json.dumps(summary.patterns_json),
+                    summary.domain,
+                    summary.user_id,
+                    summary.total_tasks,
+                    summary.success_count,
+                    summary.summary_text,
+                    json.dumps(summary.patterns_json),
                     summary.last_task_count,
                 )
         else:
+            logger.debug(
+                "upsert: clean", extra={"event": "domain_summary.upsert.db.clean"}
+            )
             self._mem[(summary.domain, summary.user_id)] = summary
 
         logger.info(
             "Domain summary upserted",
             extra={
-                "event": "domain_summary_upsert",
+                "event": "domain_summary.upsert",
                 "domain": summary.domain,
                 "total_tasks": summary.total_tasks,
             },
@@ -118,10 +136,13 @@ class DomainSummaryStore:
 
     async def list_all(self, user_id: int | None = None) -> list[DomainSummary]:
         """List all domain summaries for a user."""
-        resolved_uid = user_id if user_id is not None else current_user_id.get()
+        resolved_uid = require_user_id(user_id, "DomainSummaryStore.list_all")
 
         if self._pool is not None:
             async with self._pool.acquire() as conn:
+                logger.debug(
+                    "list_all: db", extra={"event": "domain_summary.list_all.db"}
+                )
                 rows = await conn.fetch(
                     "SELECT * FROM domain_summaries "
                     "WHERE user_id = $1 ORDER BY total_tasks DESC",
@@ -129,71 +150,115 @@ class DomainSummaryStore:
                 )
                 return [_row_to_summary(row) for row in rows]
         else:
-            return [
-                s for (d, uid), s in self._mem.items()
-                if uid == resolved_uid
-            ]
+            logger.debug(
+                "list_all: clean", extra={"event": "domain_summary.list_all.db.clean"}
+            )
+            return [s for (d, uid), s in self._mem.items() if uid == resolved_uid]
 
     async def delete(self, domain: str, user_id: int | None = None) -> bool:
         """Delete a domain summary. Returns True if deleted."""
-        resolved_uid = user_id if user_id is not None else current_user_id.get()
+        resolved_uid = require_user_id(user_id, "DomainSummaryStore.delete")
 
         if self._pool is not None:
             async with self._pool.acquire() as conn:
+                logger.debug("delete: db", extra={"event": "domain_summary.delete.db"})
                 result = await conn.execute(
-                    "DELETE FROM domain_summaries "
-                    "WHERE domain = $1 AND user_id = $2",
-                    domain, resolved_uid,
+                    "DELETE FROM domain_summaries WHERE domain = $1 AND user_id = $2",
+                    domain,
+                    resolved_uid,
+                )
+                logger.debug(
+                    "delete: early return",
+                    extra={"event": "domain_summary.delete.early_return"},
                 )
                 return "DELETE 1" in result
         else:
             key = (domain, resolved_uid)
             if key in self._mem:
+                logger.debug(
+                    "delete: match", extra={"event": "domain_summary.delete.match"}
+                )
                 del self._mem[key]
                 return True
+            logger.debug(
+                "delete: early return",
+                extra={"event": "domain_summary.delete.early_return"},
+            )
             return False
 
     async def increment_task_count(
-        self, domain: str, user_id: int | None = None,
+        self,
+        domain: str,
+        user_id: int | None = None,
     ) -> int:
         """Increment last_task_count and return new value.
 
         Used to track tasks since last summary refresh. Returns the new
         count, or 0 if no summary exists for this domain yet.
         """
-        resolved_uid = user_id if user_id is not None else current_user_id.get()
+        resolved_uid = require_user_id(
+            user_id, "DomainSummaryStore.increment_task_count"
+        )
 
         if self._pool is not None:
             async with self._pool.acquire() as conn:
+                logger.debug(
+                    "increment_task_count: db",
+                    extra={"event": "domain_summary.increment_task_count.db"},
+                )
                 row = await conn.fetchrow(
                     "UPDATE domain_summaries "
                     "SET last_task_count = last_task_count + 1 "
                     "WHERE domain = $1 AND user_id = $2 "
                     "RETURNING last_task_count",
-                    domain, resolved_uid,
+                    domain,
+                    resolved_uid,
+                )
+                logger.debug(
+                    "increment_task_count: early return",
+                    extra={"event": "domain_summary.increment_task_count.early_return"},
                 )
                 return row["last_task_count"] if row else 0
         else:
             key = (domain, resolved_uid)
             if key in self._mem:
+                logger.debug(
+                    "increment_task_count: match",
+                    extra={"event": "domain_summary.increment_task_count.match"},
+                )
                 self._mem[key].last_task_count += 1
                 return self._mem[key].last_task_count
+            logger.debug(
+                "increment_task_count: early return",
+                extra={"event": "domain_summary.increment_task_count.early_return"},
+            )
             return 0
 
     async def reset_task_count(
-        self, domain: str, user_id: int | None = None,
+        self,
+        domain: str,
+        user_id: int | None = None,
     ) -> None:
         """Reset task count to 0 after a refresh has been triggered."""
-        resolved_uid = user_id if user_id is not None else current_user_id.get()
+        resolved_uid = require_user_id(user_id, "DomainSummaryStore.reset_task_count")
 
         if self._pool is not None:
             async with self._pool.acquire() as conn:
+                logger.debug(
+                    "reset_task_count: db",
+                    extra={"event": "domain_summary.reset_task_count.db"},
+                )
                 await conn.execute(
                     "UPDATE domain_summaries SET last_task_count = 0 "
                     "WHERE domain = $1 AND user_id = $2",
-                    domain, resolved_uid,
+                    domain,
+                    resolved_uid,
                 )
         else:
+            logger.debug(
+                "reset_task_count: clean",
+                extra={"event": "domain_summary.reset_task_count.db.clean"},
+            )
             key = (domain, resolved_uid)
             if key in self._mem:
                 self._mem[key].last_task_count = 0
@@ -224,8 +289,13 @@ async def _build_patterns(
                     }
                     for s in top
                 ]
-        except Exception:
-            pass  # graceful fallback to raw computation
+        except Exception:  # catch-all: pattern build best-effort
+            logger.warning(
+                "_build_patterns: Exception",
+                extra={"event": "domain_summary.build_patterns_error"},
+                exc_info=True,
+            )
+            # graceful fallback to raw computation
 
     # Fallback: re-compute from raw records
     strategy_stats: dict[str, dict] = {}
@@ -241,21 +311,25 @@ async def _build_patterns(
 
     patterns = []
     for strategy, stats in sorted(
-        strategy_stats.items(), key=lambda x: x[1]["total"], reverse=True,
+        strategy_stats.items(),
+        key=lambda x: x[1]["total"],
+        reverse=True,
     ):
         rate = stats["success"] / stats["total"] if stats["total"] > 0 else 0
-        patterns.append({
-            "strategy": strategy,
-            "count": stats["total"],
-            "success_rate": round(rate, 2),
-        })
+        patterns.append(
+            {
+                "strategy": strategy,
+                "count": stats["total"],
+                "success_rate": round(rate, 2),
+            }
+        )
     return patterns
 
 
 async def generate_domain_summary(
     domain: str,
     episodic_store: EpisodicStore,
-    user_id: int = 1,
+    user_id: int | None = None,
     strategy_store: StrategyPatternStore | None = None,
 ) -> DomainSummary:
     """Generate a domain summary from episodic records. Deterministic — no LLM.
@@ -267,6 +341,17 @@ async def generate_domain_summary(
     - Code fixer activation count
     - Common error patterns
     """
+    # Q4-F11: resolve via helper — None resolves from current_user_id; raises on 0.
+    user_id = require_user_id(user_id, "generate_domain_summary")
+    logger.debug(
+        "generate_domain_summary called",
+        extra={
+            "event": "domain_summary.generate",
+            "domain": domain,
+            "episodic_store_type": type(episodic_store).__name__,
+            "user_id": user_id,
+        },
+    )
     records = await episodic_store.list_by_domain(domain, user_id=user_id, limit=100)
 
     total = len(records)
@@ -286,7 +371,7 @@ async def generate_domain_summary(
                 break
 
         # Error patterns
-        for err in (record.error_patterns or []):
+        for err in record.error_patterns or []:
             key = err[:50]
             error_counts[key] = error_counts.get(key, 0) + 1
 

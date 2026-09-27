@@ -5,8 +5,12 @@ settings.  Keeps construction logic in one place so app.py lifespan
 doesn't need to know about concrete classes.
 """
 
+import logging
+
 from sentinel.core.config import Settings
 from sentinel.worker.base import EmbeddingBase, PlannerBase, WorkerBase
+
+logger = logging.getLogger(__name__)
 
 
 def create_worker(s: Settings) -> WorkerBase:
@@ -14,7 +18,9 @@ def create_worker(s: Settings) -> WorkerBase:
     if s.worker_provider == "ollama":
         from sentinel.worker.ollama import OllamaWorker
 
-        return OllamaWorker(base_url=s.ollama_url, timeout=s.ollama_timeout, model=s.ollama_model)
+        return OllamaWorker(
+            base_url=s.ollama_url, timeout=s.ollama_timeout, model=s.ollama_model
+        )
     raise ValueError(f"Unknown worker provider: {s.worker_provider}")
 
 

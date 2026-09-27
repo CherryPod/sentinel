@@ -57,7 +57,7 @@ pub fn host_call_dispatch(mut caller: Caller<'_, HostState>, op: i32, req_len: i
     // O-003: Validate req_len before casting to usize — negative i32 would wrap.
     // 1 MiB cap is an intentional safety bound for IO_BUFFER — matches WASM
     // linear memory constraints and prevents guest from claiming excessive reads.
-    if req_len < 0 || req_len > 1_048_576 {
+    if !(0..=MAX_IO_BUFFER_BYTES).contains(&req_len) {
         return -4;
     }
 
@@ -74,11 +74,11 @@ pub fn host_call_dispatch(mut caller: Caller<'_, HostState>, op: i32, req_len: i
 
     // Dispatch based on operation code
     let result = match op {
-        1 => handle_read_file(&caller.data(), &request),
-        2 => handle_write_file(&caller.data(), &request),
-        3 => handle_shell_exec(&caller.data(), &request),
-        4 => handle_http_fetch(&caller.data(), &request),
-        5 => handle_get_credential(&caller.data(), &request),
+        1 => handle_read_file(caller.data(), &request),
+        2 => handle_write_file(caller.data(), &request),
+        3 => handle_shell_exec(caller.data(), &request),
+        4 => handle_http_fetch(caller.data(), &request),
+        5 => handle_get_credential(caller.data(), &request),
         _ => return -1,
     };
 
@@ -165,6 +165,9 @@ fn write_to_guest(caller: &mut Caller<'_, HostState>, offset: u32, bytes: &[u8])
     Ok(())
 }
 
+/// POSIX SIGKILL signal number for process group termination.
+const SIGKILL: i32 = 9;
+
 /// Validate a path is under one of the allowed directories.
 /// Rejects path traversal (../ sequences).
 fn validate_path(path_str: &str, allowed_paths: &[String]) -> Result<PathBuf> {
@@ -216,6 +219,9 @@ fn validate_path(path_str: &str, allowed_paths: &[String]) -> Result<PathBuf> {
 }
 
 // ── Host function handlers ──────────────────────────────────────────────
+
+/// Maximum IO buffer size for host_call request/response exchange (1 MiB).
+const MAX_IO_BUFFER_BYTES: i32 = 1_048_576;
 
 /// Maximum file size that read_file will load (1 MiB).
 const MAX_READ_FILE_BYTES: u64 = 1_048_576;
@@ -346,9 +352,13 @@ fn handle_shell_exec(state: &HostState, request: &serde_json::Value) -> Result<s
                     extern "C" {
                         fn kill(pid: i32, sig: i32) -> i32;
                     }
+                    // SAFETY: child.id() returns the PID we just spawned with
+                    // process_group(0). Linux PIDs are capped at ~4M (pid_max),
+                    // well within i32 range. kill(-pgid, SIGKILL) sends to the
+                    // entire process group, ensuring child trees are cleaned up.
                     let pgid = child.id() as i32;
                     unsafe {
-                        kill(-pgid, 9); // SIGKILL the process group
+                        kill(-pgid, SIGKILL); // process group
                     }
                 }
                 #[cfg(not(unix))]

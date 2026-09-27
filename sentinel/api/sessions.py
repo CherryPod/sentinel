@@ -17,7 +17,7 @@ import uuid
 
 import jwt
 
-logger = logging.getLogger("sentinel.api.sessions")
+logger = logging.getLogger(__name__)
 
 SESSION_TTL = 3600  # 1 hour
 

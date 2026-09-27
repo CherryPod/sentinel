@@ -9,20 +9,40 @@ import asyncio
 import json
 import logging
 from collections.abc import AsyncIterator
-from datetime import datetime, timezone
+from typing import TYPE_CHECKING
 
-from sentinel.api.auth import PinVerifier
-from sentinel.channels.base import Channel, IncomingMessage, OutgoingMessage
+if TYPE_CHECKING:
+    from sentinel.core.config import Settings
+
+from sentinel.channels.base import (
+    Channel,
+    ChannelDescriptor,
+    IncomingMessage,
+    OutgoingMessage,
+)
 from sentinel.core.bus import EventBus
+from sentinel.core.decorators import no_audit_log
 
-logger = logging.getLogger("sentinel.audit")
+logger = logging.getLogger(__name__)
+
+_SSE_KEEPALIVE_INTERVAL = 30.0
 
 
 class WebSocketChannel(Channel):
     """Wraps a FastAPI WebSocket connection with PIN-based authentication."""
-    channel_type = "websocket"
+
+    descriptor = ChannelDescriptor(
+        name="websocket",
+        tool_name="",  # no tool — web UI sends directly
+        tool_description="",
+        domain="web",
+        config_prefix="",
+        health_check=True,
+    )
     _MAX_MESSAGE_LENGTH = 10_000  # matches MCP input limit
-    _IDLE_TIMEOUT = 600.0  # BH3-017: 10 min idle timeout (raised for Opus planner latency)
+    _IDLE_TIMEOUT = (
+        600.0  # BH3-017: 10 min idle timeout (raised for Opus planner latency)
+    )
 
     def __init__(self, websocket, pin_verifier_getter, failure_tracker):
         self._ws = websocket
@@ -38,8 +58,12 @@ class WebSocketChannel(Channel):
     async def stop(self) -> None:
         try:
             await self._ws.close()
-        except Exception:
-            pass
+        except Exception:  # catch-all: websocket close best-effort
+            logger.debug(
+                "stop: Exception suppressed",
+                extra={"event": "web.stop.suppressed"},
+                exc_info=True,
+            )
 
     async def authenticate(self) -> bool:
         """First-message PIN auth. Returns True if authenticated.
@@ -58,7 +82,7 @@ class WebSocketChannel(Channel):
         if self._failure_tracker.is_locked_out(self._remote):
             logger.warning(
                 "WebSocket auth locked out",
-                extra={"event": "ws_auth_lockout", "remote": self._remote},
+                extra={"event": "ws.auth_lockout", "remote": self._remote},
             )
             await self._ws.close(code=4001, reason="Too many failed attempts")
             return False
@@ -66,8 +90,19 @@ class WebSocketChannel(Channel):
         try:
             raw = await asyncio.wait_for(self._ws.receive_text(), timeout=10.0)
             msg = json.loads(raw)
-        except (asyncio.TimeoutError, json.JSONDecodeError, Exception):
-            await self._ws.close(code=4001, reason="Authentication timeout or invalid message")
+        except (
+            TimeoutError,
+            json.JSONDecodeError,
+            Exception,
+        ):  # catch-all: auth message receive
+            logger.warning(
+                "WebSocket auth message receive failed",
+                extra={"event": "web.authenticate_error", "remote": self._remote},
+                exc_info=True,
+            )
+            await self._ws.close(
+                code=4001, reason="Authentication timeout or invalid message"
+            )
             return False
 
         if msg.get("type") != "auth" or not isinstance(msg.get("pin"), str):
@@ -78,12 +113,18 @@ class WebSocketChannel(Channel):
             self._failure_tracker.record_failure(self._remote)
             logger.warning(
                 "WebSocket PIN auth failed",
-                extra={"event": "ws_auth_failed", "remote": self._remote},
+                extra={"event": "ws.auth_failed", "remote": self._remote},
             )
             try:
-                await self._ws.send_json({"type": "auth_error", "reason": "Invalid PIN"})
-            except Exception:
-                pass
+                await self._ws.send_json(
+                    {"type": "auth_error", "reason": "Invalid PIN"}
+                )
+            except Exception:  # catch-all: best-effort error send
+                logger.debug(
+                    "authenticate: Exception suppressed",
+                    extra={"event": "web.authenticate.suppressed"},
+                    exc_info=True,
+                )
             await self._ws.close(code=4001, reason="Invalid PIN")
             return False
 
@@ -92,7 +133,7 @@ class WebSocketChannel(Channel):
         await self._ws.send_json({"type": "auth_ok"})
         logger.debug(
             "WebSocket authenticated",
-            extra={"event": "ws_auth_success", "remote": self._remote},
+            extra={"event": "ws.auth_success", "remote": self._remote},
         )
         return True
 
@@ -111,30 +152,42 @@ class WebSocketChannel(Channel):
             try:
                 # BH3-017: Idle timeout prevents abandoned connections holding resources
                 raw = await asyncio.wait_for(
-                    self._ws.receive_text(), timeout=self._IDLE_TIMEOUT,
+                    self._ws.receive_text(),
+                    timeout=self._IDLE_TIMEOUT,
                 )
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 # Idle timeout — close the connection gracefully
                 logger.info(
                     "WebSocket idle timeout — closing",
-                    extra={"event": "ws_idle_timeout", "remote": self._remote},
+                    extra={"event": "ws.idle_timeout", "remote": self._remote},
                 )
                 try:
                     await self._ws.close(code=1000, reason="Idle timeout")
-                except Exception:
-                    pass
+                except Exception:  # catch-all: idle timeout close best-effort
+                    logger.debug(
+                        "receive: Exception suppressed",
+                        extra={"event": "web.receive.suppressed"},
+                        exc_info=True,
+                    )
                 break
-            except Exception:
-                break  # disconnected
+            except Exception:  # catch-all: websocket disconnect
+                logger.debug(
+                    "WebSocket disconnected",
+                    extra={"event": "web.disconnected", "remote": self._remote},
+                    exc_info=True,
+                )
+                break
 
             # Length validation
             if len(raw) > self._MAX_MESSAGE_LENGTH:
                 try:
-                    await self._ws.send_json({
-                        "type": "error",
-                        "reason": f"Message too long (max {self._MAX_MESSAGE_LENGTH} chars)",
-                    })
-                except Exception:
+                    await self._ws.send_json(
+                        {
+                            "type": "error",
+                            "reason": f"Message too long (max {self._MAX_MESSAGE_LENGTH} chars)",
+                        }
+                    )
+                except Exception:  # catch-all: send failed — connection lost
                     break
                 continue
 
@@ -142,12 +195,19 @@ class WebSocketChannel(Channel):
                 msg = json.loads(raw)
             except json.JSONDecodeError:
                 # Send error and continue listening
+                logger.warning(
+                    "WebSocket received malformed JSON",
+                    extra={"event": "web.receive_json_error", "remote": self._remote},
+                    exc_info=True,
+                )
                 try:
-                    await self._ws.send_json({
-                        "type": "error",
-                        "reason": "Invalid JSON",
-                    })
-                except Exception:
+                    await self._ws.send_json(
+                        {
+                            "type": "error",
+                            "reason": "Invalid JSON",
+                        }
+                    )
+                except Exception:  # catch-all: send failed — connection lost
                     break
                 continue
 
@@ -155,11 +215,13 @@ class WebSocketChannel(Channel):
             content = msg.get("request", msg.get("content", ""))
             if not isinstance(content, str) or not content.strip():
                 try:
-                    await self._ws.send_json({
-                        "type": "error",
-                        "reason": "Empty or missing message content",
-                    })
-                except Exception:
+                    await self._ws.send_json(
+                        {
+                            "type": "error",
+                            "reason": "Empty or missing message content",
+                        }
+                    )
+                except Exception:  # catch-all: send failed — connection lost
                     break
                 continue
 
@@ -169,6 +231,42 @@ class WebSocketChannel(Channel):
                 content=content,
                 metadata=msg,
             )
+
+    # -- Registry extensions ---------------------------------------------------
+
+    @classmethod
+    def from_settings(cls, settings: "Settings") -> "WebSocketChannel | None":
+        # WebSocket channels are per-connection, managed by FastAPI — not
+        # instantiated from settings. Return None so the registry skips it.
+        return None
+
+    async def send_message(self, text: str, recipient: str | None = None) -> dict:
+        """Send text to the WebSocket client."""
+        await self._ws.send_json({"type": "message", "data": {"response": text}})
+        return {"status": "sent", "channel": "websocket"}
+
+    def get_source_key(self, message: IncomingMessage) -> str:
+        """Fail closed — WebSocket source_key must be set by the endpoint.
+
+        The production WebSocket path (`api/routes/websocket.py`) always
+        populates ``message.metadata["source_key"]`` with a per-connection
+        identifier before routing, so the generic receive-loop's
+        ``channel.get_source_key(message)`` call never fires for WebSocket.
+        Inheriting the base default would produce ``websocket:ws-{client_ip}``
+        — a shared-per-peer key that silently breaks session binding
+        (Q3-F11). Raising here makes any future code path that routes a
+        WebSocket message without pre-populating the key fail loudly
+        instead of producing a collision-prone fallback.
+        """
+        raise RuntimeError(
+            "WebSocket source_key must be set by the endpoint before routing; "
+            "refusing to fall back to a shared-per-client-IP default."
+        )
+
+    @property
+    def is_running(self) -> bool:
+        # WebSocket lifecycle is per-connection, always "running" while alive
+        return True
 
 
 class SSEWriter:
@@ -190,10 +288,14 @@ class SSEWriter:
 
         async def _handler(topic: str, data):
             event_type = topic.split(".")[-1]  # e.g. "started", "completed"
-            await self._queue.put({
-                "event": event_type,
-                "data": json.dumps(data if isinstance(data, dict) else {"payload": data}),
-            })
+            await self._queue.put(
+                {
+                    "event": event_type,
+                    "data": json.dumps(
+                        data if isinstance(data, dict) else {"payload": data}
+                    ),
+                }
+            )
             # Signal completion when task is done
             if event_type == "completed":
                 self._done = True
@@ -207,18 +309,22 @@ class SSEWriter:
             self._bus.unsubscribe(pattern, handler)
         self._subscriptions.clear()
 
+    @no_audit_log
     async def event_generator(self) -> AsyncIterator[dict]:
         """Yield SSE events from the queue. Used by sse-starlette."""
         try:
             while True:
                 try:
-                    event = await asyncio.wait_for(self._queue.get(), timeout=30.0)
+                    event = await asyncio.wait_for(
+                        self._queue.get(), timeout=_SSE_KEEPALIVE_INTERVAL
+                    )
                     is_final = event.get("event") == "completed"
                     yield event
                     if is_final:
                         break
-                except asyncio.TimeoutError:
-                    # Send keepalive comment to prevent connection timeout
+                except TimeoutError:
+                    # Expected: SSE poll timeout fires every 30s per client
+                    logger.debug("SSE keepalive", extra={"event": "web.sse_keepalive"})
                     yield {"comment": "keepalive"}
         finally:
             self.cleanup()

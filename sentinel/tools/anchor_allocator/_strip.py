@@ -2,20 +2,25 @@
 
 from __future__ import annotations
 
+import logging
 import re
+
+logger = logging.getLogger(__name__)
 
 # Patterns match anchor markers that are the ONLY content on their line
 # (after optional leading whitespace). This avoids stripping anchors
 # inside string literals like: x = "# anchor: fake"
 _STRIP_PATTERNS = [
-    re.compile(r'^[ \t]*<!--[ \t]*anchor:[ \t]*[\w.-]+[ \t]*-->[ \t]*\n?', re.MULTILINE),
-    re.compile(r'^[ \t]*#[ \t]*anchor:[ \t]*[\w.-]+[ \t]*\n?', re.MULTILINE),
-    re.compile(r'^[ \t]*//[ \t]*anchor:[ \t]*[\w.-]+[ \t]*\n?', re.MULTILINE),
-    re.compile(r'^[ \t]*/\*[ \t]*anchor:[ \t]*[\w.-]+[ \t]*\*/[ \t]*\n?', re.MULTILINE),
+    re.compile(
+        r"^[ \t]*<!--[ \t]*anchor:[ \t]*[\w.-]+[ \t]*-->[ \t]*\n?", re.MULTILINE
+    ),
+    re.compile(r"^[ \t]*#[ \t]*anchor:[ \t]*[\w.-]+[ \t]*\n?", re.MULTILINE),
+    re.compile(r"^[ \t]*//[ \t]*anchor:[ \t]*[\w.-]+[ \t]*\n?", re.MULTILINE),
+    re.compile(r"^[ \t]*/\*[ \t]*anchor:[ \t]*[\w.-]+[ \t]*\*/[ \t]*\n?", re.MULTILINE),
 ]
 
 # Collapse triple+ blank lines left after stripping to double blank lines
-_MULTI_BLANK = re.compile(r'\n{3,}')
+_MULTI_BLANK = re.compile(r"\n{3,}")
 
 
 def strip_anchors(content: str) -> tuple[str, int]:

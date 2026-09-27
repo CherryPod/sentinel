@@ -6,8 +6,8 @@ Moved from monolith lines 1546-1577. Finding fixes applied:
   #12: brace counting uses count_in_code("css") instead of naive count()
   #23: tracks brace depth to avoid inserting ; after nested block closers
 """
+
 import logging
-import re
 
 from ._core import (
     FixResult,
@@ -22,11 +22,21 @@ logger = logging.getLogger(__name__)
 # Public entry point
 # ---------------------------------------------------------------------------
 
+
 def fix_css(content: str) -> FixResult:
     """CSS fixes: unclosed braces, missing semicolons before closing brace."""
     result = FixResult(content=content)
     original = content
     fname = _current_filename.get()
+
+    logger.debug(
+        "CSS fixer starting",
+        extra={
+            "event": "css.fixer_start",
+            "file": fname,
+            "content_length": len(content),
+        },
+    )
 
     # Finding #12: use count_in_code to skip braces inside comments
     open_count = count_in_code(content, "css", "{")
@@ -38,11 +48,16 @@ def fix_css(content: str) -> FixResult:
         logger.debug(
             "Closed unclosed CSS braces",
             extra={
-                "event": "fixer_detail",
+                "event": "css.brace_fix",
                 "fixer": "fix_css",
                 "file": fname,
                 "count": diff,
             },
+        )
+    else:
+        logger.debug(
+            "CSS braces balanced",
+            extra={"event": "css.braces_balanced", "file": fname},
         )
 
     # Finding #23: Track brace depth to avoid inserting ; after nested block closers.
@@ -55,9 +70,10 @@ def fix_css(content: str) -> FixResult:
     for i, line in enumerate(lines):
         stripped = line.strip()
 
-        # Track brace depth for this line
-        line_opens = stripped.count("{")
-        line_closes = stripped.count("}")
+        # Track brace depth for this line — use count_in_code to skip
+        # braces inside comments, consistent with the initial brace count above
+        line_opens = count_in_code(stripped, "css", "{")
+        line_closes = count_in_code(stripped, "css", "}")
 
         if stripped == "}":
             # This is a block closer — check previous non-empty line
@@ -71,9 +87,11 @@ def fix_css(content: str) -> FixResult:
                 # Only add ; if the previous line looks like a property
                 # (not another block closer, not a block opener, and not
                 # already ending with ; or {)
-                if (prev_stripped
-                        and prev_stripped[-1] not in (";", "{", "}")
-                        and depth <= 1):
+                if (
+                    prev_stripped
+                    and prev_stripped[-1] not in (";", "{", "}")
+                    and depth <= 1
+                ):
                     # This is a top-level block closer after a property line
                     fixed_lines[prev_idx] = prev_line + ";"
 
@@ -86,7 +104,7 @@ def fix_css(content: str) -> FixResult:
         logger.debug(
             "Added missing CSS semicolons",
             extra={
-                "event": "fixer_detail",
+                "event": "css.semicolon_fix",
                 "fixer": "fix_css",
                 "file": fname,
             },

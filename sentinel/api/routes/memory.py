@@ -14,16 +14,16 @@ Endpoints:
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Annotated, Any
 
 from fastapi import APIRouter, Query
 from fastapi.responses import JSONResponse
 
 from sentinel.api.models import MemoryStoreRequest
-from sentinel.core.context import current_user_id
+from sentinel.core.context import PrincipalRequiredError, current_user_id
 from sentinel.memory.splitter import split_text
 
-logger = logging.getLogger("sentinel.api")
+logger = logging.getLogger(__name__)
 
 # ── Router ──────────────────────────────────────────────────────────
 
@@ -60,6 +60,10 @@ def init(
 @router.post("/memory")
 async def store_memory(req: MemoryStoreRequest):
     """Store text in memory — splits large texts into chunks automatically."""
+    logger.debug(
+        "store_memory called",
+        extra={"event": "memory.store_memory", "req_type": type(req).__name__},
+    )
     if _memory_store is None or _embedding_client is None:
         return JSONResponse(
             status_code=503,
@@ -73,7 +77,10 @@ async def store_memory(req: MemoryStoreRequest):
     if not chunks:
         return JSONResponse(
             status_code=400,
-            content={"status": "error", "reason": "Text produced no chunks after splitting"},
+            content={
+                "status": "error",
+                "reason": "Text produced no chunks after splitting",
+            },
         )
 
     # Embed all chunks in a single batch call
@@ -81,10 +88,14 @@ async def store_memory(req: MemoryStoreRequest):
         embeddings = await _embedding_client.embed_batch(chunks)
     except Exception as exc:
         # Graceful degradation: store without embeddings if Ollama is unavailable
+        logger.exception(
+            "store_memory: Exception", extra={"event": "memory.store_memory_error"}
+        )
         if _audit:
             _audit.warning(
                 "Embedding failed, storing without vectors",
-                extra={"event": "memory_embed_fallback", "error": str(exc)},
+                extra={"event": "memory.embed_fallback", "error": str(exc)},
+                exc_info=True,
             )
         chunk_ids = []
         for chunk_text in chunks:
@@ -104,7 +115,7 @@ async def store_memory(req: MemoryStoreRequest):
 
     # Store each chunk with its embedding
     chunk_ids = []
-    for chunk_text, embedding in zip(chunks, embeddings):
+    for chunk_text, embedding in zip(chunks, embeddings, strict=True):
         cid = await _memory_store.store_with_embedding(
             content=chunk_text,
             embedding=embedding,
@@ -127,8 +138,8 @@ async def store_memory(req: MemoryStoreRequest):
 
 @router.get("/memory/search")
 async def search_memory(
-    query: str = Query(..., min_length=1, description="Search query"),
-    k: int = Query(10, ge=1, le=100, description="Number of results"),
+    query: Annotated[str, Query(min_length=1, description="Search query")],
+    k: Annotated[int, Query(ge=1, le=100, description="Number of results")] = 10,
 ):
     """Hybrid search across memory — full-text keyword + vector semantic with RRF fusion."""
     if _memory_store is None or _hybrid_search_fn is None:
@@ -144,8 +155,12 @@ async def search_memory(
     if _embedding_client is not None:
         try:
             query_embedding = await _embedding_client.embed(query)
-        except Exception:
-            pass  # graceful degradation to full-text-only
+        except Exception:  # catch-all: embedding fallback to FTS-only
+            logger.debug(
+                "search_memory: Exception suppressed",
+                extra={"event": "memory.search_memory.suppressed"},
+                exc_info=True,
+            )
 
     results = await _hybrid_search_fn(
         query=query,
@@ -175,8 +190,10 @@ async def search_memory(
 
 @router.get("/memory/list")
 async def list_memory_chunks(
-    limit: int = Query(50, ge=1, le=500, description="Number of chunks to return"),
-    offset: int = Query(0, ge=0, description="Offset for pagination"),
+    limit: Annotated[
+        int, Query(ge=1, le=500, description="Number of chunks to return")
+    ] = 50,
+    offset: Annotated[int, Query(ge=0, description="Offset for pagination")] = 0,
 ):
     """List memory chunks, newest first. Paginated."""
     if _memory_store is None:
@@ -209,6 +226,10 @@ async def list_memory_chunks(
 @router.get("/memory/{chunk_id}")
 async def get_memory_chunk(chunk_id: str):
     """Get a specific memory chunk by ID."""
+    logger.debug(
+        "get_memory_chunk called",
+        extra={"event": "memory.get_memory_chunk", "chunk_id": chunk_id},
+    )
     if _memory_store is None:
         return JSONResponse(
             status_code=503,
@@ -243,6 +264,10 @@ async def get_memory_chunk(chunk_id: str):
 @router.delete("/memory/{chunk_id}")
 async def delete_memory_chunk(chunk_id: str):
     """Delete a memory chunk and its index entries."""
+    logger.debug(
+        "delete_memory_chunk called",
+        extra={"event": "memory.delete_memory_chunk", "chunk_id": chunk_id},
+    )
     if _memory_store is None:
         return JSONResponse(
             status_code=503,
@@ -252,7 +277,14 @@ async def delete_memory_chunk(chunk_id: str):
     uid = current_user_id.get()
     try:
         deleted = await _memory_store.delete(chunk_id, user_id=uid)
+    except PrincipalRequiredError:
+        # Q4.fix.f Coord review follow-up (Codex catch): the broad
+        # `except ValueError` below would silently absorb this subclass
+        # and misclassify a principal/auth failure as HTTP 403. Re-raise
+        # so the fail-closed invariant signals a 500 instead.
+        raise
     except ValueError as exc:
+        logger.debug("memory.delete_chunk_validation_failed", exc_info=True)
         return JSONResponse(
             status_code=403,
             content={"status": "error", "reason": str(exc)},

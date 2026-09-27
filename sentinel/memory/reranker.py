@@ -13,16 +13,23 @@ Model: ms-marco-MiniLM-L-12-v2 (~33MB ONNX, CPU-only, no PyTorch).
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 
-logger = logging.getLogger("sentinel.audit")
+logger = logging.getLogger(__name__)
 
 # Lazy import — flashrank may not be installed
 _flashrank_available = False
 try:
-    from flashrank import Ranker as _Ranker, RerankRequest as _RerankRequest
+    from flashrank import Ranker as _Ranker
+    from flashrank import RerankRequest as _RerankRequest
+
     _flashrank_available = True
 except ImportError:
+    logger.info(
+        "flashrank not installed — re-ranking will be disabled",
+        extra={"event": "reranker.flashrank_unavailable"},
+    )
     _Ranker = None  # type: ignore[assignment,misc]
     _RerankRequest = None  # type: ignore[assignment,misc]
 
@@ -47,6 +54,14 @@ def _jaccard_similarity(text_a: str, text_b: str) -> float:
 
     Returns 0.0 for empty inputs, 1.0 for identical texts.
     """
+    logger.debug(
+        "_jaccard_similarity called",
+        extra={
+            "event": "reranker._jaccard_similarity",
+            "text_a_len": len(text_a),
+            "text_b_len": len(text_b),
+        },
+    )
     words_a = set(text_a.lower().split())
     words_b = set(text_b.lower().split())
     if not words_a or not words_b:
@@ -78,7 +93,17 @@ def _apply_mmr(
     Returns:
         Diversified list of up to top_k RerankResult objects.
     """
+    logger.debug(
+        "_apply_mmr called",
+        extra={
+            "event": "reranker._apply_mmr",
+            "results_len": len(results) if hasattr(results, "__len__") else 0,
+            "top_k": top_k,
+            "mmr_lambda": mmr_lambda,
+        },
+    )
     if len(results) <= 1:
+        logger.debug("_apply_mmr: match", extra={"event": "reranker._apply_mmr.match"})
         return results[:top_k]
 
     # Normalise scores to [0, 1] for fair MMR balancing
@@ -87,11 +112,11 @@ def _apply_mmr(
     score_range = max_score - min_score
     if score_range == 0:
         # All scores identical — MMR degrades to pure diversity selection
+        logger.debug("_apply_mmr: match", extra={"event": "reranker._apply_mmr.match"})
         norm_scores = [1.0] * len(results)
     else:
-        norm_scores = [
-            (r.rerank_score - min_score) / score_range for r in results
-        ]
+        logger.debug("_apply_mmr: clean", extra={"event": "reranker._apply_mmr.clean"})
+        norm_scores = [(r.rerank_score - min_score) / score_range for r in results]
 
     selected: list[int] = []
     remaining = list(range(len(results)))
@@ -114,6 +139,9 @@ def _apply_mmr(
             )
             mmr_score = mmr_lambda * relevance - (1.0 - mmr_lambda) * max_sim
             if mmr_score > best_mmr:
+                logger.debug(
+                    "_apply_mmr: match", extra={"event": "reranker._apply_mmr.match"}
+                )
                 best_mmr = mmr_score
                 best_candidate = i
 
@@ -133,12 +161,18 @@ class Reranker:
     fails, rerank() returns candidates unchanged (sorted by original score).
     """
 
-    def __init__(self, cache_dir: str = "/tmp/flashrank") -> None:
+    def __init__(self, cache_dir: str | None = None) -> None:
+        # Prefer the image-baked model cache (populated at build time, no egress
+        # needed); fall back to a scratch dir for non-container/dev runs where the
+        # model isn't baked in. See container/Containerfile FlashRank bake step.
+        if cache_dir is None:
+            baked = "/opt/flashrank"
+            cache_dir = baked if os.path.isdir(baked) else "/tmp/flashrank"  # nosec B108 — model cache dir, container-scoped
         self._ranker = None
         if not _flashrank_available:
             logger.warning(
                 "flashrank not installed — re-ranking disabled",
-                extra={"event": "reranker_init", "available": False},
+                extra={"event": "reranker.init", "available": False},
             )
             return
         try:
@@ -154,12 +188,13 @@ class Reranker:
             )
             logger.info(
                 "FlashRank reranker loaded",
-                extra={"event": "reranker_init", "available": True},
+                extra={"event": "reranker.init", "available": True},
             )
-        except Exception as exc:
+        except Exception as exc:  # catch-all: model load (file, format, CUDA errors)
             logger.warning(
                 "FlashRank model load failed — re-ranking disabled",
-                extra={"event": "reranker_init", "error": str(exc)},
+                extra={"event": "reranker.init", "error": str(exc)},
+                exc_info=True,
             )
 
     @property
@@ -193,9 +228,7 @@ class Reranker:
 
         if self._ranker is None:
             # Graceful fallback — return as-is, sorted by original score
-            sorted_candidates = sorted(
-                candidates, key=lambda c: c.score, reverse=True
-            )
+            sorted_candidates = sorted(candidates, key=lambda c: c.score, reverse=True)
             return [
                 RerankResult(
                     chunk_id=c.chunk_id,
@@ -220,14 +253,13 @@ class Reranker:
         try:
             request = _RerankRequest(query=query, passages=passages)
             reranked = self._ranker.rerank(request)
-        except Exception as exc:
+        except Exception as exc:  # catch-all: rerank fallback to original order
             logger.warning(
                 "FlashRank rerank failed — returning original order",
-                extra={"event": "rerank_error", "error": str(exc)},
+                extra={"event": "rerank.error", "error": str(exc)},
+                exc_info=True,
             )
-            sorted_candidates = sorted(
-                candidates, key=lambda c: c.score, reverse=True
-            )
+            sorted_candidates = sorted(candidates, key=lambda c: c.score, reverse=True)
             return [
                 RerankResult(
                     chunk_id=c.chunk_id,
@@ -266,14 +298,16 @@ class Reranker:
         logger.debug(
             "Re-ranking completed (with MMR)",
             extra={
-                "event": "rerank_complete",
+                "event": "rerank.complete",
                 "candidates_in": len(candidates),
                 "scored": len(scored_results),
                 "results_out": len(results),
                 "mmr_lambda": mmr_lambda,
                 "top_score": selected_scores[0] if selected_scores else 0.0,
                 "min_score": min(all_scores) if all_scores else 0.0,
-                "score_spread": round(max(all_scores) - min(all_scores), 4) if all_scores else 0.0,
+                "score_spread": round(max(all_scores) - min(all_scores), 4)
+                if all_scores
+                else 0.0,
                 "selected_scores": [round(s, 4) for s in selected_scores],
                 "mmr_reordered": [r.chunk_id[-8:] for r in results],
             },

@@ -7,6 +7,7 @@ Finding fixes applied:
   #20: semicolon fixer skips method chain continuations (lines starting with .)
   #45: validation gate — reverts bracket completion if net count worsens
 """
+
 import logging
 
 from ._core import (
@@ -16,14 +17,24 @@ from ._core import (
 
 logger = logging.getLogger(__name__)
 
-
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 _RUST_SEMI_KEYWORDS = (
-    "let ", "return ", "println!", "eprintln!", "print!",
-    "assert", "panic!", "todo!", "unimplemented!", "vec!",
-    "dbg!", "write!", "writeln!", "format!",
+    "let ",
+    "return ",
+    "println!",
+    "eprintln!",
+    "print!",
+    "assert",
+    "panic!",
+    "todo!",
+    "unimplemented!",
+    "vec!",
+    "dbg!",
+    "write!",
+    "writeln!",
+    "format!",
 )
 
 
@@ -43,6 +54,13 @@ def _complete_brackets_rust(content: str, result: FixResult) -> str:
     the fix overclosed (e.g. due to raw strings confusing the counter),
     the original content is returned unchanged.
     """
+    logger.debug(
+        "Checking Rust bracket balance",
+        extra={
+            "event": "rust.bracket_check",
+            "content_length": len(content),
+        },
+    )
     original = content
     open_chars = {"(": ")", "[": "]", "{": "}"}
     close_chars = {v: k for k, v in open_chars.items()}
@@ -59,24 +77,44 @@ def _complete_brackets_rust(content: str, result: FixResult) -> str:
             if ch == "\n":
                 in_line_comment = False
         elif in_block_comment:
+            logger.debug(
+                "_complete_brackets_rust: clean",
+                extra={"event": "rust._complete_brackets_rust.branch.clean"},
+            )
             if ch == "*" and next_ch == "/":
                 in_block_comment = False
                 i += 1
         elif in_string:
+            logger.debug(
+                "_complete_brackets_rust: clean",
+                extra={"event": "rust._complete_brackets_rust.branch.clean"},
+            )
             if ch == "\\" and next_ch:
                 i += 1
             elif ch == '"':
                 in_string = False
         else:
             if ch == "/" and next_ch == "/":
+                logger.debug(
+                    "_complete_brackets_rust: clean",
+                    extra={"event": "rust._complete_brackets_rust.branch.clean"},
+                )
                 in_line_comment = True
                 i += 1
             elif ch == "/" and next_ch == "*":
+                logger.debug(
+                    "_complete_brackets_rust: clean",
+                    extra={"event": "rust._complete_brackets_rust.branch.clean"},
+                )
                 in_block_comment = True
                 i += 1
             # Finding #19: detect Rust raw strings r#"..."#, r##"..."##, etc.
             # Skip their contents so brackets inside don't affect the count.
             elif ch == "r" and i + 1 < len(content):
+                logger.debug(
+                    "_complete_brackets_rust: clean",
+                    extra={"event": "rust._complete_brackets_rust.branch.clean"},
+                )
                 hash_count = 0
                 j = i + 1
                 while j < len(content) and content[j] == "#":
@@ -93,14 +131,24 @@ def _complete_brackets_rust(content: str, result: FixResult) -> str:
                         j += 1
                     i = j
                     continue
-                else:
-                    # Not a raw string — treat 'r' as normal character
-                    pass
+                # Not a raw string — treat 'r' as normal character
             elif ch == '"':
+                logger.debug(
+                    "_complete_brackets_rust: clean",
+                    extra={"event": "rust._complete_brackets_rust.branch.clean"},
+                )
                 in_string = True
             elif ch in open_chars:
+                logger.debug(
+                    "_complete_brackets_rust: clean",
+                    extra={"event": "rust._complete_brackets_rust.branch.clean"},
+                )
                 stack.append(open_chars[ch])
             elif ch in close_chars:
+                logger.debug(
+                    "_complete_brackets_rust: clean",
+                    extra={"event": "rust._complete_brackets_rust.branch.clean"},
+                )
                 if stack and stack[-1] == ch:
                     stack.pop()
         i += 1
@@ -117,7 +165,7 @@ def _complete_brackets_rust(content: str, result: FixResult) -> str:
             "Completed %d unclosed Rust bracket(s)",
             len(stack),
             extra={
-                "event": "rust_bracket_complete",
+                "event": "rust.bracket_complete",
                 "file": _current_filename.get(),
                 "closing": closing,
             },
@@ -133,7 +181,7 @@ def _complete_brackets_rust(content: str, result: FixResult) -> str:
                 logger.info(
                     "Rust bracket completion reverted — made imbalance worse",
                     extra={
-                        "event": "validation_rejected",
+                        "event": "rust.validation_rejected",
                         "fixer": "_complete_brackets_rust",
                         "file": _current_filename.get(),
                         "validator": "bracket_count",
@@ -154,6 +202,13 @@ def _fix_rust_semicolons(content: str, result: FixResult) -> str:
     Finding #20: skips lines starting with . (method chain continuations)
     since those are not complete statements.
     """
+    logger.debug(
+        "Checking Rust semicolons",
+        extra={
+            "event": "rust.semicolon_check",
+            "content_length": len(content),
+        },
+    )
     lines = content.rstrip("\n").split("\n")
     fixed_count = 0
     for idx, line in enumerate(lines):
@@ -167,26 +222,30 @@ def _fix_rust_semicolons(content: str, result: FixResult) -> str:
         if stripped.startswith("."):
             continue
 
-        if (not stripped.endswith(";")
-                and not stripped.endswith("{")
-                and not stripped.endswith("}")
-                and not stripped.endswith(",")
-                and not stripped.endswith("(")
-                and not stripped.startswith("//")
-                and not stripped.startswith("/*")
-                and not stripped.startswith("*")
-                and any(stripped.startswith(kw) for kw in _RUST_SEMI_KEYWORDS)):
+        if (
+            not stripped.endswith(";")
+            and not stripped.endswith("{")
+            and not stripped.endswith("}")
+            and not stripped.endswith(",")
+            and not stripped.endswith("(")
+            and not stripped.startswith("//")
+            and not stripped.startswith("/*")
+            and not stripped.startswith("*")
+            and any(stripped.startswith(kw) for kw in _RUST_SEMI_KEYWORDS)
+        ):
             # Only add if the next non-blank line suggests this line is complete
             next_stripped = ""
-            for nxt in lines[idx + 1:]:
+            for nxt in lines[idx + 1 :]:
                 ns = nxt.strip()
                 if ns:
                     next_stripped = ns
                     break
-            if (next_stripped.startswith("}")
-                    or next_stripped.startswith("let ")
-                    or not next_stripped
-                    or idx == len(lines) - 1):
+            if (
+                next_stripped.startswith("}")
+                or next_stripped.startswith("let ")
+                or not next_stripped
+                or idx == len(lines) - 1
+            ):
                 lines[idx] = line.rstrip() + ";"
                 fixed_count += 1
 
@@ -197,7 +256,7 @@ def _fix_rust_semicolons(content: str, result: FixResult) -> str:
             "Added %d missing Rust semicolon(s)",
             fixed_count,
             extra={
-                "event": "rust_semicolons_added",
+                "event": "rust.semicolons_added",
                 "file": _current_filename.get(),
                 "count": fixed_count,
             },
@@ -225,7 +284,7 @@ def fix_rust(content: str) -> FixResult:
     logger.debug(
         "Rust fixer starting",
         extra={
-            "event": "rust_fixer_start",
+            "event": "rust.fixer_start",
             "file": _current_filename.get(),
             "content_length": len(content),
         },

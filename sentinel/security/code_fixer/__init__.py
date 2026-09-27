@@ -6,16 +6,18 @@ Public API:
 
 Backwards-compatible: existing imports work unchanged.
 """
+
 import logging
 from pathlib import Path
 
 from ._core import (
-    FixResult,
     _MAX_FIX_SIZE,
+    FixResult,
     _is_empty_or_whitespace,
     _looks_binary,
     _run_chain,
 )
+from ._cross_language import fix_cross_language
 from ._css import fix_css
 from ._detectors import _detect_duplicate_defs_generic, _detect_truncation_generic
 from ._dockerfile import fix_dockerfile
@@ -27,13 +29,12 @@ from ._python import fix_python
 from ._rust import fix_rust
 from ._shell import fix_shell
 from ._sql import fix_sql
+from ._structural import check_structural_integrity
 from ._toml import fix_toml
 from ._universal import fix_universal, strip_prose
 from ._yaml import fix_yaml
-from ._cross_language import fix_cross_language
-from ._structural import check_structural_integrity
 
-__all__ = ["fix_code", "FixResult"]
+__all__ = ["FixResult", "fix_code"]
 
 logger = logging.getLogger(__name__)
 
@@ -47,55 +48,53 @@ FIXER_REGISTRY = {
 # Prose stripping only runs on code files (not data formats like JSON/YAML).
 FIXER_CHAINS = {
     # Code files (prose stripping enabled)
-    ".py":          [fix_universal, strip_prose, fix_python],
-    ".rs":          [fix_universal, strip_prose, fix_rust],
-    ".html":        [fix_universal, strip_prose, fix_html],
-    ".htm":         [fix_universal, strip_prose, fix_html],
-    ".css":         [fix_universal, fix_css],
-    ".sql":         [fix_universal, fix_sql],
-    ".sh":          [fix_universal, strip_prose, fix_shell],
-    ".bash":        [fix_universal, strip_prose, fix_shell],
-
+    ".py": [fix_universal, strip_prose, fix_python],
+    ".rs": [fix_universal, strip_prose, fix_rust],
+    ".html": [fix_universal, strip_prose, fix_html],
+    ".htm": [fix_universal, strip_prose, fix_html],
+    ".css": [fix_universal, fix_css],
+    ".sql": [fix_universal, fix_sql],
+    ".sh": [fix_universal, strip_prose, fix_shell],
+    ".bash": [fix_universal, strip_prose, fix_shell],
     # Data/config files (no prose stripping — content is the data)
-    ".json":        [fix_universal, fix_json],
-    ".yaml":        [fix_universal, fix_yaml],
-    ".yml":         [fix_universal, fix_yaml],
-    ".toml":        [fix_universal, fix_toml],
-
+    ".json": [fix_universal, fix_json],
+    ".yaml": [fix_universal, fix_yaml],
+    ".yml": [fix_universal, fix_yaml],
+    ".toml": [fix_universal, fix_toml],
     # Container files (prose stripping enabled)
-    "Dockerfile":   [fix_universal, strip_prose, fix_dockerfile],
+    "Dockerfile": [fix_universal, strip_prose, fix_dockerfile],
     "Containerfile": [fix_universal, strip_prose, fix_dockerfile],
-    ".dockerfile":  [fix_universal, strip_prose, fix_dockerfile],
-
+    ".dockerfile": [fix_universal, strip_prose, fix_dockerfile],
     # JavaScript/TypeScript
-    ".js":          [fix_universal, strip_prose, fix_javascript],
-    ".ts":          [fix_universal, strip_prose, fix_javascript],
-    ".jsx":         [fix_universal, strip_prose, fix_javascript],
-    ".tsx":         [fix_universal, strip_prose, fix_javascript],
-
+    ".js": [fix_universal, strip_prose, fix_javascript],
+    ".ts": [fix_universal, strip_prose, fix_javascript],
+    ".jsx": [fix_universal, strip_prose, fix_javascript],
+    ".tsx": [fix_universal, strip_prose, fix_javascript],
     # Languages we don't have specific fixers for yet — universal only.
     # Listed explicitly so they get universal normalisation (BOM, CRLF,
     # whitespace, newline) rather than being silently skipped.
-    ".c":           [fix_universal],
-    ".cpp":         [fix_universal],
-    ".h":           [fix_universal],
-    ".hpp":         [fix_universal],
-    ".java":        [fix_universal],
-    ".go":          [fix_universal],
-    ".rb":          [fix_universal],
-    ".lua":         [fix_universal],
-    ".xml":         [fix_universal],
-    ".ini":         [fix_universal],
-    ".cfg":         [fix_universal],
-    ".conf":        [fix_universal],
-    ".php":         [fix_universal],
-    ".txt":         [fix_universal],
-    ".md":          [fix_universal, fix_markdown],
-    ".csv":         [fix_universal],
+    ".c": [fix_universal],
+    ".cpp": [fix_universal],
+    ".h": [fix_universal],
+    ".hpp": [fix_universal],
+    ".java": [fix_universal],
+    ".go": [fix_universal],
+    ".rb": [fix_universal],
+    ".lua": [fix_universal],
+    ".xml": [fix_universal],
+    ".ini": [fix_universal],
+    ".cfg": [fix_universal],
+    ".conf": [fix_universal],
+    ".php": [fix_universal],
+    ".txt": [fix_universal],
+    ".md": [fix_universal, fix_markdown],
+    ".csv": [fix_universal],
 }
 
 
-def fix_code(filename: str, content: str) -> FixResult:
+def fix_code(
+    filename: str, content: str, surrounding_context: str | None = None
+) -> FixResult:
     """Run the appropriate fixer chain for a file.
 
     Args:
@@ -104,6 +103,9 @@ def fix_code(filename: str, content: str) -> FixResult:
                   executor.py _file_write().
         content:  The file content to fix (after RESPONSE/fence stripping
                   by executor).
+        surrounding_context: Optional surrounding file content (50 lines
+                  before/after the anchor position). Individual fixers can
+                  use this for integration error detection.
 
     Returns:
         FixResult with the (possibly fixed) content and audit metadata.
@@ -111,13 +113,48 @@ def fix_code(filename: str, content: str) -> FixResult:
     """
     # Guard: empty/whitespace content — pass through unchanged
     if _is_empty_or_whitespace(content):
-        return FixResult(content=content, skipped=True,
-                         skip_reason="Empty or whitespace-only content")
+        logger.debug(
+            "fix_code: is_empty_or_whitespace_content",
+            extra={
+                "event": "code_fixer.fix_code.match",
+                "reason": "is_empty_or_whitespace_content",
+            },
+        )  # auto:neg
+        return FixResult(
+            content=content,
+            skipped=True,
+            skip_reason="Empty or whitespace-only content",
+        )
+    logger.debug(
+        "fix_code: is_empty_or_whitespace_content_passed",
+        extra={
+            "event": "code_fixer.fix_code.passed",
+            "reason": "is_empty_or_whitespace_content_passed",
+        },
+    )  # auto:neg
 
     # Guard: binary content — pass through unchanged
     if _looks_binary(content):
-        return FixResult(content=content, skipped=True,
-                         skip_reason="Binary content detected")
+        logger.debug(
+            "fix_code: looks_binary_content",
+            extra={
+                "event": "code_fixer.fix_code.match",
+                "reason": "looks_binary_content",
+            },
+        )  # auto:neg
+        return FixResult(
+            content=content, skipped=True, skip_reason="Binary content detected"
+        )
+
+    logger.debug(
+        "fix_code entry",
+        extra={
+            "event": "core.fix_code_entry",
+            "file": filename,
+            "ext": Path(filename).suffix.lower(),
+            "content_length": len(content),
+        },
+    )
 
     path = Path(filename)
     ext = path.suffix.lower()
@@ -125,6 +162,10 @@ def fix_code(filename: str, content: str) -> FixResult:
 
     # Guard: oversized content — universal only (BOM/CRLF/whitespace)
     if len(content) > _MAX_FIX_SIZE:
+        logger.debug(
+            "fix_code: condition_match",
+            extra={"event": "code_fixer.fix_code.match", "reason": "condition_match"},
+        )  # auto:neg
         result = fix_universal(content)
         # Finding #52 fix: clear size format
         result.warnings.append(
@@ -135,6 +176,29 @@ def fix_code(filename: str, content: str) -> FixResult:
     # Select fixer chain: match by exact filename first (Dockerfile),
     # then by extension, then fallback to universal-only
     chain = FIXER_CHAINS.get(name) or FIXER_CHAINS.get(ext) or [fix_universal]
+
+    # Log which chain was selected and how it was matched
+    if name in FIXER_CHAINS:
+        chain_match = "name"
+    elif ext in FIXER_CHAINS:
+        logger.debug(
+            "fix_code: clean", extra={"event": "code_fixer.fix_code.branch.clean"}
+        )
+        chain_match = "ext"
+    else:
+        logger.debug(
+            "fix_code: clean", extra={"event": "code_fixer.fix_code.branch.clean"}
+        )
+        chain_match = "fallback"
+    logger.debug(
+        "Fixer chain selected",
+        extra={
+            "event": "core.chain_selected",
+            "file": filename,
+            "match_type": chain_match,
+            "chain_length": len(chain),
+        },
+    )
 
     # Run chain with error isolation
     combined = _run_chain(
@@ -153,6 +217,10 @@ def fix_code(filename: str, content: str) -> FixResult:
     try:
         cross_lang = fix_cross_language(combined.content)
         if cross_lang.changed:
+            logger.debug(
+                "fix_code: changed",
+                extra={"event": "code_fixer.fix_code.match", "reason": "changed"},
+            )  # auto:neg
             combined.content = cross_lang.content
             combined.changed = True
             combined.fixes_applied.extend(cross_lang.fixes_applied)
@@ -165,7 +233,7 @@ def fix_code(filename: str, content: str) -> FixResult:
         logger.error(
             "Cross-language detector crashed",
             extra={
-                "event": "cross_lang_crash",
+                "event": "core.cross_lang_crash",
                 "file": filename,
                 "error": str(exc),
             },
@@ -178,6 +246,10 @@ def fix_code(filename: str, content: str) -> FixResult:
 
     # Skip duplicate detection for Python — it has its own detector in fix_python()
     if ext != ".py":
+        logger.debug(
+            "fix_code: ext_noteq__py",
+            extra={"event": "code_fixer.fix_code.match", "reason": "ext_noteq__py"},
+        )  # auto:neg
         dup_errors = _detect_duplicate_defs_generic(combined.content, ext)
         combined.errors_found.extend(dup_errors)
 
@@ -187,7 +259,9 @@ def fix_code(filename: str, content: str) -> FixResult:
     # the file is in bad shape. Does NOT block the write.
     try:
         integrity_errors = check_structural_integrity(
-            combined.content, ext, combined.errors_found,
+            combined.content,
+            ext,
+            combined.errors_found,
         )
         combined.errors_found.extend(integrity_errors)
     except Exception as exc:
@@ -197,7 +271,7 @@ def fix_code(filename: str, content: str) -> FixResult:
         logger.error(
             "Structural integrity check crashed",
             extra={
-                "event": "structural_integrity_crash",
+                "event": "core.structural_integrity_crash",
                 "file": filename,
                 "error": str(exc),
             },

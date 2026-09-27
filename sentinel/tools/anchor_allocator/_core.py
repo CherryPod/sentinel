@@ -3,26 +3,29 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 
 class AnchorTier(Enum):
     """Granularity tiers for anchor placement."""
 
-    SECTION = 1   # head, body, style blocks, import blocks
-    BLOCK = 2     # functions, classes, elements with IDs, media queries
-    DETAIL = 3    # individual CSS rules, inner blocks
+    SECTION = 1  # head, body, style blocks, import blocks
+    BLOCK = 2  # functions, classes, elements with IDs, media queries
+    DETAIL = 3  # individual CSS rules, inner blocks
 
     @classmethod
     def from_string(cls, value: str) -> AnchorTier:
         """Convert string to AnchorTier, raising ValueError if invalid."""
         try:
             return cls[value.upper()]
-        except KeyError:
+        except KeyError as exc:
             valid = ", ".join(t.name.lower() for t in cls)
-            raise ValueError(f"Invalid tier '{value}'. Valid: {valid}")
+            raise ValueError(f"Invalid tier '{value}'. Valid: {valid}") from exc
 
 
 @dataclass
@@ -57,16 +60,20 @@ class AnchorResult:
 # Extension -> comment format mapping
 _MARKER_FORMATS: dict[str, str] = {
     ".html": "<!-- anchor: {name} -->",
-    ".htm":  "<!-- anchor: {name} -->",
-    ".py":   "# anchor: {name}",
-    ".sh":   "# anchor: {name}",
+    ".htm": "<!-- anchor: {name} -->",
+    ".py": "# anchor: {name}",
+    ".sh": "# anchor: {name}",
     ".bash": "# anchor: {name}",
     ".yaml": "# anchor: {name}",
-    ".yml":  "# anchor: {name}",
+    ".yml": "# anchor: {name}",
     ".toml": "# anchor: {name}",
-    ".js":   "// anchor: {name}",
-    ".ts":   "// anchor: {name}",
-    ".css":  "/* anchor: {name} */",
+    ".js": "// anchor: {name}",
+    ".mjs": "// anchor: {name}",
+    ".jsx": "// anchor: {name}",
+    ".tsx": "// anchor: {name}",
+    ".ts": "// anchor: {name}",
+    ".css": "/* anchor: {name} */",
+    ".rs": "// anchor: {name}",
 }
 
 

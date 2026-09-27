@@ -20,10 +20,13 @@ Only stdlib is used here (ast, textwrap) — no external dependencies.
 """
 
 import ast
+import logging
 import textwrap
 
 from sentinel.core.config import OLLAMA_NUM_PREDICT
 from sentinel.security.code_extractor import CodeBlock
+
+logger = logging.getLogger(__name__)
 
 # Flag truncation when eval_count / num_predict >= this threshold.
 # At 95%+ utilisation the model is almost certainly against the cap.
@@ -37,22 +40,22 @@ _TOKEN_CAP_THRESHOLD = 0.95
 # but have strong distinguishing signals — check negatives first.
 # ---------------------------------------------------------------------------
 _NOT_PYTHON_MARKERS: list[str] = [
-    "fn ",        # Rust function declaration
-    "let ",       # Rust/JS variable binding
-    "mut ",       # Rust mutable binding
-    "impl ",      # Rust impl block
-    "pub fn",     # Rust public function
+    "fn ",  # Rust function declaration
+    "let ",  # Rust/JS variable binding
+    "mut ",  # Rust mutable binding
+    "impl ",  # Rust impl block
+    "pub fn",  # Rust public function
     "println!(",  # Rust macro
-    "-> {",       # Rust return type + block
-    "(&self)",    # Rust self reference
-    "#include",   # C/C++ include directive
+    "-> {",  # Rust return type + block
+    "(&self)",  # Rust self reference
+    "#include",  # C/C++ include directive
     "int main(",  # C/C++ main function
-    "std::",      # C++ standard library
-    "cout <<",    # C++ output stream
-    "printf(",    # C printf
-    "void ",      # C/C++ void return
-    "#ifndef",    # C/C++ header guard
-    "#define",    # C/C++ macro
+    "std::",  # C++ standard library
+    "cout <<",  # C++ output stream
+    "printf(",  # C printf
+    "void ",  # C/C++ void return
+    "#ifndef",  # C/C++ header guard
+    "#define",  # C/C++ macro
 ]
 
 # ---------------------------------------------------------------------------
@@ -61,10 +64,22 @@ _NOT_PYTHON_MARKERS: list[str] = [
 # in other languages.
 # ---------------------------------------------------------------------------
 _PYTHON_MARKERS: list[str] = [
-    "def ", "class ", "import ", "from ",
-    "if __name__", "async def ", "await ",
-    "self.", "print(", "try:", "except ",
-    "with open(", "raise ", "elif ", "lambda ", "yield ",
+    "def ",
+    "class ",
+    "import ",
+    "from ",
+    "if __name__",
+    "async def ",
+    "await ",
+    "self.",
+    "print(",
+    "try:",
+    "except ",
+    "with open(",
+    "raise ",
+    "elif ",
+    "lambda ",
+    "yield ",
 ]
 
 
@@ -83,6 +98,18 @@ def check_code_quality(
         List of warning strings.  Empty list means no quality issues found.
         Strings are human-readable and suitable for logging and planner context.
     """
+    logger.debug(
+        "check_code_quality called",
+        extra={
+            "event": "quality_gate.check_code_quality",
+            "code_blocks_len": len(code_blocks)
+            if hasattr(code_blocks, "__len__")
+            else 0,
+            "worker_usage_len": len(worker_usage)
+            if hasattr(worker_usage, "__len__")
+            else 0,
+        },
+    )  # auto:entry
     warnings: list[str] = []
 
     # Token-cap truncation check — run once per response, not per block.
@@ -117,6 +144,15 @@ def _check_truncation(worker_usage: dict | None) -> str | None:
     OLLAMA_NUM_PREDICT >= _TOKEN_CAP_THRESHOLD the response very likely
     hit the token cap mid-generation.
     """
+    logger.debug(
+        "_check_truncation called",
+        extra={
+            "event": "quality_gate._check_truncation",
+            "worker_usage_len": len(worker_usage)
+            if hasattr(worker_usage, "__len__")
+            else 0,
+        },
+    )  # auto:entry
     if worker_usage is None:
         return None
 
@@ -148,11 +184,20 @@ def _check_python_syntax(code: str) -> tuple[bool, str]:
         ast.parse(textwrap.dedent(code))
         return True, ""
     except SyntaxError:
-        pass
+        logger.debug(
+            "_check_python_syntax: SyntaxError suppressed",
+            extra={"event": "quality_gate._check_python_syntax.suppressed"},
+            exc_info=True,
+        )
     try:
         ast.parse(code)
         return True, ""
     except SyntaxError as exc:
+        logger.warning(
+            "_check_python_syntax: SyntaxError",
+            extra={"event": "quality_gate.syntax_error", "error": str(exc)},
+            exc_info=True,
+        )
         return False, f"Line {exc.lineno}: {exc.msg}"
 
 
@@ -167,6 +212,13 @@ def _is_likely_python(code: str) -> bool:
     Uses the first 30 lines as a sample — enough to catch language-specific
     patterns without processing large blocks unnecessarily.
     """
+    logger.debug(
+        "_is_likely_python called",
+        extra={
+            "event": "quality_gate._is_likely_python",
+            "code_len": len(code) if hasattr(code, "__len__") else 0,
+        },
+    )  # auto:entry
     lines = code.strip().splitlines()
     if not lines:
         return False

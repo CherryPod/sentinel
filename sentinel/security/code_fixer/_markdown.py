@@ -7,6 +7,7 @@ Fixes common LLM mistakes in Markdown:
 
 Conservative: only fix clearly broken syntax. Don't touch inline backticks.
 """
+
 import logging
 import re
 
@@ -24,7 +25,7 @@ def fix_markdown(content: str) -> FixResult:
     logger.debug(
         "Markdown fixer starting",
         extra={
-            "event": "markdown_fixer_start",
+            "event": "markdown.fixer_start",
             "file": fname,
             "content_length": len(content),
         },
@@ -53,36 +54,36 @@ def fix_markdown(content: str) -> FixResult:
         content = content.rstrip("\n") + "\n" + closing_fence + "\n"
         result.fixes_applied.append("Closed unclosed code fence")
 
+    # Image regex runs FIRST — it is more specific (![) and would otherwise
+    # be consumed by the link regex (which matches [, a superset).
     # Finding #57 fix: simplified regex to prevent catastrophic backtracking.
-    # Finding #27 fix: removed dead endswith(")") check — the regex itself
-    # only matches lines that DON'T end with ), so the lambda guard was dead code.
-    # Unbalanced link syntax: [text](url  -> [text](url)
-    content = re.sub(
-        r'\[([^\]]*)\]\(([^)]+)\s*$',
-        lambda m: m.group(0) + ")",
-        content,
-        flags=re.MULTILINE,
-    )
-
-    # Finding #28 fix: use proper list membership check instead of
-    # str(result.fixes_applied) substring match
-    if content != original and "Closed unbalanced link/image syntax" not in result.fixes_applied:
-        result.fixes_applied.append("Closed unbalanced link/image syntax")
-
-    # Unbalanced image syntax: ![alt](src  -> ![alt](src)
-    # Uses the same simplified regex pattern (Finding #57)
     pre_image = content
     content = re.sub(
-        r'!\[([^\]]*)\]\(([^)]+)\s*$',
+        r"!\[([^\]]*)\]\(([^)]+)\s*$",
         lambda m: m.group(0) + ")",
         content,
         flags=re.MULTILINE,
     )
-
-    # Finding #28 fix: proper list membership check for dedup
-    if content != pre_image and "Closed unbalanced link/image syntax" not in result.fixes_applied:
+    if content != pre_image:
         if "Closed unbalanced image syntax" not in result.fixes_applied:
             result.fixes_applied.append("Closed unbalanced image syntax")
+
+    # Unbalanced link syntax: [text](url  -> [text](url)
+    # Negative lookbehind (?<!!) prevents matching image links already
+    # handled above.
+    # Finding #27 fix: removed dead endswith(")") check.
+    pre_link = content
+    content = re.sub(
+        r"(?<!!)\[([^\]]*)\]\(([^)]+)\s*$",
+        lambda m: m.group(0) + ")",
+        content,
+        flags=re.MULTILINE,
+    )
+    if (
+        content != pre_link
+        and "Closed unbalanced link/image syntax" not in result.fixes_applied
+    ):
+        result.fixes_applied.append("Closed unbalanced link/image syntax")
 
     result.content = content
     result.changed = content != original
@@ -91,9 +92,9 @@ def fix_markdown(content: str) -> FixResult:
         logger.debug(
             "Markdown fixer applied changes",
             extra={
-                "event": "markdown_fixer_done",
+                "event": "markdown.fixer_done",
                 "file": fname,
-                "fixes": result.fixes_applied,
+                "fix_description": ", ".join(result.fixes_applied),
             },
         )
 

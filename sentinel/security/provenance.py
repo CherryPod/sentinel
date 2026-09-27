@@ -16,13 +16,13 @@ import json
 import logging
 import threading
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, cast
 
 from sentinel.core.context import current_user_id, get_task_id
 from sentinel.core.models import DataSource, TaggedData, TrustLevel
 
-logger = logging.getLogger("sentinel.audit")
+logger = logging.getLogger(__name__)
 
 MAX_PROVENANCE_ENTRIES = 10_000
 MAX_FILE_PROVENANCE_ENTRIES = 10_000
@@ -30,7 +30,7 @@ MAX_FILE_PROVENANCE_ENTRIES = 10_000
 
 def _dt_to_iso(dt: datetime | None) -> str:
     if dt is None:
-        return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+        return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
     return dt.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
@@ -47,9 +47,9 @@ def _row_to_tagged(row: Any) -> TaggedData:
     if not isinstance(created_at, datetime):
         logger.warning(
             "Provenance record has non-datetime created_at, using now()",
-            extra={"event": "provenance_invalid_timestamp", "data_id": row["data_id"]},
+            extra={"event": "provenance.invalid_timestamp", "data_id": row["data_id"]},
         )
-        created_at = datetime.now(timezone.utc)
+        created_at = datetime.now(UTC)
 
     return TaggedData(
         id=row["data_id"],
@@ -74,7 +74,9 @@ class ProvenanceStore:
         self._in_memory = pool is None
         if self._in_memory:
             self._store: dict[str, tuple[TaggedData, int]] = {}  # (entry, user_id)
-            self._file_provenance: dict[tuple[str, int], tuple[str, str]] = {}  # (path, user_id) -> (data_id, hash)
+            self._file_provenance: dict[
+                tuple[str, int], tuple[str, str]
+            ] = {}  # (path, user_id) -> (data_id, hash)
 
     async def reset_store(self) -> None:
         """Clear ALL provenance data for ALL users.
@@ -83,6 +85,10 @@ class ProvenanceStore:
         both file_provenance and provenance tables. Used in tests and
         administrative maintenance only — never call from user-facing code.
         """
+        logger.warning(
+            "Provenance store full reset",
+            extra={"event": "provenance.reset_store", "in_memory": self._in_memory},
+        )
         if self._in_memory:
             self._store.clear()
             self._file_provenance.clear()
@@ -113,7 +119,7 @@ class ProvenanceStore:
                     logger.warning(
                         "Trust downgrade: missing parent",
                         extra={
-                            "event": "provenance_missing_parent",
+                            "event": "provenance.missing_parent",
                             "parent_id": pid,
                             "source": source.value,
                             "originated_from": originated_from,
@@ -142,7 +148,7 @@ class ProvenanceStore:
             trust_level=effective_trust,
             source=source,
             originated_from=originated_from,
-            timestamp=datetime.now(timezone.utc),
+            timestamp=datetime.now(UTC),
             derived_from=derived,
         )
 
@@ -169,7 +175,7 @@ class ProvenanceStore:
             logger.exception(
                 "Failed to persist provenance entry",
                 extra={
-                    "event": "provenance_insert_failed",
+                    "event": "provenance.insert_failed",
                     "data_id": tagged.id,
                     "source": source.value,
                 },
@@ -179,7 +185,9 @@ class ProvenanceStore:
         return tagged
 
     async def get_tagged_data(
-        self, data_id: str, user_id: int | None = None,
+        self,
+        data_id: str,
+        user_id: int | None = None,
     ) -> TaggedData | None:
         """Retrieve a single provenance entry by data_id.
 
@@ -215,7 +223,10 @@ class ProvenanceStore:
             return _row_to_tagged(row)
 
     async def update_content(
-        self, data_id: str, content: str, user_id: int | None = None,
+        self,
+        data_id: str,
+        content: str,
+        user_id: int | None = None,
     ) -> bool:
         """Update the content of an existing provenance entry.
 
@@ -232,7 +243,9 @@ class ProvenanceStore:
             tagged.content = content
             return True
         if user_id is not None:
-            sql = "UPDATE provenance SET content = $1 WHERE data_id = $2 AND user_id = $3"
+            sql = (
+                "UPDATE provenance SET content = $1 WHERE data_id = $2 AND user_id = $3"
+            )
             params: tuple = (content, data_id, user_id)
         else:
             sql = "UPDATE provenance SET content = $1 WHERE data_id = $2"
@@ -243,7 +256,9 @@ class ProvenanceStore:
             return result == "UPDATE 1"
 
     async def get_provenance_chain(
-        self, data_id: str, max_depth: int = 50,
+        self,
+        data_id: str,
+        max_depth: int = 50,
         user_id: int | None = None,
     ) -> list[TaggedData]:
         """Walk the provenance chain back to the roots.
@@ -280,7 +295,7 @@ class ProvenanceStore:
                 FROM chain
                 JOIN provenance p ON p.data_id = chain.data_id
                 {user_filter}
-                """,
+                """,  # nosec B608 — user_filter is a hardcoded string literal; values parameterised via asyncpg
                 *params,
             )
             return [_row_to_tagged(r) for r in rows]
@@ -289,14 +304,48 @@ class ProvenanceStore:
         """Check whether data (and all its ancestors) are trusted.
 
         Returns False for unknown data_ids (empty chain) — unknown = untrusted.
+        Returns False (explicit fail-closed) if the chain walk raises —
+        DB pool exhaustion / asyncpg connection error / query timeout
+        all collapse to "unknown ancestry, treat as untrusted." Q10-F5
+        makes the invariant explicit so a future caller refactor cannot
+        silently downgrade UNTRUSTED-via-error to TRUSTED.
         """
-        chain = await self.get_provenance_chain(data_id)
-        if not chain:
+        logger.debug(
+            "Trust safety check started",
+            extra={"event": "provenance.trust_check", "data_id": data_id},
+        )
+        try:
+            chain = await self.get_provenance_chain(data_id)
+        except Exception:
+            logger.warning(
+                "provenance trust check failed — fail-closed",
+                extra={
+                    "event": "provenance.trust_check_failed",
+                    "data_id": data_id,
+                    "error_category": "provenance_chain_failure",
+                },
+                exc_info=True,
+            )
             return False
-        return all(item.trust_level == TrustLevel.TRUSTED for item in chain)
+        safe = bool(chain) and all(
+            item.trust_level == TrustLevel.TRUSTED for item in chain
+        )
+        logger.debug(
+            "Trust safety check result",
+            extra={
+                "event": "provenance.trust_check_result",
+                "data_id": data_id,
+                "safe": safe,
+                "chain_len": len(chain),
+            },
+        )
+        return safe
 
     async def record_file_write(
-        self, path: str, data_id: str, content: str | bytes = "",
+        self,
+        path: str,
+        data_id: str,
+        content: str | bytes = "",
         user_id: int | None = None,
     ) -> None:
         """Record that a file was written by a specific provenance chain entry.
@@ -305,34 +354,65 @@ class ProvenanceStore:
         later verify the file hasn't been overwritten outside the pipeline
         (prevents trust laundering via the provenance-overwrite attack).
         """
+        logger.debug(
+            "Recording file write provenance",
+            extra={
+                "event": "provenance.record_file_write",
+                "data_id": data_id,
+                "path_len": len(path),
+            },
+        )
         resolved_user_id = user_id if user_id is not None else current_user_id.get()
         content_bytes = content.encode() if isinstance(content, str) else content
         content_hash = hashlib.sha256(content_bytes).hexdigest()
         if self._in_memory:
+            logger.debug(
+                "record_file_write: in_memory",
+                extra={
+                    "event": "provenance.record_file_write_error.clean",
+                    "reason": "in_memory",
+                },
+            )  # auto:neg
             self._file_provenance[(path, resolved_user_id)] = (data_id, content_hash)
             self._evict_oldest(self._file_provenance, MAX_FILE_PROVENANCE_ENTRIES)
         else:
-            async with self._pool.acquire() as conn:
-                await conn.execute(
-                    "INSERT INTO file_provenance (file_path, writer_data_id, user_id, content_sha256) "
-                    "VALUES ($1, $2, $3, $4) "
-                    "ON CONFLICT (file_path, user_id) DO UPDATE SET "
-                    "writer_data_id = EXCLUDED.writer_data_id, "
-                    "content_sha256 = EXCLUDED.content_sha256, created_at = NOW()",
-                    path, data_id, resolved_user_id, content_hash,
+            try:
+                async with self._pool.acquire() as conn:
+                    await conn.execute(
+                        "INSERT INTO file_provenance (file_path, writer_data_id, user_id, content_sha256) "
+                        "VALUES ($1, $2, $3, $4) "
+                        "ON CONFLICT (file_path, user_id) DO UPDATE SET "
+                        "writer_data_id = EXCLUDED.writer_data_id, "
+                        "content_sha256 = EXCLUDED.content_sha256, created_at = NOW()",
+                        path,
+                        data_id,
+                        resolved_user_id,
+                        content_hash,
+                    )
+            except Exception:
+                logger.exception(
+                    "Failed to record file provenance",
+                    extra={
+                        "event": "provenance.record_file_write_error",
+                        "data_id": data_id,
+                        "path_len": len(path),
+                    },
                 )
+                raise
         logger.info(
             "File provenance recorded",
             extra={
-                "event": "file_provenance_write",
-                "path": path,
+                "event": "provenance.file_write",
+                "path_len": len(path),
                 "data_id": data_id,
                 "user_id": resolved_user_id,
             },
         )
 
     async def get_file_writer(
-        self, path: str, user_id: int | None = None,
+        self,
+        path: str,
+        user_id: int | None = None,
     ) -> tuple[str, str] | None:
         """Get the (data_id, content_sha256) of the last provenance write to this file.
 
@@ -348,12 +428,16 @@ class ProvenanceStore:
                     return value
             return None
         if user_id is not None:
-            sql = ("SELECT writer_data_id, content_sha256 FROM file_provenance "
-                   "WHERE file_path = $1 AND user_id = $2")
+            sql = (
+                "SELECT writer_data_id, content_sha256 FROM file_provenance "
+                "WHERE file_path = $1 AND user_id = $2"
+            )
             params: tuple = (path, user_id)
         else:
-            sql = ("SELECT writer_data_id, content_sha256 FROM file_provenance "
-                   "WHERE file_path = $1")
+            sql = (
+                "SELECT writer_data_id, content_sha256 FROM file_provenance "
+                "WHERE file_path = $1"
+            )
             params = (path,)
         async with self._pool.acquire() as conn:
             row = await conn.fetchrow(sql, *params)
@@ -379,32 +463,31 @@ class ProvenanceStore:
             file_params = (days,)
             prov_params = (days,)
 
-        async with self._pool.acquire() as conn:
-            async with conn.transaction():
-                # file_provenance rows are scoped via the provenance subquery
-                # (joining on writer_data_id which is globally unique per data_id).
-                # No direct user_id filter needed on file_provenance — the
-                # provenance.user_id filter in the subquery handles scoping.
-                await conn.execute(
-                    "DELETE FROM file_provenance WHERE writer_data_id IN ("
-                    "  SELECT data_id FROM provenance "
-                    f"  WHERE created_at < NOW() - INTERVAL '1 day' * $1{user_filter}"
-                    ")",
-                    *file_params,
-                )
-                result = await conn.execute(
-                    "DELETE FROM provenance "
-                    f"WHERE created_at < NOW() - INTERVAL '1 day' * $1{user_filter}",
-                    *prov_params,
-                )
-                # asyncpg returns "DELETE N"
-                deleted = int(result.split()[-1]) if result else 0
+        async with self._pool.acquire() as conn, conn.transaction():
+            # file_provenance rows are scoped via the provenance subquery
+            # (joining on writer_data_id which is globally unique per data_id).
+            # No direct user_id filter needed on file_provenance — the
+            # provenance.user_id filter in the subquery handles scoping.
+            await conn.execute(
+                "DELETE FROM file_provenance WHERE writer_data_id IN ("
+                "  SELECT data_id FROM provenance "
+                f"  WHERE created_at < NOW() - INTERVAL '1 day' * $1{user_filter}"  # nosec B608 — user_filter is a hardcoded literal; values parameterised via asyncpg
+                ")",
+                *file_params,
+            )
+            result = await conn.execute(
+                "DELETE FROM provenance "
+                f"WHERE created_at < NOW() - INTERVAL '1 day' * $1{user_filter}",  # nosec B608 — user_filter is a hardcoded literal; values parameterised via asyncpg
+                *prov_params,
+            )
+            # asyncpg returns "DELETE N"
+            deleted = int(result.split()[-1]) if result else 0
 
         if deleted > 0:
             logger.info(
                 "Provenance cleanup",
                 extra={
-                    "event": "provenance_cleanup",
+                    "event": "provenance.cleanup",
                     "deleted": deleted,
                     "days": days,
                     "user_id": user_id,
@@ -415,14 +498,30 @@ class ProvenanceStore:
     # ── In-memory helpers ──────────────────────────────────────
 
     def _get_provenance_chain_mem(
-        self, data_id: str, max_depth: int, user_id: int | None = None,
+        self,
+        data_id: str,
+        max_depth: int,
+        user_id: int | None = None,
     ) -> list[TaggedData]:
+        logger.debug(
+            "_get_provenance_chain_mem called",
+            extra={
+                "event": "provenance._get_provenance_chain_mem",
+                "data_id": data_id,
+                "max_depth": max_depth,
+                "user_id": user_id,
+            },
+        )  # auto:entry
         chain: list[TaggedData] = []
         visited: set[str] = set()
-        queue = collections.deque([data_id])
+        # Track (node_id, hop_depth) to match the PG CTE's chain.depth < $2 limit.
+        # Depth-per-node (not total-node-count) ensures a wide graph cannot exhaust
+        # the budget before visiting all siblings at one level and their UNTRUSTED
+        # ancestors at the next level.
+        queue: collections.deque[tuple[str, int]] = collections.deque([(data_id, 0)])
 
-        while queue and len(chain) < max_depth:
-            current_id = queue.popleft()
+        while queue:
+            current_id, depth = queue.popleft()
             if current_id in visited:
                 continue
             visited.add(current_id)
@@ -433,17 +532,20 @@ class ProvenanceStore:
             tagged, owner_id = item
 
             chain.append(tagged)
-            for parent_id in tagged.derived_from:
-                if parent_id not in visited:
-                    queue.append(parent_id)
+            # Mirror PG CTE: WHERE chain.depth < $2 — nodes at depth == max_depth
+            # ARE visited and added to chain; their parents are not enqueued.
+            if depth < max_depth:
+                for parent_id in tagged.derived_from:
+                    if parent_id not in visited:
+                        queue.append((parent_id, depth + 1))
 
         # Filter final result by user_id (matches PG CTE behaviour: walk all
         # users for trust inheritance, but return only the caller's nodes)
         if user_id is not None:
             chain = [
-                t for t in chain
-                if self._store.get(t.id) is not None
-                and self._store[t.id][1] == user_id
+                t
+                for t in chain
+                if self._store.get(t.id) is not None and self._store[t.id][1] == user_id
             ]
         return chain
 
@@ -457,6 +559,11 @@ class ProvenanceStore:
 
 # ── Module-level default store + wrapper functions ─────────────
 
+# ASYNCIO SAFETY: _default_store is written once at startup via set_default_store()
+# (called from lifespan before any async tasks run) and read by all wrapper functions
+# below. All reads are from the single-threaded async event loop, so no lock is needed
+# for reads — the GIL + startup-only writes guarantee consistency. The _store_lock
+# exists solely to protect the one-time swap in set_default_store().
 _default_store = ProvenanceStore(pool=None)
 _store_lock = threading.Lock()  # C-004: protect default store swap
 
@@ -482,18 +589,29 @@ async def create_tagged_data(
     user_id: int | None = None,
 ) -> TaggedData:
     return await _default_store.create_tagged_data(
-        content, source, trust_level, originated_from, parent_ids, user_id,
+        content,
+        source,
+        trust_level,
+        originated_from,
+        parent_ids,
+        user_id,
     )
 
 
-async def get_tagged_data(data_id: str, user_id: int | None = None) -> TaggedData | None:
+async def get_tagged_data(
+    data_id: str, user_id: int | None = None
+) -> TaggedData | None:
     return await _default_store.get_tagged_data(data_id, user_id=user_id)
 
 
 async def get_provenance_chain(
-    data_id: str, max_depth: int = 50, user_id: int | None = None,
+    data_id: str,
+    max_depth: int = 50,
+    user_id: int | None = None,
 ) -> list[TaggedData]:
-    return await _default_store.get_provenance_chain(data_id, max_depth, user_id=user_id)
+    return await _default_store.get_provenance_chain(
+        data_id, max_depth, user_id=user_id
+    )
 
 
 async def is_trust_safe_for_execution(data_id: str) -> bool:
@@ -501,17 +619,25 @@ async def is_trust_safe_for_execution(data_id: str) -> bool:
 
 
 async def record_file_write(
-    path: str, data_id: str, content: str | bytes = "",
+    path: str,
+    data_id: str,
+    content: str | bytes = "",
     user_id: int | None = None,
 ) -> None:
-    await _default_store.record_file_write(path, data_id, content=content, user_id=user_id)
+    await _default_store.record_file_write(
+        path, data_id, content=content, user_id=user_id
+    )
 
 
-async def get_file_writer(path: str, user_id: int | None = None) -> tuple[str, str] | None:
+async def get_file_writer(
+    path: str, user_id: int | None = None
+) -> tuple[str, str] | None:
     return await _default_store.get_file_writer(path, user_id=user_id)
 
 
-async def update_content(data_id: str, content: str, user_id: int | None = None) -> bool:
+async def update_content(
+    data_id: str, content: str, user_id: int | None = None
+) -> bool:
     return await _default_store.update_content(data_id, content, user_id=user_id)
 
 
@@ -522,4 +648,4 @@ async def cleanup_old(days: int = 7, user_id: int | None = None) -> int:
 if TYPE_CHECKING:
     from sentinel.core.store_protocols import ProvenanceStoreProtocol
 
-    _: ProvenanceStoreProtocol = cast(ProvenanceStoreProtocol, ProvenanceStore())
+    _: ProvenanceStoreProtocol = cast("ProvenanceStoreProtocol", ProvenanceStore())

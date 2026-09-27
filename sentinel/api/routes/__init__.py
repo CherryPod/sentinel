@@ -4,7 +4,7 @@ DI Contract — init() globals pattern
 =====================================
 
 Every route module in this package follows the same dependency-injection
-pattern used throughout the codebase (contacts.py, red_team.py, etc.).
+pattern used throughout the codebase (contacts.py, and the other route modules).
 This avoids introducing FastAPI ``Depends()`` into a codebase that uses
 it nowhere, and keeps test setup trivial.
 
@@ -52,3 +52,7 @@ Pattern (reference implementation: ``sentinel/api/contacts.py``):
    Either way: no monkey-patching, no ``Depends()`` overrides, no
    special test harness.
 """
+
+import logging
+
+logger = logging.getLogger(__name__)

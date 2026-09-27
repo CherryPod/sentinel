@@ -12,7 +12,9 @@ from dataclasses import dataclass
 
 import httpx
 
-logger = logging.getLogger("sentinel.audit")
+from sentinel.crypto.blind_index import log_hash
+
+logger = logging.getLogger(__name__)
 
 # Maximum snippet length after sanitisation
 _MAX_SNIPPET_LEN = 500
@@ -21,13 +23,14 @@ _MAX_SNIPPET_LEN = 500
 @dataclass
 class SearchResult:
     """A single search result."""
+
     title: str
     url: str
     snippet: str
 
 
-class SearchError(Exception):
-    """Error during web search."""
+# Moved to sentinel.core.exceptions (SH-3) — re-exported here.
+from sentinel.core.exceptions import SearchError
 
 
 class SearchBackend(ABC):
@@ -48,6 +51,14 @@ class BraveSearchBackend(SearchBackend):
 
     async def search(self, query: str, count: int = 5) -> list[SearchResult]:
         """Search via Brave Web Search API."""
+        logger.debug(
+            "search called",
+            extra={
+                "event": "web_search.search",
+                "query_len": len(query) if hasattr(query, "__len__") else 0,
+                "count": count,
+            },
+        )  # auto:entry
         try:
             async with httpx.AsyncClient(timeout=self._timeout) as client:
                 resp = await client.get(
@@ -59,9 +70,45 @@ class BraveSearchBackend(SearchBackend):
                     },
                 )
         except httpx.TimeoutException as exc:
-            raise SearchError(f"search request timed out: {exc}") from exc
+            exc_str = str(exc)
+            try:
+                exc_hash = log_hash(exc_str)
+            except Exception:
+                logger.warning(
+                    "log_hash unavailable for exc, using fallback",
+                    exc_info=True,
+                    extra={"event": "crypto.log_hash_fallback"},
+                )
+                exc_hash = "hash-error"
+            logger.debug(
+                "search request timed out",
+                extra={
+                    "event": "web_search.timeout",
+                    "exc_hash": exc_hash,
+                    "exc_len": len(exc_str),
+                },
+            )
+            raise SearchError("search request timed out") from exc
         except httpx.ConnectError as exc:
-            raise SearchError(f"search backend unavailable: {exc}") from exc
+            exc_str = str(exc)
+            try:
+                exc_hash = log_hash(exc_str)
+            except Exception:
+                logger.warning(
+                    "log_hash unavailable for exc, using fallback",
+                    exc_info=True,
+                    extra={"event": "crypto.log_hash_fallback"},
+                )
+                exc_hash = "hash-error"
+            logger.debug(
+                "search backend unavailable",
+                extra={
+                    "event": "web_search.connect_error",
+                    "exc_hash": exc_hash,
+                    "exc_len": len(exc_str),
+                },
+            )
+            raise SearchError("search backend unavailable") from exc
 
         if resp.status_code == 429:
             raise SearchError("rate limited by search API")
@@ -73,11 +120,13 @@ class BraveSearchBackend(SearchBackend):
 
         results = []
         for item in web_results[:count]:
-            results.append(SearchResult(
-                title=_sanitize_text(item.get("title", "")),
-                url=item.get("url", ""),
-                snippet=_sanitize_text(item.get("description", "")),
-            ))
+            results.append(
+                SearchResult(
+                    title=_sanitize_text(item.get("title", "")),
+                    url=item.get("url", ""),
+                    snippet=_sanitize_text(item.get("description", "")),
+                )
+            )
         return results
 
 
@@ -90,6 +139,14 @@ class SearXNGBackend(SearchBackend):
 
     async def search(self, query: str, count: int = 5) -> list[SearchResult]:
         """Search via SearXNG JSON API."""
+        logger.debug(
+            "search called",
+            extra={
+                "event": "web_search.search",
+                "query_len": len(query) if hasattr(query, "__len__") else 0,
+                "count": count,
+            },
+        )  # auto:entry
         try:
             async with httpx.AsyncClient(timeout=self._timeout) as client:
                 resp = await client.get(
@@ -97,9 +154,45 @@ class SearXNGBackend(SearchBackend):
                     params={"q": query, "format": "json"},
                 )
         except httpx.TimeoutException as exc:
-            raise SearchError(f"search request timed out: {exc}") from exc
+            exc_str = str(exc)
+            try:
+                exc_hash = log_hash(exc_str)
+            except Exception:
+                logger.warning(
+                    "log_hash unavailable for exc, using fallback",
+                    exc_info=True,
+                    extra={"event": "crypto.log_hash_fallback"},
+                )
+                exc_hash = "hash-error"
+            logger.debug(
+                "search request timed out",
+                extra={
+                    "event": "web_search.timeout",
+                    "exc_hash": exc_hash,
+                    "exc_len": len(exc_str),
+                },
+            )
+            raise SearchError("search request timed out") from exc
         except httpx.ConnectError as exc:
-            raise SearchError(f"search backend unavailable: {exc}") from exc
+            exc_str = str(exc)
+            try:
+                exc_hash = log_hash(exc_str)
+            except Exception:
+                logger.warning(
+                    "log_hash unavailable for exc, using fallback",
+                    exc_info=True,
+                    extra={"event": "crypto.log_hash_fallback"},
+                )
+                exc_hash = "hash-error"
+            logger.debug(
+                "search backend unavailable",
+                extra={
+                    "event": "web_search.connect_error",
+                    "exc_hash": exc_hash,
+                    "exc_len": len(exc_str),
+                },
+            )
+            raise SearchError("search backend unavailable") from exc
 
         if resp.status_code == 429:
             raise SearchError("rate limited by search API")
@@ -111,11 +204,13 @@ class SearXNGBackend(SearchBackend):
 
         results = []
         for item in raw_results[:count]:
-            results.append(SearchResult(
-                title=_sanitize_text(item.get("title", "")),
-                url=item.get("url", ""),
-                snippet=_sanitize_text(item.get("content", "")),
-            ))
+            results.append(
+                SearchResult(
+                    title=_sanitize_text(item.get("title", "")),
+                    url=item.get("url", ""),
+                    snippet=_sanitize_text(item.get("content", "")),
+                )
+            )
         return results
 
 
@@ -140,6 +235,13 @@ _HTML_TAG_RE = re.compile(r"<[^>]+>")
 def _sanitize_text(text: str) -> str:
     """Strip HTML tags, decode entities, truncate to max length."""
     # Strip HTML tags
+    logger.debug(
+        "_sanitize_text called",
+        extra={
+            "event": "web_search._sanitize_text",
+            "text_len": len(text) if hasattr(text, "__len__") else 0,
+        },
+    )  # auto:entry
     text = _HTML_TAG_RE.sub("", text)
     # Decode HTML entities
     text = html.unescape(text)
@@ -156,14 +258,39 @@ def _load_api_key(key_file: str) -> str:
     try:
         with open(key_file) as f:
             return f.read().strip()
-    except FileNotFoundError:
-        raise SearchError(f"API key file not found: {key_file}")
+    except FileNotFoundError as exc:
+        raise SearchError(f"API key file not found: {key_file}") from exc
     except OSError as exc:
-        raise SearchError(f"Cannot read API key file: {exc}")
+        exc_str = str(exc)
+        try:
+            exc_hash = log_hash(exc_str)
+        except Exception:
+            logger.warning(
+                "log_hash unavailable for exc, using fallback",
+                exc_info=True,
+                extra={"event": "crypto.log_hash_fallback"},
+            )
+            exc_hash = "hash-error"
+        logger.debug(
+            "API key file read failed",
+            extra={
+                "event": "web_search.load_api_key_error",
+                "exc_hash": exc_hash,
+                "exc_len": len(exc_str),
+            },
+        )
+        raise SearchError("cannot read API key file") from exc
 
 
 def create_search_backend(settings) -> SearchBackend:
     """Factory: settings.web_search_backend -> BraveSearchBackend or SearXNGBackend."""
+    logger.debug(
+        "create_search_backend called",
+        extra={
+            "event": "web_search.create_search_backend",
+            "settings_type": type(settings).__name__,
+        },
+    )  # auto:entry
     backend_name = settings.web_search_backend.lower()
     timeout = settings.web_search_timeout
 
@@ -174,10 +301,9 @@ def create_search_backend(settings) -> SearchBackend:
             api_key=api_key,
             timeout=timeout,
         )
-    elif backend_name == "searxng":
+    if backend_name == "searxng":
         return SearXNGBackend(
             api_url=settings.web_search_api_url,
             timeout=timeout,
         )
-    else:
-        raise SearchError(f"Unknown search backend: {backend_name}")
+    raise SearchError(f"Unknown search backend: {backend_name}")

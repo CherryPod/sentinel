@@ -6,7 +6,7 @@ If you discover a security vulnerability in Sentinel, please report it responsib
 
 **Do NOT open a public GitHub issue for security vulnerabilities.**
 
-Instead, use [GitHub Security Advisories](https://github.com/anthropics/sentinel/security/advisories/new) to report vulnerabilities privately. If the advisories link is unavailable, open a private security report via the repository's "Security" tab.
+Instead, use [GitHub Security Advisories](https://github.com/CherryPod/sentinel/security/advisories/new) to report vulnerabilities privately. If the advisories link is unavailable, open a private security report via the repository's "Security" tab.
 
 Include:
 - Description of the vulnerability
@@ -21,7 +21,7 @@ You should receive an acknowledgement within 48 hours. We aim to provide a fix o
 The following are in scope for security reports:
 
 - Bypasses of the 10-layer security pipeline
-- Prompt injection that produces genuinely dangerous output (not just "escaped" — see our [triage methodology](docs/assessments/v3-security-analysis.md))
+- Prompt injection that produces genuinely dangerous output (a refusal or a blocked tool call is not, by itself, an exploit)
 - Air-gap violations (any way for the worker LLM to reach the internet)
 - Authentication bypasses (PIN auth, CSRF protection)
 - Trust laundering (untrusted data reaching dangerous operations without scanning)
@@ -41,11 +41,7 @@ The following are **out of scope**:
 
 ## Security Architecture
 
-Sentinel's security model is documented in detail:
-
-- [Security Model](docs/security-model.md) — full description of the 10-layer pipeline, CaMeL trust model, and threat model
-- [v3 Security Analysis](docs/assessments/v3-security-analysis.md) — results from 811 adversarial prompts across 21+ attack categories
-- [Expert Report](docs/assessments/v3-expert-report.md) — independent assessment of the v3 benchmark
+The threat model is the one in the README: the worker model is untrusted, tool execution is sandboxed, and the controller is the trust boundary. Unit tests under `tests/` cover the scanners, policy engine, and auth gate.
 
 ## Supported Versions
 

@@ -14,8 +14,13 @@ from pydantic import BaseModel
 
 from sentinel.core.context import current_user_id
 from sentinel.core.credential_store import mask_sensitive
+from sentinel.security.ssrf import (
+    UrlValidationError,
+    _parse_allowlist,
+    parse_and_check_syntactic,
+)
 
-logger = logging.getLogger("sentinel.api.credentials")
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/credentials")
 
@@ -41,6 +46,7 @@ def _get_store():
 
 class CredentialSet(BaseModel):
     """Credential data to store. Fields vary by service."""
+
     model_config = {"extra": "allow"}
 
 
@@ -67,6 +73,13 @@ async def get_credential(service: str):
     data = await store.get(service)
     if data is None:
         raise HTTPException(status_code=404, detail=f"No credentials for {service}")
+    uid = current_user_id.get()
+    logger.info(
+        "Credential read for service=%s by user_id=%d",
+        service,
+        uid,
+        extra={"event": "credential.read"},
+    )
     return CredentialResponse(service=service, data=mask_sensitive(data))
 
 
@@ -77,11 +90,58 @@ async def set_credential(service: str, req: CredentialSet):
     data = req.model_dump()
     if not data:
         raise HTTPException(status_code=400, detail="No credential data provided")
+    _validate_service_credential(service, data)
     await store.set(service, data)
     uid = current_user_id.get()
-    logger.info("Credential set for service=%s by user_id=%d", service, uid,
-                extra={"event": "credential_set"})
+    logger.info(
+        "Credential set for service=%s by user_id=%d",
+        service,
+        uid,
+        extra={"event": "credential.set"},
+    )
     return {"status": "stored", "service": service}
+
+
+def _validate_service_credential(service: str, data: dict) -> None:
+    """Per-service syntactic validation before the opaque store.set.
+
+    Q12-F1: CalDAV credentials accept an attacker-controllable URL string
+    that flows into ``caldav.DAVClient``. Enforce SSRF policy at PUT so
+    operators see a 400 immediately rather than a deferred ToolError.
+    Use-time ``resolve_and_check_private`` is the hard enforcement
+    boundary (see ``caldav_calendar._get_caldav_client``) — this PUT
+    gate is belt-and-braces, not the only line.
+    """
+    if service != "caldav":
+        return
+    url = data.get("url")
+    if not url or not isinstance(url, str):
+        return
+    # Deferred import: settings reach here via module import cycle otherwise.
+    from sentinel.core.config import Settings
+
+    settings = Settings()
+    allowlist = _parse_allowlist(settings.ssrf_caldav_allowlist)
+    try:
+        parse_and_check_syntactic(
+            url,
+            allow_http=settings.ssrf_allow_http,
+            allowlist=allowlist,
+        )
+    except UrlValidationError as exc:
+        logger.info(
+            "Credential PUT rejected by SSRF policy",
+            extra={
+                "event": "credential.set_rejected",
+                "service": service,
+                "reason": exc.category,
+                "host": exc.host,
+            },
+        )
+        raise HTTPException(
+            status_code=400,
+            detail=f"caldav url rejected: {exc.reason}",
+        ) from exc
 
 
 @router.delete("/{service}")
@@ -89,9 +149,13 @@ async def delete_credential(service: str):
     """Delete credentials for a service."""
     store = _get_store()
     deleted = await store.delete(service)
-    uid = current_user_id.get()
-    logger.info("Credential deleted for service=%s by user_id=%d", service, uid,
-                extra={"event": "credential_deleted"})
     if not deleted:
         raise HTTPException(status_code=404, detail=f"No credentials for {service}")
+    uid = current_user_id.get()
+    logger.info(
+        "Credential deleted for service=%s by user_id=%d",
+        service,
+        uid,
+        extra={"event": "credential.deleted"},
+    )
     return {"status": "deleted", "service": service}

@@ -21,9 +21,16 @@ from dataclasses import dataclass
 from email.mime.text import MIMEText
 from email.utils import formatdate, make_msgid
 
-logger = logging.getLogger("sentinel.audit")
+logger = logging.getLogger(__name__)
+# Q13-F12: audit channel for credential-discipline events (plaintext auth refusal,
+# localhost-allowed plaintext warning). Distinct from `logger` so events route to
+# the audit stream rather than just the application log.
+audit = logging.getLogger("sentinel.audit")
 
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
+
+# Maximum length for snippet/preview text in search results
+_SNIPPET_MAX_LEN = 200
 
 
 def _mask_email(address: str) -> str:
@@ -38,17 +45,20 @@ def _mask_query(query: str) -> str:
     return re.sub(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+", _mask_email, query)[:100]
 
 
-class ImapEmailError(Exception):
-    """Error from IMAP/SMTP operations."""
-
+# Moved to sentinel.core.exceptions (SH-3) — re-exported here.
+from sentinel.core.decorators import no_audit_log
+from sentinel.core.exceptions import ImapEmailError
+from sentinel.crypto.blind_index import log_hash
 
 # ---------------------------------------------------------------------------
 # Data classes — compatible with gmail.py EmailSearchResult / EmailMessage
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class EmailSearchResult:
     """Summary of an email from a search result."""
+
     message_id: str
     thread_id: str
     subject: str
@@ -60,6 +70,7 @@ class EmailSearchResult:
 @dataclass
 class EmailMessage:
     """Full email message with decoded body."""
+
     message_id: str
     thread_id: str
     subject: str
@@ -78,37 +89,85 @@ _LOCALHOST_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
 
 
 def _build_ssl_context(
-    tls_mode: str, cert_file: str, host: str = "",
+    tls_mode: str,
+    cert_file: str,
+    host: str = "",
 ) -> ssl.SSLContext | None:
     """Build an SSL context for IMAP or SMTP connections.
 
     Supports custom CA certs for self-signed servers (Proton Bridge).
     Falls back to CERT_NONE only for verified localhost connections.
     """
-    # #2 LOW: warn on plaintext mode — credentials traverse network in cleartext
+    # Q13-F12: tls_mode="none" disables TLS context construction. For IMAP this
+    # means imaplib.IMAP4 (no STARTTLS) — credentials traverse the wire in
+    # cleartext via the LOGIN command. For SMTP the aiosmtplib send path still
+    # passes start_tls=True, so the credential exposure is IMAP-specific in
+    # practice; the gate fail-closes both channels uniformly to prevent
+    # operator misconfiguration of remote hosts. Permitted only against
+    # loopback (debug/dev).
+    #
+    # Q13-F12 review fix-now (Cx-2): normalise host casing + trailing dot
+    # before the membership check so operator typos like 'Localhost' and
+    # 'localhost.' don't false-refuse legitimate loopback configurations.
+    # Numeric loopback aliases (e.g. '127.1', '0177.0.0.1') and DNS-based
+    # equivalence are out of scope for this pass — fail-closed in the safe
+    # direction (operator can switch to '127.0.0.1' / '::1' / 'localhost').
     if tls_mode == "none":
+        normalised_host = host.lower().rstrip(".") if host else ""
+        if normalised_host and normalised_host not in _LOCALHOST_HOSTS:
+            logger.debug(
+                "_build_ssl_context: host",
+                extra={
+                    "event": "integrations.imap_email._build_ssl_context.match",
+                    "reason": "host",
+                },
+            )  # auto:neg
+            audit.warning(
+                "IMAP/SMTP plaintext auth refused — tls_mode=none requires localhost host",
+                extra={"event": "imap.plaintext_auth_refused", "host": host},
+            )
+            raise ImapEmailError(
+                f"IMAP/SMTP tls_mode='none' is only permitted for localhost "
+                f"(127.0.0.1/::1/localhost); refusing to send credentials in "
+                f"cleartext to remote host {host!r}."
+            )
+        # Localhost-allowed plaintext — surface to audit stream (not just app log)
+        # so operators see it in audit telemetry, plus keep the legacy logger
+        # warning for backwards-compatible app-log surfacing.
+        audit.warning(
+            "IMAP plaintext auth permitted on localhost (tls_mode=none) — "
+            "IMAP LOGIN credentials will traverse loopback unencrypted",
+            extra={"event": "imap.plaintext_auth", "host": host},
+        )
         logger.warning(
             "IMAP/SMTP using plaintext (tls_mode=none) — credentials sent unencrypted",
-            extra={"event": "tls_plaintext_warning", "host": host},
+            extra={"event": "tls.plaintext_warning", "host": host},
         )
         return None
 
     ctx = ssl.create_default_context()
     if cert_file:
+        # Custom CA cert for self-signed servers (e.g. Proton Bridge)
+        logger.debug(
+            "_build_ssl_context: custom CA cert loaded",
+            extra={"event": "tls.custom_ca"},
+        )
         ctx.load_verify_locations(cert_file)
+    elif host and host not in _LOCALHOST_HOSTS:
+        # Remote host with no custom cert — use system CA bundle.
+        # ssl.create_default_context() already loads system CAs and
+        # verifies hostnames, which is correct for public servers.
+        logger.debug(
+            "Using system CA bundle for remote host",
+            extra={"event": "tls.system_ca", "host": host},
+        )
     else:
-        # #1 HIGH: enforce localhost-only for CERT_NONE — remote servers
-        # without cert verification are vulnerable to MITM interception
-        if host and host not in _LOCALHOST_HOSTS:
-            raise ImapEmailError(
-                f"TLS cert file required for remote host '{host}' — "
-                f"CERT_NONE is only safe for localhost ({', '.join(sorted(_LOCALHOST_HOSTS))})"
-            )
+        # Localhost — disable cert verification (self-signed/dev)
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
         logger.warning(
             "IMAP/SMTP TLS: no cert file, using CERT_NONE (localhost only)",
-            extra={"event": "tls_cert_none", "host": host},
+            extra={"event": "tls.cert_none", "host": host},
         )
     return ctx
 
@@ -119,14 +178,13 @@ def _read_password(password_file: str) -> str:
         with open(password_file) as f:
             return f.read().strip()
     except OSError as exc:
-        raise ImapEmailError(
-            f"Cannot read password file: {exc}"
-        ) from exc
+        raise ImapEmailError(f"Cannot read password file: {exc}") from exc
 
 
 # ---------------------------------------------------------------------------
 # Header decoding
 # ---------------------------------------------------------------------------
+
 
 def _decode_header_value(raw: str) -> str:
     """Decode RFC 2047 encoded header values."""
@@ -141,18 +199,79 @@ def _decode_header_value(raw: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Attachment extraction
+# ---------------------------------------------------------------------------
+
+
+def extract_attachments(
+    msg: email.message.Message,
+) -> list[tuple[str, str, bytes]]:
+    """Extract attachments from a parsed email.Message.
+
+    Returns list of (filename, mime_type, data) tuples for each
+    attachment part.  Handles both 'attachment' and 'inline' dispositions
+    (with filenames).  Text body parts are skipped.
+    """
+    attachments: list[tuple[str, str, bytes]] = []
+    if not msg.is_multipart():
+        return attachments
+
+    for part in msg.walk():
+        content_type = part.get_content_type()
+        disposition = part.get_content_disposition()
+
+        # Skip the text body parts (unless explicitly marked as attachment).
+        if content_type in ("text/plain", "text/html") and disposition != "attachment":
+            continue
+
+        # Only process parts with a filename (attachment or inline with file).
+        filename = part.get_filename()
+        if not filename:
+            continue
+
+        data = part.get_payload(decode=True)
+        if data is None:
+            continue
+
+        mime_type = content_type or "application/octet-stream"
+
+        logger.debug(
+            "email attachment extracted",
+            extra={
+                "event": "email.attachment_extracted",
+                "att_filename": filename,
+                "mime_type": mime_type,
+                "att_size": len(data),
+            },
+        )
+
+        attachments.append((filename, mime_type, data))
+
+    return attachments
+
+
+# ---------------------------------------------------------------------------
 # Body extraction
 # ---------------------------------------------------------------------------
 
+
 def _extract_body(msg: email.message.Message, max_length: int) -> str:
     """Extract text body from a MIME message — prefers text/plain."""
+    logger.debug(
+        "_extract_body called",
+        extra={
+            "event": "imap_email._extract_body",
+            "msg_type": type(msg).__name__,
+            "max_length": max_length,
+        },
+    )
     plain_text = ""
     html_text = ""
 
     if msg.is_multipart():
         for part in msg.walk():
             content_type = part.get_content_type()
-            # Skip attachments (v1: no attachment handling)
+            # Skip attachments — extracted separately by extract_attachments()
             if part.get_content_disposition() == "attachment":
                 continue
             if content_type == "text/plain" and not plain_text:
@@ -181,6 +300,10 @@ def _extract_body(msg: email.message.Message, max_length: int) -> str:
 
 def _sanitize_html(html_text: str) -> str:
     """Strip HTML tags, decode entities."""
+    logger.debug(
+        "_sanitize_html called",
+        extra={"event": "imap_email._sanitize_html", "html_len": len(html_text)},
+    )
     if not html_text:
         return ""
     text = _HTML_TAG_RE.sub("", html_text)
@@ -201,13 +324,30 @@ def _truncate_body(body: str, max_length: int) -> str:
 # IMAP operations (blocking, wrapped in asyncio.to_thread)
 # ---------------------------------------------------------------------------
 
+
 def _imap_connect(config) -> imaplib.IMAP4_SSL | imaplib.IMAP4:
     """Connect and authenticate to IMAP server. Blocking call."""
+    logger.debug(
+        "_imap_connect called",
+        extra={
+            "event": "imap_email._imap_connect",
+            "config_type": type(config).__name__,
+        },
+    )
     password = _read_password(config.imap_password_file)
-    ssl_ctx = _build_ssl_context(config.imap_tls_mode, config.imap_tls_cert_file, config.imap_host)
+    ssl_ctx = _build_ssl_context(
+        config.imap_tls_mode, config.imap_tls_cert_file, config.imap_host
+    )
 
     try:
         if config.imap_tls_mode == "ssl":
+            logger.debug(
+                "_imap_connect: SSL mode",
+                extra={
+                    "event": "imap_email._imap_connect.ssl",
+                    "tls_mode": config.imap_tls_mode,
+                },
+            )
             conn = imaplib.IMAP4_SSL(
                 host=config.imap_host,
                 port=config.imap_port,
@@ -215,6 +355,10 @@ def _imap_connect(config) -> imaplib.IMAP4_SSL | imaplib.IMAP4:
                 timeout=config.imap_timeout,
             )
         elif config.imap_tls_mode == "starttls":
+            logger.debug(
+                "_imap_connect: STARTTLS mode",
+                extra={"event": "imap_email._imap_connect.starttls"},
+            )
             conn = imaplib.IMAP4(
                 host=config.imap_host,
                 port=config.imap_port,
@@ -223,6 +367,10 @@ def _imap_connect(config) -> imaplib.IMAP4_SSL | imaplib.IMAP4:
             conn.starttls(ssl_context=ssl_ctx)
         else:
             # "none" — plaintext, testing only
+            logger.debug(
+                "_imap_connect: plaintext mode",
+                extra={"event": "imap_email._imap_connect.plaintext"},
+            )
             conn = imaplib.IMAP4(
                 host=config.imap_host,
                 port=config.imap_port,
@@ -239,22 +387,34 @@ def _imap_connect(config) -> imaplib.IMAP4_SSL | imaplib.IMAP4:
     try:
         conn.socket().settimeout(config.imap_timeout)
     except (AttributeError, OSError):
-        pass  # Socket not yet available (shouldn't happen post-connect)
+        logger.debug(
+            "_imap_connect: AttributeError | OSError suppressed",
+            extra={"event": "imap_email._imap_connect.suppressed"},
+            exc_info=True,
+        )
 
     try:
         conn.login(config.imap_username, password)
     except imaplib.IMAP4.error as exc:
         try:
             conn.logout()
-        except Exception:
-            pass
+        except Exception:  # catch-all: IMAP logout best-effort
+            logger.debug(
+                "_imap_connect: Exception suppressed",
+                extra={"event": "imap_email._imap_connect.suppressed"},
+                exc_info=True,
+            )
         raise ImapEmailError(f"IMAP login failed: {exc}") from exc
-    except Exception as exc:
+    except Exception as exc:  # catch-all: connection leak prevention
         # Catch non-IMAP errors (e.g. socket errors) to prevent connection leak
         try:
             conn.logout()
-        except Exception:
-            pass
+        except Exception:  # catch-all: IMAP logout best-effort
+            logger.debug(
+                "_imap_connect: Exception suppressed",
+                extra={"event": "imap_email._imap_connect.suppressed"},
+                exc_info=True,
+            )
         raise ImapEmailError(f"IMAP login failed: {exc}") from exc
 
     return conn
@@ -282,7 +442,9 @@ def _imap_search_sync(config, query: str, max_results: int) -> list[EmailSearchR
         results = []
         for uid in uids:
             status, msg_data = conn.uid(
-                "fetch", uid, "(BODY.PEEK[HEADER.FIELDS (SUBJECT FROM DATE CONTENT-TRANSFER-ENCODING)] BODY.PEEK[TEXT])"
+                "fetch",
+                uid,
+                "(BODY.PEEK[HEADER.FIELDS (SUBJECT FROM DATE CONTENT-TRANSFER-ENCODING)] BODY.PEEK[TEXT])",
             )
             if status != "OK" or not msg_data or not msg_data[0]:
                 continue
@@ -304,37 +466,63 @@ def _imap_search_sync(config, query: str, max_results: int) -> list[EmailSearchR
                 body_preview = msg_data[1][1]
                 if isinstance(body_preview, bytes):
                     # Decode Content-Transfer-Encoding (base64, quoted-printable)
-                    encoding = header_msg.get("Content-Transfer-Encoding", "").lower().strip()
+                    encoding = (
+                        header_msg.get("Content-Transfer-Encoding", "").lower().strip()
+                    )
                     if "base64" in encoding:
                         import base64
+
                         try:
                             body_preview = base64.b64decode(body_preview)
-                        except Exception:
-                            pass  # Keep raw bytes if decode fails
+                        except Exception:  # catch-all: base64 decode on malformed email
+                            logger.debug(
+                                "_imap_search_sync: Exception suppressed",
+                                extra={
+                                    "event": "imap_email._imap_search_sync.suppressed"
+                                },
+                                exc_info=True,
+                            )
                     elif "quoted-printable" in encoding:
                         import quopri
+
                         try:
                             body_preview = quopri.decodestring(body_preview)
-                        except Exception:
-                            pass
-                    snippet = body_preview.decode("utf-8", errors="replace")[:200].strip()
+                        except Exception:  # catch-all: QP decode on malformed email
+                            logger.debug(
+                                "_imap_search_sync: Exception suppressed",
+                                extra={
+                                    "event": "imap_email._imap_search_sync.suppressed"
+                                },
+                                exc_info=True,
+                            )
+                    snippet = body_preview.decode("utf-8", errors="replace")[
+                        :_SNIPPET_MAX_LEN
+                    ].strip()
                     snippet = re.sub(r"\s+", " ", snippet)
 
-            results.append(EmailSearchResult(
-                message_id=uid.decode("ascii") if isinstance(uid, bytes) else str(uid),
-                thread_id="",  # IMAP has no thread concept in basic protocol
-                subject=subject,
-                sender=sender,
-                date=date_str,
-                snippet=snippet,
-            ))
+            results.append(
+                EmailSearchResult(
+                    message_id=uid.decode("ascii")
+                    if isinstance(uid, bytes)
+                    else str(uid),
+                    thread_id="",  # IMAP has no thread concept in basic protocol
+                    subject=subject,
+                    sender=sender,
+                    date=date_str,
+                    snippet=snippet,
+                )
+            )
 
         return results
     finally:
         try:
             conn.logout()
-        except Exception:
-            pass
+        except Exception:  # catch-all: IMAP logout best-effort
+            logger.debug(
+                "_imap_search_sync: Exception suppressed",
+                extra={"event": "imap_email._imap_search_sync.suppressed"},
+                exc_info=True,
+            )
 
 
 # #3 MED: allowlist-based IMAP escape — only permit safe characters
@@ -351,6 +539,15 @@ def _build_imap_search(query: str) -> str:
 
     Supports: from:X, to:X, subject:X, and free text (searches body+subject).
     """
+
+    logger.debug(
+        "_build_imap_search called",
+        extra={
+            "event": "imap_email._build_imap_search",
+            "query_len": len(query) if query else 0,
+        },
+    )
+
     def _imap_escape(value: str) -> str:
         return _IMAP_SAFE_RE.sub("", value)
 
@@ -385,8 +582,16 @@ def _build_imap_search(query: str) -> str:
     return " ".join(parts)
 
 
-def _imap_read_sync(config, message_id: str, max_body_length: int) -> EmailMessage:
-    """Fetch a full email by UID. Blocking."""
+def _imap_read_sync(
+    config,
+    message_id: str,
+    max_body_length: int,
+) -> tuple[EmailMessage, list[tuple[str, str, bytes]]]:
+    """Fetch a full email by UID. Blocking.
+
+    Returns (EmailMessage, raw_attachments) where raw_attachments is a
+    list of (filename, mime_type, data) tuples from extract_attachments().
+    """
     # #5 MED: validate message_id is numeric — prevents IMAP range injection
     # (e.g. "1:*" would fetch ALL messages, causing resource exhaustion)
     if not message_id or not message_id.strip().isdigit():
@@ -413,6 +618,8 @@ def _imap_read_sync(config, message_id: str, max_body_length: int) -> EmailMessa
         date_str = msg.get("Date", "")
         body = _extract_body(msg, max_body_length)
 
+        raw_attachments = extract_attachments(msg)
+
         return EmailMessage(
             message_id=message_id,
             thread_id="",
@@ -421,12 +628,16 @@ def _imap_read_sync(config, message_id: str, max_body_length: int) -> EmailMessa
             to=to,
             date=date_str,
             body_text=body,
-        )
+        ), raw_attachments
     finally:
         try:
             conn.logout()
-        except Exception:
-            pass
+        except Exception:  # catch-all: IMAP logout best-effort
+            logger.debug(
+                "_imap_read_sync: Exception suppressed",
+                extra={"event": "imap_email._imap_read_sync.suppressed"},
+                exc_info=True,
+            )
 
 
 def _imap_create_draft_sync(config, to: str, subject: str, body: str) -> str:
@@ -453,8 +664,12 @@ def _imap_create_draft_sync(config, to: str, subject: str, body: str) -> str:
     finally:
         try:
             conn.logout()
-        except Exception:
-            pass
+        except Exception:  # catch-all: IMAP logout best-effort
+            logger.debug(
+                "_imap_create_draft_sync: Exception suppressed",
+                extra={"event": "imap_email._imap_create_draft_sync.suppressed"},
+                exc_info=True,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -469,12 +684,19 @@ _EMAIL_RE = re.compile(r"^[^@\r\n]+@[^@\r\n]+\.[^@\r\n]+$")
 
 # #7 MED: per-recipient send rate limit (timestamps of recent sends)
 _send_timestamps: dict[str, list[float]] = {}
-_SEND_RATE_LIMIT = 5       # max sends per window
-_SEND_RATE_WINDOW = 3600   # 1 hour window
+_SEND_RATE_LIMIT = 5  # max sends per window
+_SEND_RATE_WINDOW = 3600  # 1 hour window
 
 
 def _check_send_rate(recipient: str) -> None:
     """Enforce per-recipient rate limit on email sends."""
+    logger.debug(
+        "_check_send_rate called",
+        extra={
+            "event": "imap_email._check_send_rate",
+            "recipient": _mask_email(recipient),
+        },
+    )
     now = time.monotonic()
     key = recipient.lower().strip()
     timestamps = _send_timestamps.get(key, [])
@@ -491,9 +713,7 @@ def _check_send_rate(recipient: str) -> None:
 def _validate_email_address(address: str) -> None:
     """Validate email address format — rejects newlines and malformed addresses."""
     if not _EMAIL_RE.match(address):
-        raise ImapEmailError(
-            f"Invalid email address format: '{address[:50]}'"
-        )
+        raise ImapEmailError(f"Invalid email address format: '{address[:50]}'")
 
 
 async def search_emails(
@@ -505,61 +725,90 @@ async def search_emails(
     if not config.imap_host:
         raise ImapEmailError("IMAP host not configured")
     t0 = time.monotonic()
+    last_exc: Exception | None = None
     for attempt in range(2):
         try:
-            results = await asyncio.to_thread(_imap_search_sync, config, query, max_results)
+            results = await asyncio.to_thread(
+                _imap_search_sync, config, query, max_results
+            )
             logger.info(
                 "imap.search_emails",
                 # #10 LOW: mask query in logs — may contain PII (email addresses, names)
-                extra={"query": _mask_query(query), "results": len(results), "elapsed_s": round(time.monotonic() - t0, 2)},
+                extra={
+                    "event": "imap.search_emails",
+                    "query": _mask_query(query),
+                    "results": len(results),
+                    "elapsed_s": round(time.monotonic() - t0, 2),
+                },
             )
             return results
         except ImapEmailError as exc:
+            last_exc = exc
             # Retry on transient connection errors wrapped in ImapEmailError
             if attempt < 1 and isinstance(exc.__cause__, _IMAP_TRANSIENT_ERRORS):
                 logger.warning(
                     "IMAP search connection error, retrying",
-                    extra={"event": "imap_search_retry", "error": str(exc)},
+                    extra={"event": "imap.search_retry", "error": str(exc)},
+                    exc_info=True,
                 )
                 await asyncio.sleep(2)
                 continue
             raise
         except Exception as exc:
             raise ImapEmailError(f"IMAP search failed: {exc}") from exc
-    raise ImapEmailError("IMAP search failed after retry")  # unreachable, keeps type checker happy
+    raise ImapEmailError("IMAP search failed after retry") from last_exc
 
 
 async def read_email(
     config,
     message_id: str,
     max_body_length: int = 50000,
-) -> EmailMessage:
-    """Read a full email by message ID (IMAP UID)."""
+) -> tuple[EmailMessage, list[tuple[str, str, bytes]]]:
+    """Read a full email by message ID (IMAP UID).
+
+    Returns (EmailMessage, raw_attachments) where raw_attachments is a
+    list of (filename, mime_type, data) tuples.
+    """
     if not config.imap_host:
         raise ImapEmailError("IMAP host not configured")
     t0 = time.monotonic()
+    last_exc: Exception | None = None
     for attempt in range(2):
         try:
-            result = await asyncio.to_thread(_imap_read_sync, config, message_id, max_body_length)
+            email_msg, raw_attachments = await asyncio.to_thread(
+                _imap_read_sync,
+                config,
+                message_id,
+                max_body_length,
+            )
             logger.info(
                 "imap.read_email",
-                extra={"message_id": message_id, "elapsed_s": round(time.monotonic() - t0, 2)},
+                extra={
+                    "event": "imap.read_email",
+                    "message_id_hash": log_hash(message_id),
+                    "message_id_len": len(message_id),
+                    "attachment_count": len(raw_attachments),
+                    "elapsed_s": round(time.monotonic() - t0, 2),
+                },
             )
-            return result
+            return email_msg, raw_attachments
         except ImapEmailError as exc:
+            last_exc = exc
             if attempt < 1 and isinstance(exc.__cause__, _IMAP_TRANSIENT_ERRORS):
                 logger.warning(
                     "IMAP read connection error, retrying",
-                    extra={"event": "imap_read_retry", "error": str(exc)},
+                    extra={"event": "imap.read_retry", "error": str(exc)},
+                    exc_info=True,
                 )
                 await asyncio.sleep(2)
                 continue
             raise
         except Exception as exc:
             raise ImapEmailError(f"IMAP read failed: {exc}") from exc
-    raise ImapEmailError("IMAP read failed after retry")
+    raise ImapEmailError("IMAP read failed after retry") from last_exc
 
 
+@no_audit_log
 async def send_email(
     config,
     to: str,
@@ -575,7 +824,9 @@ async def send_email(
     t0 = time.monotonic()
 
     password = _read_password(config.smtp_password_file)
-    ssl_ctx = _build_ssl_context(config.smtp_tls_mode, config.imap_tls_cert_file, config.smtp_host)
+    ssl_ctx = _build_ssl_context(
+        config.smtp_tls_mode, config.imap_tls_cert_file, config.smtp_host
+    )
 
     msg = MIMEText(body, "plain", "utf-8")
     msg["To"] = to
@@ -592,6 +843,7 @@ async def send_email(
             "aiosmtplib package not installed — required for SMTP send"
         ) from exc
 
+    last_exc: Exception | None = None
     for attempt in range(2):
         try:
             if config.smtp_tls_mode == "ssl":
@@ -622,14 +874,21 @@ async def send_email(
             _masked_to = to[0] + "***@" + to.split("@")[-1] if "@" in to else "***"
             logger.info(
                 "imap.send_email",
-                extra={"to": _masked_to, "subject": subject[:100], "elapsed_s": round(time.monotonic() - t0, 2)},
+                extra={
+                    "event": "imap.send_email",
+                    "to": _masked_to,
+                    "subject": subject[:100],
+                    "elapsed_s": round(time.monotonic() - t0, 2),
+                },
             )
             return msg["Message-ID"]
         except _IMAP_TRANSIENT_ERRORS as exc:
+            last_exc = exc
             if attempt < 1:
                 logger.warning(
                     "SMTP send connection error, retrying",
-                    extra={"event": "smtp_send_retry", "error": str(exc)},
+                    extra={"event": "smtp.send_retry", "error": str(exc)},
+                    exc_info=True,
                 )
                 await asyncio.sleep(2)
                 continue
@@ -637,7 +896,7 @@ async def send_email(
         except Exception as exc:
             raise ImapEmailError(f"SMTP send failed: {exc}") from exc
 
-    raise ImapEmailError("SMTP send failed after retry")
+    raise ImapEmailError("SMTP send failed after retry") from last_exc
 
 
 async def create_draft(
@@ -651,32 +910,43 @@ async def create_draft(
         raise ImapEmailError("IMAP host not configured")
     _validate_email_address(to)
     t0 = time.monotonic()
+    last_exc: Exception | None = None
     for attempt in range(2):
         try:
-            result = await asyncio.to_thread(_imap_create_draft_sync, config, to, subject, body)
+            result = await asyncio.to_thread(
+                _imap_create_draft_sync, config, to, subject, body
+            )
             logger.info(
                 "imap.create_draft",
                 # #9 LOW: mask recipient in draft logs (consistent with send_email)
-                extra={"to": _mask_email(to), "subject": subject[:100], "elapsed_s": round(time.monotonic() - t0, 2)},
+                extra={
+                    "event": "imap.create_draft",
+                    "to": _mask_email(to),
+                    "subject": subject[:100],
+                    "elapsed_s": round(time.monotonic() - t0, 2),
+                },
             )
             return result
         except ImapEmailError as exc:
+            last_exc = exc
             if attempt < 1 and isinstance(exc.__cause__, _IMAP_TRANSIENT_ERRORS):
                 logger.warning(
                     "IMAP draft connection error, retrying",
-                    extra={"event": "imap_draft_retry", "error": str(exc)},
+                    extra={"event": "imap.draft_retry", "error": str(exc)},
+                    exc_info=True,
                 )
                 await asyncio.sleep(2)
                 continue
             raise
         except Exception as exc:
             raise ImapEmailError(f"IMAP draft failed: {exc}") from exc
-    raise ImapEmailError("IMAP draft failed after retry")
+    raise ImapEmailError("IMAP draft failed after retry") from last_exc
 
 
 # ---------------------------------------------------------------------------
 # Formatters — produce LLM-friendly text (compatible with gmail.py format)
 # ---------------------------------------------------------------------------
+
 
 def format_search_results(results: list[EmailSearchResult]) -> str:
     """Format search results as numbered text for LLM consumption."""

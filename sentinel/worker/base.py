@@ -4,32 +4,19 @@ Defines the interface that all worker, planner, and embedding providers must
 implement. Concrete implementations (Ollama, Claude, etc.) subclass these.
 """
 
+import logging
 from abc import ABC, abstractmethod
 
+# Exception classes moved to sentinel.core.exceptions (SH-3) — re-exported here.
+from sentinel.core.exceptions import (  # noqa: F401
+    ProviderConnectionError,
+    ProviderError,
+    ProviderModelNotFound,
+    ProviderTimeoutError,
+)
 from sentinel.core.models import Plan
 
-
-# -- Generic provider exceptions --
-# Concrete provider exceptions (e.g. OllamaConnectionError) should subclass
-# both their provider-specific base AND the appropriate generic exception,
-# so consumers can catch either.
-
-
-class ProviderError(Exception):
-    """Base exception for all provider errors."""
-
-
-class ProviderConnectionError(ProviderError):
-    """Cannot reach the provider backend."""
-
-
-class ProviderTimeoutError(ProviderError):
-    """Request to the provider timed out."""
-
-
-class ProviderModelNotFound(ProviderError):
-    """Requested model is not available on the provider."""
-
+logger = logging.getLogger(__name__)
 
 # -- Abstract base classes --
 
@@ -113,7 +100,9 @@ class EmbeddingBase(ABC):
         ...
 
     @abstractmethod
-    async def embed_batch(self, texts: list[str], prefix: str | None = None) -> list[list[float]]:
+    async def embed_batch(
+        self, texts: list[str], prefix: str | None = None
+    ) -> list[list[float]]:
         """Embed multiple texts in a single call.
 
         Args:

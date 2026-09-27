@@ -15,6 +15,7 @@ use ureq::unversioned::transport::DefaultConnector;
 #[derive(Debug)]
 pub struct ValidatedUrl {
     /// The original URL string.
+    #[allow(dead_code)] // Retained for debugging and future callers
     pub original: String,
     /// Parsed URL.
     pub url: Url,
@@ -59,12 +60,15 @@ impl std::error::Error for UrlValidationError {}
 
 /// Check if an IPv4 address is private/reserved (SSRF protection).
 fn is_private_ipv4(ip: &Ipv4Addr) -> bool {
+    let octets = ip.octets();
     ip.is_loopback()                        // 127.0.0.0/8
         || ip.is_private()                  // 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
         || ip.is_link_local()               // 169.254.0.0/16
         || ip.is_broadcast()                // 255.255.255.255
-        || ip.is_unspecified()              // 0.0.0.0
-        || ip.octets()[0] == 100 && ip.octets()[1] >= 64 && ip.octets()[1] <= 127  // 100.64.0.0/10 (CGN)
+        || octets[0] == 0                   // 0.0.0.0/8 — "this network" (Linux routes to loopback)
+        || (octets[0] == 100 && octets[1] >= 64 && octets[1] <= 127)  // 100.64.0.0/10 (CGN)
+        || (octets[0] == 198 && (octets[1] == 18 || octets[1] == 19)) // 198.18.0.0/15 (benchmarking)
+        || octets[0] >= 240                 // 240.0.0.0/4 (reserved/future use)
 }
 
 /// Check if an IPv6 address is private/reserved (SSRF protection).
@@ -125,10 +129,9 @@ impl fmt::Debug for PinnedResolver {
 /// Check if a hostname matches an allowlist entry.
 /// Supports glob patterns: `*.example.com` matches `api.example.com`.
 fn hostname_matches(hostname: &str, pattern: &str) -> bool {
-    if pattern.starts_with("*.") {
-        // *.example.com matches sub.example.com but NOT example.com itself
-        // and NOT evil-example.com (O-001: require dot boundary before suffix)
-        let suffix = &pattern[2..]; // "example.com"
+    if let Some(suffix) = pattern.strip_prefix("*.") {
+        // *.example.com matches sub.example.com AND example.com itself
+        // but NOT evil-example.com (O-001: require dot boundary before suffix)
         hostname == suffix || {
             // Check hostname ends with ".example.com" — the dot ensures subdomain boundary
             hostname.len() > suffix.len() + 1
@@ -384,6 +387,28 @@ mod tests {
     #[test]
     fn test_private_ipv4_link_local() {
         assert!(is_private_ip(&IpAddr::V4(Ipv4Addr::new(169, 254, 1, 1))));
+    }
+
+    #[test]
+    fn test_private_ipv4_this_network() {
+        // 0.0.0.0/8 — "this network" (Linux routes to loopback)
+        assert!(is_private_ip(&IpAddr::V4(Ipv4Addr::new(0, 0, 0, 1))));
+        assert!(is_private_ip(&IpAddr::V4(Ipv4Addr::new(0, 255, 255, 255))));
+    }
+
+    #[test]
+    fn test_private_ipv4_benchmarking() {
+        // 198.18.0.0/15
+        assert!(is_private_ip(&IpAddr::V4(Ipv4Addr::new(198, 18, 0, 1))));
+        assert!(is_private_ip(&IpAddr::V4(Ipv4Addr::new(198, 19, 255, 255))));
+        assert!(!is_private_ip(&IpAddr::V4(Ipv4Addr::new(198, 20, 0, 1))));
+    }
+
+    #[test]
+    fn test_private_ipv4_reserved() {
+        // 240.0.0.0/4
+        assert!(is_private_ip(&IpAddr::V4(Ipv4Addr::new(240, 0, 0, 1))));
+        assert!(is_private_ip(&IpAddr::V4(Ipv4Addr::new(255, 255, 255, 254))));
     }
 
     #[test]

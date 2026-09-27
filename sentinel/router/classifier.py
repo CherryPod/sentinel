@@ -12,7 +12,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from enum import Enum
 
 from sentinel.core.config import settings
@@ -32,9 +32,7 @@ _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 
 # Regex to extract JSON from prose (e.g. markdown code fences or inline).
 # Supports up to 2 levels of brace nesting (route > params > nested value).
-_JSON_EXTRACT_RE = re.compile(
-    r"\{[^{}]*(?:\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}[^{}]*)*\}"
-)
+_JSON_EXTRACT_RE = re.compile(r"\{[^{}]*(?:\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}[^{}]*)*\}")
 
 _SYSTEM_PROMPT_TEMPLATE = """\
 You are a request classifier. Analyse the user's message and return JSON.
@@ -59,6 +57,7 @@ Format for planner route:
 
 class Route(Enum):
     """Classification outcome — fast path or full planner."""
+
     FAST = "fast"
     PLANNER = "planner"
 
@@ -66,6 +65,7 @@ class Route(Enum):
 @dataclass
 class ClassificationResult:
     """Result of classifying a user message."""
+
     route: Route
     template_name: str | None = None
     params: dict = field(default_factory=dict)
@@ -99,7 +99,9 @@ class Classifier:
     ) -> None:
         self._worker = worker
         self._registry = registry
-        self._timeout = timeout if timeout is not None else settings.router_classifier_timeout
+        self._timeout = (
+            timeout if timeout is not None else settings.router_classifier_timeout
+        )
 
     async def classify(self, user_message: str) -> ClassificationResult:
         """Classify a user message as FAST or PLANNER.
@@ -114,14 +116,14 @@ class Classifier:
             # Find all occurrences and check none are preceded by negation
             for m in re.finditer(r"\b" + re.escape(phrase) + r"\b", msg_lower):
                 # Check for negation words immediately before the match
-                prefix = msg_lower[:m.start()].rstrip()
+                prefix = msg_lower[: m.start()].rstrip()
                 if prefix.endswith(("not", "don't", "dont", "no", "never")):
                     continue
                 logger.debug("Planner override phrase detected: %r", phrase)
                 return _planner_fallback(f"User requested planner: '{phrase}'")
 
         # Build the system prompt with current time and template listing
-        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        now = datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
         system_prompt = _SYSTEM_PROMPT_TEMPLATE.format(
             now=now,
             templates=self._registry.build_classifier_prompt(),
@@ -136,11 +138,23 @@ class Classifier:
                 ),
                 timeout=self._timeout,
             )
-        except asyncio.TimeoutError:
-            logger.warning("Classifier timed out after %.1fs", self._timeout)
+        except TimeoutError:
+            logger.warning(
+                "Classifier timed out after %.1fs",
+                self._timeout,
+                extra={
+                    "event": "classifier.timeout",
+                    "timeout_s": self._timeout,
+                },
+                exc_info=True,
+            )
             return _planner_fallback("Worker timeout — falling back to planner")
-        except Exception:
-            logger.exception("Classifier worker error")
+        except Exception:  # catch-all: classification fallback to planner
+            logger.warning(
+                "Classifier worker error",
+                extra={"event": "classifier.worker_error"},
+                exc_info=True,
+            )
             return _planner_fallback("Worker error — falling back to planner")
 
         # Parse the response
@@ -152,6 +166,13 @@ class Classifier:
         Strips thinking tags, tries direct JSON parse, then regex extraction.
         """
         # Strip <think>...</think> blocks
+        logger.debug(
+            "_parse_response called",
+            extra={
+                "event": "classifier._parse_response",
+                "raw_len": len(raw) if hasattr(raw, "__len__") else 0,
+            },
+        )
         cleaned = _THINK_RE.sub("", raw).strip()
 
         # Try direct JSON parse
@@ -176,20 +197,56 @@ class Classifier:
             if isinstance(obj, dict):
                 return obj
         except (json.JSONDecodeError, TypeError):
-            pass
+            logger.debug(
+                "_try_parse_json: json.JSONDecodeError | TypeError suppressed",
+                extra={"event": "classifier._try_parse_json.suppressed"},
+                exc_info=True,
+            )
         return None
 
     def _interpret(self, data: dict) -> ClassificationResult:
         """Interpret a parsed JSON dict into a ClassificationResult."""
+        logger.debug(
+            "_interpret called",
+            extra={
+                "event": "classifier._interpret",
+                "data_len": len(data) if hasattr(data, "__len__") else 0,
+            },
+        )
         route_str = data.get("route", "").lower()
 
         # Planner route
         if route_str == "planner":
+            logger.debug(
+                "_interpret: Qwen chose planner",
+                extra={"event": "classifier.interpret.planner"},
+            )
             return _planner_fallback(data.get("reason", "Qwen chose planner"))
+        logger.debug(
+            "_interpret: route_str_eq_planner_passed",
+            extra={
+                "event": "classifier.interpret.planner.passed",
+                "reason": "route_str_eq_planner_passed",
+            },
+        )  # auto:neg
 
         # Fast route — validate template and params
         if route_str != "fast":
+            logger.debug(
+                "_interpret: unknown route value",
+                extra={
+                    "event": "classifier.interpret.unknown_route",
+                    "route": route_str,
+                },
+            )
             return _planner_fallback(f"Unknown route value: {route_str!r}")
+        logger.debug(
+            "_interpret: route_str_noteq_fast_passed",
+            extra={
+                "event": "classifier.interpret.unknown_route.passed",
+                "reason": "route_str_noteq_fast_passed",
+            },
+        )  # auto:neg
 
         template_name = data.get("template", "")
         template = self._registry.get(template_name)

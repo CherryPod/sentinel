@@ -11,10 +11,14 @@ Each call still goes through the full security pipeline.
 
 from __future__ import annotations
 
-import time
+import logging
 from dataclasses import dataclass, field
 
 from sentinel.core.config import settings
+
+logger = logging.getLogger(__name__)
+
+_CHARS_PER_TOKEN_ESTIMATE = 4  # rough char-to-token ratio for budget calculation
 
 
 @dataclass
@@ -22,9 +26,9 @@ class WorkerTurn:
     """One turn of worker interaction."""
 
     turn_number: int
-    prompt_summary: str        # First 200 chars of the resolved prompt
-    response_summary: str      # First 500 chars of Qwen's response
-    step_outcome: dict         # F1 metadata (file_path, output_size, language, etc.)
+    prompt_summary: str  # First 200 chars of the resolved prompt
+    response_summary: str  # First 500 chars of Qwen's response
+    step_outcome: dict  # F1 metadata (file_path, output_size, language, etc.)
     timestamp: float
 
 
@@ -39,7 +43,9 @@ class WorkerContext:
     session_id: str
     turns: list[WorkerTurn] = field(default_factory=list)
     max_turns: int = field(default_factory=lambda: settings.worker_turn_buffer_size)
-    max_tokens: int = field(default_factory=lambda: settings.worker_context_token_budget)
+    max_tokens: int = field(
+        default_factory=lambda: settings.worker_context_token_budget
+    )
 
     def add_turn(self, turn: WorkerTurn) -> None:
         """Append a turn, evicting the oldest if over max."""
@@ -49,10 +55,13 @@ class WorkerContext:
 
     def format_context(self) -> str:
         """Produce compact text block for prompt injection, within token budget."""
+        logger.debug(
+            "format_context called", extra={"event": "context.format_context"}
+        )  # auto:entry
         if not self.turns:
             return ""
 
-        budget = self.max_tokens * 4  # approximate char budget at ~4 chars/token
+        budget = self.max_tokens * _CHARS_PER_TOKEN_ESTIMATE
         lines = ["[Previous work in this session:]"]
 
         for turn in self.turns:
@@ -66,9 +75,7 @@ class WorkerContext:
             if so.get("output_language"):
                 meta_parts.append(so["output_language"])
             if so.get("syntax_valid") is not None:
-                meta_parts.append(
-                    "syntax ok" if so["syntax_valid"] else "SYNTAX ERROR"
-                )
+                meta_parts.append("syntax ok" if so["syntax_valid"] else "SYNTAX ERROR")
             if so.get("scanner_result"):
                 meta_parts.append(f"scanner: {so['scanner_result']}")
             if so.get("status") == "blocked":

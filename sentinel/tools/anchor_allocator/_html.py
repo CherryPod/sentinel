@@ -5,20 +5,29 @@ from __future__ import annotations
 import logging
 import re
 
-from bs4 import BeautifulSoup, Tag
+from bs4 import BeautifulSoup
 
 from sentinel.tools.anchor_allocator._core import AnchorEntry, AnchorTier
 
 logger = logging.getLogger(__name__)
 
 # Structural HTML tags that get anchored even without IDs
-_STRUCTURAL_TAGS = frozenset({
-    "nav", "header", "footer", "main", "section", "article", "aside",
-})
+_STRUCTURAL_TAGS = frozenset(
+    {
+        "nav",
+        "header",
+        "footer",
+        "main",
+        "section",
+        "article",
+        "aside",
+    }
+)
 
 # Regex for function declarations inside <script> blocks
 _JS_FUNC_RE = re.compile(
-    r'(?:async\s+)?function\s+(\w+)\s*\(', re.MULTILINE,
+    r"(?:async\s+)?function\s+(\w+)\s*\(",
+    re.MULTILINE,
 )
 
 
@@ -35,12 +44,15 @@ def _add_with_end(
     here.  _insert_anchors() generates the end marker from end_line once
     _resolve_html_lines has resolved it.
     """
-    anchors.append(AnchorEntry(
-        name=name, line=0,
-        tier=tier,
-        description=description,
-        has_end=True,
-    ))
+    anchors.append(
+        AnchorEntry(
+            name=name,
+            line=0,
+            tier=tier,
+            description=description,
+            has_end=True,
+        )
+    )
 
 
 def parse_html_anchors(content: str) -> list[AnchorEntry]:
@@ -53,8 +65,12 @@ def parse_html_anchors(content: str) -> list[AnchorEntry]:
 
     try:
         soup = BeautifulSoup(content, "html.parser")
-    except Exception as exc:
-        logger.warning("html_anchor_parse_failed", exc_info=exc)
+    except Exception:  # catch-all: HTML parsing on untrusted content
+        logger.warning(
+            "html_anchor_parse_failed",
+            extra={"event": "html.parse_failed"},
+            exc_info=True,
+        )
         return []
 
     anchors: list[AnchorEntry] = []
@@ -64,41 +80,53 @@ def parse_html_anchors(content: str) -> list[AnchorEntry]:
     head = soup.find("head")
     if head:
         # Style blocks
-        for style in head.find_all("style"):
+        for _style in head.find_all("style"):
             _add_with_end(
-                anchors, "head-styles", AnchorTier.SECTION,
+                anchors,
+                "head-styles",
+                AnchorTier.SECTION,
                 "Before <style> block in <head>. Insert CSS here",
             )
 
         # Script blocks in head
-        for script in head.find_all("script"):
+        for _script in head.find_all("script"):
             _add_with_end(
-                anchors, "head-scripts", AnchorTier.SECTION,
+                anchors,
+                "head-scripts",
+                AnchorTier.SECTION,
                 "Before <script> block in <head>",
             )
 
     # --- SECTION tier: <body> boundaries ---
     body = soup.find("body")
     if body:
-        anchors.append(AnchorEntry(
-            name="body-start", line=0,
-            tier=AnchorTier.SECTION,
-            description="Start of <body>",
-            has_end=False,
-        ))
-        anchors.append(AnchorEntry(
-            name="body-end", line=0,
-            tier=AnchorTier.SECTION,
-            description="End of <body>. Insert new sections before this",
-            has_end=False,
-        ))
+        anchors.append(
+            AnchorEntry(
+                name="body-start",
+                line=0,
+                tier=AnchorTier.SECTION,
+                description="Start of <body>",
+                has_end=False,
+            )
+        )
+        anchors.append(
+            AnchorEntry(
+                name="body-end",
+                line=0,
+                tier=AnchorTier.SECTION,
+                description="End of <body>. Insert new sections before this",
+                has_end=False,
+            )
+        )
 
     # --- SECTION tier: <script> blocks in body ---
     if body:
         body_scripts = body.find_all("script", recursive=False)
         if body_scripts:
             _add_with_end(
-                anchors, "scripts", AnchorTier.SECTION,
+                anchors,
+                "scripts",
+                AnchorTier.SECTION,
                 "Main <script> block in body",
             )
 
@@ -108,7 +136,9 @@ def parse_html_anchors(content: str) -> list[AnchorEntry]:
         if not tag_id or tag.name in ("html", "head", "body"):
             continue
         _add_with_end(
-            anchors, f"el-{tag_id}", AnchorTier.BLOCK,
+            anchors,
+            f"el-{tag_id}",
+            AnchorTier.BLOCK,
             f"Element #{tag_id} (<{tag.name}>)",
         )
 
@@ -121,7 +151,9 @@ def parse_html_anchors(content: str) -> list[AnchorEntry]:
             structural_counts[tag_name] += 1
             n = structural_counts[tag_name]
             _add_with_end(
-                anchors, f"el-{tag_name}-{n}", AnchorTier.BLOCK,
+                anchors,
+                f"el-{tag_name}-{n}",
+                AnchorTier.BLOCK,
                 f"<{tag_name}> element (#{n}, no ID)",
             )
 
@@ -132,7 +164,9 @@ def parse_html_anchors(content: str) -> list[AnchorEntry]:
             for match in _JS_FUNC_RE.finditer(script_text):
                 func_name = match.group(1)
                 _add_with_end(
-                    anchors, f"func-{func_name}", AnchorTier.BLOCK,
+                    anchors,
+                    f"func-{func_name}",
+                    AnchorTier.BLOCK,
                     f"JS function {func_name}()",
                 )
 

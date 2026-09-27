@@ -8,10 +8,53 @@ with route-module fallbacks and safety-net test patches. The lifecycle functions
 sync values back to this module via _sync_to_app_module().
 """
 
-from fastapi import APIRouter, FastAPI, Request
+import logging
+
+from fastapi import APIRouter, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
+
+# Import lifecycle — the lifespan context manager and all module-level globals
+# live there. We import the module itself (not from ... import) so that the
+# middleware lambda can read lifecycle._pin_verifier at call time (getting the
+# value set by _init_security, not a stale copy).
+import sentinel.api.lifecycle as lifecycle
+from sentinel.api.auth_routes import router as auth_router
+from sentinel.api.contacts import router as contacts_router
+from sentinel.api.credentials import router as credentials_router
+from sentinel.api.lifecycle import lifespan
+from sentinel.api.routes import (
+    a2a as a2a_routes,
+)
+from sentinel.api.routes import (
+    health as health_routes,
+)
+from sentinel.api.routes import (
+    loop as loop_routes,
+)
+from sentinel.api.routes import (
+    memory as memory_routes,
+)
+from sentinel.api.routes import (
+    routines as routine_routes,
+)
+from sentinel.api.routes import (
+    security as security_routes,
+)
+from sentinel.api.routes import (
+    streaming as streaming_routes,
+)
+from sentinel.api.routes import (
+    task as task_routes,
+)
+from sentinel.api.routes import (
+    webhooks as webhook_routes,
+)
+from sentinel.api.routes import (
+    websocket as websocket_routes,
+)
+from sentinel.core.config import settings
 
 from .middleware import (
     CSRFMiddleware,
@@ -21,28 +64,9 @@ from .middleware import (
     UserContextMiddleware,
 )
 from .rate_limit import limiter
-from sentinel.core.config import settings
-from sentinel.api.auth_routes import router as auth_router
-from sentinel.api.contacts import router as contacts_router
-from sentinel.api.credentials import router as credentials_router
-from sentinel.api.routes import (
-    health as health_routes,
-    memory as memory_routes,
-    routines as routine_routes,
-    security as security_routes,
-    streaming as streaming_routes,
-    task as task_routes,
-    webhooks as webhook_routes,
-    websocket as websocket_routes,
-    a2a as a2a_routes,
-)
 
-# Import lifecycle — the lifespan context manager and all module-level globals
-# live there. We import the module itself (not from ... import) so that the
-# middleware lambda can read lifecycle._pin_verifier at call time (getting the
-# value set by _init_security, not a stale copy).
-import sentinel.api.lifecycle as lifecycle
-from sentinel.api.lifecycle import lifespan
+logger = logging.getLogger(__name__)
+
 
 # ── Backward-compat re-exports ────────────────────────────────────────
 # Route modules read these via `import sentinel.api.app as _app; _app._shutting_down`.
@@ -58,8 +82,7 @@ _planner_available = False
 _ollama_reachable = False
 _sidecar = None
 _sandbox = None
-_signal_channel = None
-_telegram_channel = None
+_channel_registry = None
 _shutting_down = False
 _background_tasks = lifecycle._background_tasks
 
@@ -81,7 +104,9 @@ app.add_middleware(SlowAPIMiddleware)
 # from request.app.state at dispatch time (wired by lifecycle.py during lifespan).
 app.add_middleware(
     CSRFMiddleware,
-    allowed_origins=[o.strip() for o in settings.allowed_origins.split(",") if o.strip()],
+    allowed_origins=[
+        o.strip() for o in settings.allowed_origins.split(",") if o.strip()
+    ],
 )
 app.add_middleware(RequestSizeLimitMiddleware, max_bytes=settings.max_request_bytes)
 app.add_middleware(SecurityHeadersMiddleware)
@@ -97,7 +122,7 @@ async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
         audit.warning(
             "Rate limit exceeded",
             extra={
-                "event": "rate_limit_exceeded",
+                "event": "rate.limit_exceeded",
                 "path": str(request.url.path),
                 "remote": request.client.host if request.client else "unknown",
             },
@@ -111,6 +136,20 @@ async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
     )
 
 
+# Registered before global_exception_handler: Starlette dispatches by MRO
+# (most-derived type wins), so HTTPException always routes here, never to
+# the bare-Exception handler below.
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    """Normalize HTTPException to the standard {status, reason} envelope."""
+    reason = exc.detail if isinstance(exc.detail, str) else str(exc.detail)
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"status": "error", "reason": reason},
+        headers=getattr(exc, "headers", None),
+    )
+
+
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
     """Ensure all errors return JSON, never HTML error pages."""
@@ -118,11 +157,12 @@ async def global_exception_handler(request: Request, exc: Exception):
     if audit:
         audit.error(
             "Unhandled exception",
+            exc_info=exc,
             extra={
-                "event": "unhandled_exception",
+                "event": "unhandled.exception",
                 "path": str(request.url.path),
-                "error": str(exc),
                 "error_type": type(exc).__name__,
+                "error_length": len(str(exc)),
             },
         )
     return JSONResponse(
@@ -179,9 +219,12 @@ app.include_router(streaming_routes.router, prefix="/api")
 # WebSocket route: PIN auth, channel routing, bidirectional messaging at /ws
 app.include_router(websocket_routes.router)
 
-# A2A routes: Agent Card at /.well-known/agent.json, JSON-RPC at /a2a (no prefix)
+# Loop routes: loop management + insight endpoints at /api/loop, /api/insights
+app.include_router(loop_routes.router, prefix="/api")
+
+# A2A routes: Agent Card at /.well-known/agent-card.json, JSON-RPC at /a2a (no prefix)
 app.include_router(a2a_routes.router)
 
 # Static file mount moved to lifespan() — must be registered LAST so that
-# routes added during lifespan (B2 red-team, MCP) aren't shadowed by the
+# routes added during lifespan (such as MCP) aren't shadowed by the
 # catch-all "/" mount.  See comment above the yield in lifespan().

@@ -12,13 +12,13 @@ from __future__ import annotations
 import json
 import logging
 import uuid
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 
-from sentinel.core.context import current_user_id
+from sentinel.core.context import require_user_id
 
-logger = logging.getLogger("sentinel.audit")
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -46,6 +46,13 @@ class StrategyPattern:
 
 def _row_to_pattern(row: Any) -> StrategyPattern:
     """Convert an asyncpg Record to a StrategyPattern dataclass."""
+    logger.debug(
+        "_row_to_pattern called",
+        extra={
+            "event": "strategy_store._row_to_pattern",
+            "row_type": type(row).__name__,
+        },
+    )
     seq = row["step_sequence"]
     if isinstance(seq, str):
         seq = json.loads(seq)
@@ -63,7 +70,7 @@ def _row_to_pattern(row: Any) -> StrategyPattern:
         domain=row["domain"],
         user_id=row["user_id"],
         strategy_name=row["strategy_name"],
-        step_sequence=seq if seq else [],
+        step_sequence=seq or [],
         occurrence_count=row["occurrence_count"],
         success_count=row["success_count"],
         avg_duration_s=row["avg_duration_s"],
@@ -99,7 +106,7 @@ class StrategyPatternStore:
         increments occurrence_count (and success_count if success=True).
         Updates avg_duration_s with a running average.
         """
-        resolved_uid = user_id if user_id is not None else current_user_id.get()
+        resolved_uid = require_user_id(user_id, "StrategyPatternStore.upsert")
         seq = step_sequence or []
 
         if self._pool is not None:
@@ -121,8 +128,13 @@ class StrategyPatternStore:
                     "  WHEN $7 IS NOT NULL THEN $7 "
                     "  ELSE strategy_patterns.avg_duration_s END, "
                     "last_seen = NOW()",
-                    pattern_id, domain, resolved_uid, strategy_name,
-                    json.dumps(seq), int(success), duration_s,
+                    pattern_id,
+                    domain,
+                    resolved_uid,
+                    strategy_name,
+                    json.dumps(seq),
+                    int(success),
+                    duration_s,
                 )
         else:
             key = (domain, resolved_uid, strategy_name)
@@ -134,14 +146,13 @@ class StrategyPatternStore:
                 if duration_s is not None:
                     if p.avg_duration_s is not None:
                         p.avg_duration_s = (
-                            (p.avg_duration_s * (p.occurrence_count - 1) + duration_s)
-                            / p.occurrence_count
-                        )
+                            p.avg_duration_s * (p.occurrence_count - 1) + duration_s
+                        ) / p.occurrence_count
                     else:
                         p.avg_duration_s = duration_s
-                p.last_seen = datetime.now(timezone.utc).isoformat()
+                p.last_seen = datetime.now(UTC).isoformat()
             else:
-                now = datetime.now(timezone.utc).isoformat()
+                now = datetime.now(UTC).isoformat()
                 self._mem[key] = StrategyPattern(
                     pattern_id=str(uuid.uuid4()),
                     domain=domain,
@@ -158,7 +169,7 @@ class StrategyPatternStore:
         logger.info(
             "Strategy pattern upserted",
             extra={
-                "event": "strategy_upsert",
+                "event": "strategy.upsert",
                 "domain": domain,
                 "strategy": strategy_name,
                 "success": success,
@@ -172,7 +183,9 @@ class StrategyPatternStore:
         limit: int = 5,
     ) -> list[StrategyPattern]:
         """Get top strategies for a domain, ordered by success rate then count."""
-        resolved_uid = user_id if user_id is not None else current_user_id.get()
+        resolved_uid = require_user_id(
+            user_id, "StrategyPatternStore.get_top_strategies"
+        )
 
         if self._pool is not None:
             async with self._pool.acquire() as conn:
@@ -185,15 +198,20 @@ class StrategyPatternStore:
                     "    ELSE 0 END DESC, "
                     "  occurrence_count DESC "
                     "LIMIT $3",
-                    domain, resolved_uid, limit,
+                    domain,
+                    resolved_uid,
+                    limit,
                 )
                 return [_row_to_pattern(row) for row in rows]
         else:
             matches = [
-                p for (d, uid, _), p in self._mem.items()
+                p
+                for (d, uid, _), p in self._mem.items()
                 if d == domain and uid == resolved_uid
             ]
-            matches.sort(key=lambda p: (p.success_rate, p.occurrence_count), reverse=True)
+            matches.sort(
+                key=lambda p: (p.success_rate, p.occurrence_count), reverse=True
+            )
             return matches[:limit]
 
     async def get_by_pattern(
@@ -203,14 +221,16 @@ class StrategyPatternStore:
         strategy_name: str = "",
     ) -> StrategyPattern | None:
         """Get a specific strategy pattern."""
-        resolved_uid = user_id if user_id is not None else current_user_id.get()
+        resolved_uid = require_user_id(user_id, "StrategyPatternStore.get_by_pattern")
 
         if self._pool is not None:
             async with self._pool.acquire() as conn:
                 row = await conn.fetchrow(
                     "SELECT * FROM strategy_patterns "
                     "WHERE domain = $1 AND user_id = $2 AND strategy_name = $3",
-                    domain, resolved_uid, strategy_name,
+                    domain,
+                    resolved_uid,
+                    strategy_name,
                 )
                 return _row_to_pattern(row) if row else None
         else:
@@ -218,7 +238,7 @@ class StrategyPatternStore:
 
     async def list_all(self, user_id: int | None = None) -> list[StrategyPattern]:
         """List all strategy patterns for a user."""
-        resolved_uid = user_id if user_id is not None else current_user_id.get()
+        resolved_uid = require_user_id(user_id, "StrategyPatternStore.list_all")
 
         if self._pool is not None:
             async with self._pool.acquire() as conn:
@@ -229,10 +249,7 @@ class StrategyPatternStore:
                 )
                 return [_row_to_pattern(row) for row in rows]
         else:
-            return [
-                p for (_, uid, _), p in self._mem.items()
-                if uid == resolved_uid
-            ]
+            return [p for (_, uid, _), p in self._mem.items() if uid == resolved_uid]
 
     async def get_domain_total(
         self,
@@ -240,7 +257,7 @@ class StrategyPatternStore:
         user_id: int | None = None,
     ) -> int:
         """Get total occurrence count for a domain (across all strategies)."""
-        resolved_uid = user_id if user_id is not None else current_user_id.get()
+        resolved_uid = require_user_id(user_id, "StrategyPatternStore.get_domain_total")
 
         if self._pool is not None:
             async with self._pool.acquire() as conn:
@@ -248,12 +265,14 @@ class StrategyPatternStore:
                     "SELECT COALESCE(SUM(occurrence_count), 0) AS total "
                     "FROM strategy_patterns "
                     "WHERE domain = $1 AND user_id = $2",
-                    domain, resolved_uid,
+                    domain,
+                    resolved_uid,
                 )
                 return int(row["total"]) if row else 0
         else:
             return sum(
-                p.occurrence_count for (d, uid, _), p in self._mem.items()
+                p.occurrence_count
+                for (d, uid, _), p in self._mem.items()
                 if d == domain and uid == resolved_uid
             )
 
@@ -268,6 +287,14 @@ class StrategyPatternStore:
         but only if the domain has >=10 total tasks.
         Returns None if criteria are not met.
         """
+        logger.debug(
+            "get_canonical called",
+            extra={
+                "event": "strategy_store.get_canonical",
+                "domain": domain,
+                "user_id": user_id,
+            },
+        )
         total = await self.get_domain_total(domain, user_id)
         if total < 10:
             return None
@@ -292,13 +319,20 @@ class StrategyPatternStore:
         - 30+ days since last generation, OR
         - 20+ new tasks since last generation
         """
+        logger.debug(
+            "should_regenerate_canonical called",
+            extra={
+                "event": "strategy_store.should_regenerate_canonical",
+                "domain": domain,
+                "user_id": user_id,
+                "last_generated_type": type(last_generated).__name__,
+            },
+        )
         if last_generated is None:
             return True
 
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         days_since = (now - last_generated).total_seconds() / 86400.0
         if days_since >= 30:
             return True
-        if tasks_since >= 20:
-            return True
-        return False
+        return tasks_since >= 20

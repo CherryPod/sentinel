@@ -13,12 +13,14 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import Any, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
+
+from sentinel.crypto.blind_index import log_hash
 
 if TYPE_CHECKING:
     from sentinel.contacts.store import ContactStore
 
-logger = logging.getLogger("sentinel.audit")
+logger = logging.getLogger(__name__)
 
 # Patterns for pronoun rewriting — (regex, replacement_template).
 # Templates use {user_id} placeholder. Only match recognised action patterns
@@ -26,19 +28,33 @@ logger = logging.getLogger("sentinel.audit")
 _PRONOUN_PATTERNS: list[tuple[re.Pattern[str], str, str]] = [
     # Possessive: "my <noun>"
     (re.compile(r"\bmy email\b", re.IGNORECASE), "user {user_id}'s email", "my email"),
-    (re.compile(r"\bmy calendar\b", re.IGNORECASE), "user {user_id}'s calendar", "my calendar"),
-    (re.compile(r"\bmy last message\b", re.IGNORECASE), "user {user_id}'s last message", "my last message"),
+    (
+        re.compile(r"\bmy calendar\b", re.IGNORECASE),
+        "user {user_id}'s calendar",
+        "my calendar",
+    ),
+    (
+        re.compile(r"\bmy last message\b", re.IGNORECASE),
+        "user {user_id}'s last message",
+        "my last message",
+    ),
     # Verb + me
     (re.compile(r"\bsend me\b", re.IGNORECASE), "send user {user_id}", "send me"),
     (re.compile(r"\bemail me\b", re.IGNORECASE), "email user {user_id}", "email me"),
-    (re.compile(r"\bmessage me\b", re.IGNORECASE), "message user {user_id}", "message me"),
+    (
+        re.compile(r"\bmessage me\b", re.IGNORECASE),
+        "message user {user_id}",
+        "message me",
+    ),
     (re.compile(r"\bremind me\b", re.IGNORECASE), "remind user {user_id}", "remind me"),
     (re.compile(r"\bnotify me\b", re.IGNORECASE), "notify user {user_id}", "notify me"),
 ]
 
 
 async def resolve_sender(
-    store: ContactStore, channel: str, identifier: str,
+    store: ContactStore,
+    channel: str,
+    identifier: str,
 ) -> int | None:
     """Map an incoming channel identifier to a user_id.
 
@@ -46,6 +62,16 @@ async def resolve_sender(
     to the contact, and returns the linked_user_id if the contact is a user.
     Returns None if not found, not a user, or no linked_user_id.
     """
+    logger.debug(
+        "resolve_sender called",
+        extra={
+            "event": "resolver.resolve_sender",
+            "store_type": type(store).__name__,
+            "channel": channel,
+            "identifier_len": len(identifier or ""),
+            "identifier_hash": log_hash(identifier),
+        },
+    )
     ch = await store.get_by_identifier(channel, identifier)
     if ch is None:
         return None
@@ -64,7 +90,9 @@ async def resolve_sender(
 
 
 async def resolve_recipient_name(
-    store: ContactStore, display_name: str, user_id: int,
+    store: ContactStore,
+    display_name: str,
+    user_id: int,
 ) -> int | None:
     """Map a display name to a contact_id, scoped to the owner (user_id).
 
@@ -80,7 +108,9 @@ async def resolve_recipient_name(
 
 
 async def resolve_recipient_to_channel(
-    store: ContactStore, contact_id: int, channel: str,
+    store: ContactStore,
+    contact_id: int,
+    channel: str,
 ) -> str | None:
     """Map a contact_id + channel to the actual channel identifier.
 
@@ -112,11 +142,13 @@ def rewrite_pronouns(text: str, user_id: int) -> tuple[str, list[dict]]:
         replacement = template.format(user_id=user_id)
         new_result, count = pattern.subn(replacement, result)
         if count > 0:
-            audit.append({
-                "original": pattern_name,
-                "replacement": replacement,
-                "pattern": pattern_name,
-            })
+            audit.append(
+                {
+                    "original": pattern_name,
+                    "replacement": replacement,
+                    "pattern": pattern_name,
+                }
+            )
             result = new_result
     return result, audit
 
@@ -125,6 +157,7 @@ def rewrite_pronouns(text: str, user_id: int) -> tuple[str, list[dict]]:
 _MESSAGING_TOOLS: dict[str, tuple[str, str]] = {
     "signal_send": ("signal", "recipient"),
     "telegram_send": ("telegram", "recipient"),
+    "matrix_send": ("matrix", "recipient"),
     "email_send": ("email", "recipient"),
     "email_draft": ("email", "recipient"),
 }
@@ -163,9 +196,7 @@ async def resolve_tool_recipient(
         return args
 
     if store is None:
-        raise ValueError(
-            f"Cannot resolve contact — contact store not available"
-        )
+        raise ValueError("Cannot resolve contact — contact store not available")
 
     contact_id = int(match.group(1))
     resolved = await resolve_recipient_to_channel(store, contact_id, channel)
@@ -178,7 +209,7 @@ async def resolve_tool_recipient(
     logger.info(
         "Recipient resolved",
         extra={
-            "event": "recipient_resolved",
+            "event": "resolver.recipient_resolved",
             "tool": tool_name,
             "contact_id": contact_id,
             "channel": channel,
@@ -220,13 +251,15 @@ async def resolve_default_recipient(
 
     # Resolve that contact's channel identifier
     resolved = await resolve_recipient_to_channel(
-        store, self_contact["contact_id"], channel,
+        store,
+        self_contact["contact_id"],
+        channel,
     )
     if resolved:
         logger.info(
             "Default recipient resolved to self",
             extra={
-                "event": "default_recipient_resolved",
+                "event": "resolver.default_recipient_resolved",
                 "tool": tool_name,
                 "contact_id": self_contact["contact_id"],
                 "channel": channel,
@@ -236,7 +269,9 @@ async def resolve_default_recipient(
 
 
 async def rewrite_message(
-    store: ContactStore, text: str, user_id: int,
+    store: ContactStore,
+    text: str,
+    user_id: int,
 ) -> tuple[str, list[dict]]:
     """Full intake rewriting — name resolution + pronoun rewriting.
 
@@ -249,6 +284,15 @@ async def rewrite_message(
     Longer names are replaced first to avoid partial matches.
     Unresolved names pass through unchanged.
     """
+    logger.debug(
+        "rewrite_message called",
+        extra={
+            "event": "resolver.rewrite_message",
+            "store_type": type(store).__name__,
+            "text_len": len(text),
+            "user_id": user_id,
+        },
+    )
     audit: list[dict] = []
     result = text
 
@@ -264,11 +308,13 @@ async def rewrite_message(
         replacement = f"user {contact['contact_id']}"
         new_result, count = pattern.subn(replacement, result)
         if count > 0:
-            audit.append({
-                "original": name,
-                "replacement": replacement,
-                "pattern": "name_resolution",
-            })
+            audit.append(
+                {
+                    "original": name,
+                    "replacement": replacement,
+                    "pattern": "name_resolution",
+                }
+            )
             result = new_result
 
     # Step 4: Pronoun rewriting

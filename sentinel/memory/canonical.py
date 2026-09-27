@@ -13,10 +13,12 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
-from typing import TYPE_CHECKING, Any
+from datetime import UTC, datetime, timedelta
+from typing import TYPE_CHECKING
 
-logger = logging.getLogger("sentinel.audit")
+from sentinel.core.context import require_user_id
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sentinel.memory.chunks import MemoryStore
@@ -40,12 +42,12 @@ class CanonicalTrajectory:
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
 def _expiry_iso(days: int = 30) -> str:
     """Return ISO timestamp for expiry days from now."""
-    dt = datetime.now(timezone.utc) + timedelta(days=days)
+    dt = datetime.now(UTC) + timedelta(days=days)
     return dt.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
@@ -83,15 +85,20 @@ async def store_canonical_as_chunk(
     trajectory: CanonicalTrajectory,
     memory_store: MemoryStore,
     embedding_client: EmbeddingBase | None = None,
-    user_id: int = 1,
+    user_id: int | None = None,
 ) -> str:
     """Store a canonical trajectory as a memory chunk.
 
     Source: "system:canonical" — protected from user deletion.
     Metadata includes domain, strategy, expiry for retrieval filtering.
     """
+    user_id = require_user_id(user_id, "memory.canonical.store_canonical_as_chunk")
     # Build content text for embedding + FTS
-    steps_str = " → ".join(trajectory.step_sequence) if trajectory.step_sequence else trajectory.strategy_name
+    steps_str = (
+        " → ".join(trajectory.step_sequence)
+        if trajectory.step_sequence
+        else trajectory.strategy_name
+    )
     content = (
         f"[CANONICAL] {trajectory.domain}: "
         f"best approach is {trajectory.strategy_name} "
@@ -112,7 +119,8 @@ async def store_canonical_as_chunk(
     if embedding_client is not None:
         try:
             embedding = await embedding_client.embed(
-                content, prefix="search_document: ",
+                content,
+                prefix="search_document: ",
             )
             chunk_id = await memory_store.store_with_embedding(
                 content=content,
@@ -125,16 +133,17 @@ async def store_canonical_as_chunk(
             logger.info(
                 "Canonical trajectory stored with embedding",
                 extra={
-                    "event": "canonical_stored",
+                    "event": "canonical.stored",
                     "domain": trajectory.domain,
                     "chunk_id": chunk_id,
                 },
             )
             return chunk_id
-        except Exception as exc:
+        except Exception as exc:  # catch-all: embedding fallback to plain store
             logger.warning(
                 "Canonical embedding failed, storing without",
-                extra={"event": "canonical_embed_failed", "error": str(exc)},
+                extra={"event": "canonical.embed_failed", "error": str(exc)},
+                exc_info=True,
             )
 
     # Fallback: store without embedding
@@ -148,7 +157,7 @@ async def store_canonical_as_chunk(
     logger.info(
         "Canonical trajectory stored (no embedding)",
         extra={
-            "event": "canonical_stored",
+            "event": "canonical.stored",
             "domain": trajectory.domain,
             "chunk_id": chunk_id,
         },
@@ -180,10 +189,11 @@ async def refresh_canonical_trajectories(
 
     try:
         summaries = await domain_summary_store.list_all(user_id=user_id)
-    except Exception as exc:
+    except Exception as exc:  # catch-all: canonical refresh best-effort
         logger.warning(
             "Canonical refresh: failed to list domains",
-            extra={"event": "canonical_refresh_failed", "error": str(exc)},
+            extra={"event": "canonical.refresh_failed", "error": str(exc)},
+            exc_info=True,
         )
         return 0
 
@@ -205,10 +215,16 @@ async def refresh_canonical_trajectories(
             if existing_canonical and existing_canonical.metadata.get("generated_at"):
                 try:
                     last_generated = datetime.fromisoformat(
-                        existing_canonical.metadata["generated_at"].replace("Z", "+00:00")
+                        existing_canonical.metadata["generated_at"]
                     )
                 except (ValueError, TypeError):
-                    pass
+                    logger.debug(
+                        "refresh_canonical_trajectories: ValueError | TypeError suppressed",
+                        extra={
+                            "event": "canonical.refresh_canonical_trajectories.suppressed"
+                        },
+                        exc_info=True,
+                    )
 
             should_regen = await strategy_store.should_regenerate_canonical(
                 domain=summary.domain,
@@ -235,10 +251,19 @@ async def refresh_canonical_trajectories(
             if existing_canonical:
                 try:
                     await memory_store.delete(
-                        existing_canonical.chunk_id, user_id=user_id,
+                        existing_canonical.chunk_id,
+                        user_id=user_id,
                     )
                 except ValueError:
                     # system: source is protected — use update instead
+                    logger.warning(
+                        "Canonical delete blocked (protected source), using update",
+                        extra={
+                            "event": "canonical.delete_protected",
+                            "chunk_id": existing_canonical.chunk_id,
+                        },
+                        exc_info=True,
+                    )
                     await memory_store.update(
                         existing_canonical.chunk_id,
                         content="[SUPERSEDED]",
@@ -247,28 +272,32 @@ async def refresh_canonical_trajectories(
 
             # Store new canonical
             await store_canonical_as_chunk(
-                trajectory, memory_store, embedding_client, user_id,
+                trajectory,
+                memory_store,
+                embedding_client,
+                user_id,
             )
             refreshed += 1
 
             logger.info(
                 "Canonical trajectory refreshed",
                 extra={
-                    "event": "canonical_refreshed",
+                    "event": "canonical.refreshed",
                     "domain": summary.domain,
                     "strategy": trajectory.strategy_name,
                     "success_rate": trajectory.success_rate,
                 },
             )
 
-        except Exception as exc:
+        except Exception as exc:  # catch-all: per-domain refresh isolation
             logger.warning(
                 "Canonical refresh failed for domain (non-fatal)",
                 extra={
-                    "event": "canonical_refresh_domain_failed",
+                    "event": "canonical.refresh_domain_failed",
                     "domain": summary.domain,
                     "error": str(exc),
                 },
+                exc_info=True,
             )
 
     return refreshed

@@ -2,6 +2,7 @@
 
 Fix YAML indentation issues (tabs, inconsistent indent) and validate.
 """
+
 import logging
 
 import yaml
@@ -14,6 +15,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Layer 3: YAML repair
 # ---------------------------------------------------------------------------
+
 
 def fix_yaml(content: str) -> FixResult:
     """Fix YAML indentation issues and validate.
@@ -30,6 +32,15 @@ def fix_yaml(content: str) -> FixResult:
     """
     result = FixResult(content=content)
     original = content
+
+    logger.debug(
+        "YAML fixer starting",
+        extra={
+            "event": "yaml_fixer.start",
+            "file": _current_filename.get(),
+            "content_length": len(content),
+        },
+    )
 
     # Tab -> 2 spaces (safe — YAML spec forbids tabs)
     if "\t" in content:
@@ -57,9 +68,7 @@ def fix_yaml(content: str) -> FixResult:
             if line and not line.lstrip().startswith("#"):
                 leading = len(line) - len(line.lstrip())
                 if leading > 0 and leading % 2 == 0:
-                    normalized_lines.append(
-                        " " * (leading // 2) + line.lstrip()
-                    )
+                    normalized_lines.append(" " * (leading // 2) + line.lstrip())
                 else:
                     normalized_lines.append(line)
             else:
@@ -72,12 +81,22 @@ def fix_yaml(content: str) -> FixResult:
                 "Normalized 4-space indent -> 2-space (YAML convention)"
             )
         except yaml.YAMLError:
-            pass  # normalization broke it — revert
+            logger.warning(
+                "fix_yaml: yaml.YAMLError",
+                extra={"event": "yaml_fixer.parse_error"},
+                exc_info=True,
+            )
+            # normalization broke it — revert
 
     # Final validation
     try:
         yaml.safe_load(content)
     except yaml.YAMLError as e:
+        logger.warning(
+            "fix_yaml: yaml.YAMLError",
+            extra={"event": "yaml_fixer.parse_error", "error": str(e)},
+            exc_info=True,
+        )
         result.errors_found.append(f"YAMLError: {e}")
 
     result.content = content
@@ -87,7 +106,7 @@ def fix_yaml(content: str) -> FixResult:
         logger.debug(
             "YAML fixes applied",
             extra={
-                "event": "fixer_applied",
+                "event": "yaml_fixer.applied",
                 "fixer": "fix_yaml",
                 "file": _current_filename.get(),
                 "fix_description": ", ".join(result.fixes_applied),

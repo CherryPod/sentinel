@@ -18,11 +18,14 @@ Trust-level-aware classification (D3/D4/D5):
   static denylist always blocks regardless of constraints.
 """
 
-from enum import Enum
+import logging
+from enum import StrEnum
+
+logger = logging.getLogger(__name__)
 
 
-class TrustTier(str, Enum):
-    SAFE = "safe"           # Bypass CaMeL, still auth + sandbox
+class TrustTier(StrEnum):
+    SAFE = "safe"  # Bypass CaMeL, still auth + sandbox
     PERMITTED = "permitted"  # Allowed with approval + enhanced scanning (D4)
     DANGEROUS = "dangerous"  # Full CaMeL pipeline
 
@@ -35,18 +38,20 @@ class TrustTier(str, Enum):
 # through the full CaMeL pipeline with human approval at all trust levels.
 # Read operations (email_search, email_read, calendar_list_events) are also
 # excluded because they return UNTRUSTED external data that must be scanned.
-SAFE_OPS = frozenset({
-    "health_check",
-    "session_info",
-    "memory_search",
-    "memory_list",
-    "memory_store",
-    "memory_recall_file",
-    "memory_recall_session",
-    "routine_list",
-    "routine_get",
-    "routine_history",
-})
+SAFE_OPS = frozenset(
+    {
+        "health_check",
+        "session_info",
+        "memory_search",
+        "memory_list",
+        "memory_store",
+        "memory_recall_file",
+        "memory_recall_session",
+        "routine_list",
+        "routine_get",
+        "routine_history",
+    }
+)
 
 # TL2 allowlist — extends TL1 with read-only file access.
 # file_read still runs through ToolExecutor (policy checks, provenance
@@ -75,7 +80,44 @@ def classify_operation(op: str, trust_level: int = 1) -> TrustTier:
     """
     safe_set = TL2_SAFE_OPS if trust_level >= 2 else SAFE_OPS
     if op in safe_set:
+        logger.debug(
+            "classify_operation result — SAFE",
+            extra={
+                "event": "classify.operation_result",
+                "op": op,
+                "trust_level": trust_level,
+                "tier": "SAFE",
+                "reason": "op in safe_set",
+            },
+        )
         return TrustTier.SAFE
+    logger.debug(
+        "classify_operation: op_in_safe_set_passed",
+        extra={
+            "event": "classify.operation_result.passed",
+            "reason": "op_in_safe_set_passed",
+        },
+    )  # auto:neg
     if trust_level >= 3 and op in TL3_PERMITTED_OPS:
+        logger.debug(
+            "classify_operation result — PERMITTED",
+            extra={
+                "event": "classify.operation_result",
+                "op": op,
+                "trust_level": trust_level,
+                "tier": "PERMITTED",
+                "reason": "TL3+ permitted op",
+            },
+        )
         return TrustTier.PERMITTED
+    logger.debug(
+        "classify_operation result — DANGEROUS",
+        extra={
+            "event": "classify.operation_result",
+            "op": op,
+            "trust_level": trust_level,
+            "tier": "DANGEROUS",
+            "reason": "default — not in any allowlist",
+        },
+    )
     return TrustTier.DANGEROUS

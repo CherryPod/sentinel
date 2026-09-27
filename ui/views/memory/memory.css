@@ -1,0 +1,146 @@
+/* ── Memory View ─────────────────────────────────────────────
+   Memory search, cards, preview, actions, metadata.
+   ──────────────────────────────────────────────────────────── */
+
+.memory-content {
+    max-width: 800px;
+}
+
+.memory-form {
+    background: var(--bg-card);
+    border: 1px solid var(--border-card);
+    border-radius: var(--radius-2xl);
+    padding: var(--space-4);
+    margin-bottom: var(--space-4);
+    box-shadow: var(--shadow-sm);
+}
+
+
+.memory-results {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+}
+
+.memory-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border-card);
+    border-radius: var(--radius-2xl);
+    padding: var(--space-3) var(--space-4);
+    cursor: pointer;
+    box-shadow: var(--shadow-sm);
+    transition: border-color var(--duration-fast), box-shadow var(--duration-fast);
+}
+
+.memory-card:hover {
+    border-color: var(--rose-border);
+    box-shadow: var(--shadow-md);
+}
+
+.memory-card-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: var(--space-2);
+}
+
+.memory-card-source {
+    font-size: var(--text-xs);
+    font-weight: 600;
+    color: var(--text-muted);
+}
+
+.memory-card-score {
+    font-size: var(--text-xs);
+    color: var(--rose-text);
+    font-weight: 600;
+}
+
+.memory-card-preview {
+    font-size: var(--text-base);
+    color: var(--text-secondary);
+    line-height: 1.5;
+    display: -webkit-box;
+    -webkit-line-clamp: 3;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+}
+
+.memory-card.expanded .memory-card-preview {
+    -webkit-line-clamp: unset;
+    overflow: visible;
+}
+
+.memory-card-actions {
+    gap: var(--space-2);
+    margin-top: var(--space-2);
+    display: none;
+}
+
+.memory-card.expanded .memory-card-actions { display: flex; }
+
+.memory-card-meta {
+    display: none;
+    margin-top: var(--space-2);
+    font-size: var(--text-sm);
+    color: var(--text-muted);
+}
+
+.memory-card.expanded .memory-card-meta { display: block; }
+
+/* Meta spans inside the expanded card */
+.memory-source,
+.memory-score,
+.memory-chunk-id {
+    display: inline-block;
+    margin-right: var(--space-2);
+}
+
+/* Store form container and actions row */
+.memory-store-form {
+    margin-top: var(--space-3);
+}
+
+.memory-store-actions {
+    display: flex;
+    gap: var(--space-2);
+    margin-top: var(--space-2);
+}
+
+/* Search container */
+.memory-search {
+    margin-bottom: var(--space-4);
+}
+
+/* Inputs in the store form */
+.memory-search-input,
+.memory-input,
+.memory-textarea {
+    width: 100%;
+    padding: var(--space-3) var(--space-4);
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    color: var(--text-primary);
+    font-family: inherit;
+    font-size: var(--text-md);
+    outline: none;
+    transition: border-color var(--duration-normal), box-shadow var(--duration-normal);
+}
+
+.memory-search-input:focus,
+.memory-input:focus,
+.memory-textarea:focus {
+    border-color: var(--accent);
+    box-shadow: var(--shadow-focus);
+}
+
+.memory-search-input::placeholder,
+.memory-input::placeholder,
+.memory-textarea::placeholder {
+    color: var(--text-muted);
+}
+
+.memory-delete-btn {
+    margin-top: var(--space-2);
+}

@@ -10,7 +10,10 @@ gate blocks non-Latin scripts from reaching Qwen; this module catches
 them in text that's already been generated or in path arguments.
 """
 
+import logging
 import unicodedata
+
+logger = logging.getLogger(__name__)
 
 # Cyrillic → Latin visual confusable map.
 # Only includes characters that look identical or near-identical to Latin
@@ -19,31 +22,36 @@ import unicodedata
 # phonetic similarity.
 _CYRILLIC_TO_LATIN: dict[str, str] = {
     # Lower-case
-    "\u0430": "a",   # а
-    "\u0435": "e",   # е
-    "\u043E": "o",   # о
-    "\u0440": "p",   # р
-    "\u0441": "c",   # с
-    "\u0443": "y",   # у
-    "\u0445": "x",   # х
-    "\u0455": "s",   # ѕ
-    "\u0456": "i",   # і
-    "\u0458": "j",   # ј
-    "\u04BB": "h",   # һ
-    "\u0501": "d",   # ԁ
+    "\u0430": "a",  # а
+    "\u0435": "e",  # е
+    "\u043e": "o",  # о
+    "\u0440": "p",  # р
+    "\u0441": "c",  # с
+    "\u0443": "y",  # у
+    "\u0445": "x",  # х
+    "\u0455": "s",  # ѕ
+    "\u0456": "i",  # і
+    "\u0458": "j",  # ј
+    "\u04bb": "h",  # һ
+    "\u0501": "d",  # ԁ
     # Upper-case
-    "\u0410": "A",   # А
-    "\u0412": "B",   # В
-    "\u0415": "E",   # Е
-    "\u041A": "K",   # К
-    "\u041C": "M",   # М
-    "\u041D": "H",   # Н
-    "\u041E": "O",   # О
-    "\u0420": "P",   # Р
-    "\u0421": "C",   # С
-    "\u0422": "T",   # Т
-    "\u0423": "Y",   # У
-    "\u0425": "X",   # Х
+    "\u0405": "S",  # Ѕ — C78, paired with ѕ U+0455
+    "\u0406": "I",  # І — C78, paired with і U+0456
+    "\u0408": "J",  # Ј — C78, paired with ј U+0458
+    "\u0410": "A",  # А
+    "\u0412": "B",  # В
+    "\u0415": "E",  # Е
+    "\u041a": "K",  # К
+    "\u041c": "M",  # М
+    "\u041d": "H",  # Н
+    "\u041e": "O",  # О
+    "\u0420": "P",  # Р
+    "\u0421": "C",  # С
+    "\u0422": "T",  # Т
+    "\u0423": "Y",  # У
+    "\u0425": "X",  # Х
+    "\u04ba": "H",  # Һ — C78, paired with һ U+04BB
+    "\u0500": "D",  # Ԁ — C78, paired with ԁ U+0501
 }
 
 # Build a translation table for str.translate() — fast single-pass replacement
@@ -65,6 +73,10 @@ def normalise_homoglyphs(text: str) -> str:
     Non-confusable Unicode (arrows, math symbols, CJK, etc.) passes
     through unchanged.
     """
+    logger.debug(
+        "Homoglyph normalisation started",
+        extra={"event": "homoglyph.normalise", "text_len": len(text)},
+    )
     if not text:
         return text
 
@@ -73,9 +85,16 @@ def normalise_homoglyphs(text: str) -> str:
 
     # Step 2+3: Strip combining marks (Mn) and invisible format chars (Cf)
     stripped = "".join(
-        ch for ch in decomposed
-        if unicodedata.category(ch) not in ("Mn", "Cf")
+        ch for ch in decomposed if unicodedata.category(ch) not in ("Mn", "Cf")
     )
 
     # Step 4: Cyrillic → Latin visual confusables
-    return stripped.translate(_CONFUSABLE_TABLE)
+    result = stripped.translate(_CONFUSABLE_TABLE)
+    logger.debug(
+        "Homoglyph normalisation complete",
+        extra={
+            "event": "homoglyph.normalise_complete",
+            "changed": result != text,
+        },
+    )
+    return result

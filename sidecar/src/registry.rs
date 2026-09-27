@@ -15,8 +15,10 @@ pub struct ToolMeta {
     /// Tool name (e.g. "file_read").
     pub name: String,
     /// Human-readable description.
+    #[allow(dead_code)] // Loaded from tool.toml — available for future logging/UI
     pub description: String,
     /// Path to the compiled .wasm file.
+    #[allow(dead_code)] // Loaded from tool.toml — available for diagnostics
     pub wasm_path: PathBuf,
     /// Pre-compiled Wasmtime module (compiled once at startup, reused per-call).
     /// Wasmtime supports Module::serialize()/deserialize() for persistent caching
@@ -143,6 +145,7 @@ impl ToolRegistry {
     }
 
     /// Check if the registry is empty.
+    #[allow(dead_code)] // Conventional companion to len()
     pub fn is_empty(&self) -> bool {
         self.tools.is_empty()
     }

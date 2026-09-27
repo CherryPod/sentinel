@@ -197,20 +197,31 @@ impl LeakDetector {
 
     /// Redact all detected leaks in the text, replacing matches with
     /// `[REDACTED:pattern_name]`.
+    ///
+    /// Handles overlapping matches (e.g. builtin + credential scanner ranges)
+    /// by merging overlaps before replacement, building output left-to-right.
     pub fn redact(&self, text: &str, creds: Option<&CredentialScanner>) -> String {
         let mut leaks = self.scan(text, creds);
         if leaks.is_empty() {
             return text.to_string();
         }
 
-        // Sort by start position descending so replacements don't shift offsets
-        leaks.sort_by(|a, b| b.start.cmp(&a.start));
+        // Sort ascending by start position, then widest match first for ties
+        leaks.sort_by(|a, b| a.start.cmp(&b.start).then(b.end.cmp(&a.end)));
 
-        let mut result = text.to_string();
+        // Build output left-to-right, skipping overlapping ranges
+        let mut result = String::with_capacity(text.len());
+        let mut cursor = 0;
         for leak in &leaks {
-            let replacement = format!("[REDACTED:{}]", leak.pattern_name);
-            result.replace_range(leak.start..leak.end, &replacement);
+            if leak.start < cursor {
+                // Overlaps with a previous (already-replaced) match — skip
+                continue;
+            }
+            result.push_str(&text[cursor..leak.start]);
+            result.push_str(&format!("[REDACTED:{}]", leak.pattern_name));
+            cursor = leak.end;
         }
+        result.push_str(&text[cursor..]);
         result
     }
 }
@@ -308,6 +319,29 @@ mod tests {
         // has_leaks with None creds should not panic or match everything
         let detector = LeakDetector::new();
         assert!(!detector.has_leaks("normal text", None));
+    }
+
+    #[test]
+    fn test_redaction_with_adjacent_matches() {
+        // password=sk_live_xyz — two patterns back-to-back
+        let detector = LeakDetector::new();
+        let text = "password=sk_live_test123";
+        let redacted = detector.redact(text, None);
+        assert!(!redacted.contains("password="));
+        assert!(!redacted.contains("sk_live_"));
+        assert!(redacted.contains("[REDACTED:"));
+    }
+
+    #[test]
+    fn test_redaction_with_overlapping_credential() {
+        // Credential value contains a builtin pattern prefix
+        let detector = LeakDetector::new();
+        let creds = CredentialScanner::new(vec!["the-password=secret".to_string()]);
+        let text = "value is the-password=secret here";
+        let redacted = detector.redact(text, creds.as_ref());
+        // Should not panic or produce corrupt output
+        assert!(!redacted.contains("password=secret"));
+        assert!(redacted.contains("[REDACTED:"));
     }
 
     #[test]

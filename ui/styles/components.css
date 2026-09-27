@@ -1,0 +1,580 @@
+/* ── Shared Components ────────────────────────────────────────
+   Buttons, toasts, spinner, forms, toggles, badges, empty states.
+   View-specific styles live in views/<name>/<name>.css.
+
+   CSS Naming Convention (L-03):
+   - Flat hyphenated: .component-part-subpart (e.g. .memory-card-header)
+   - Modifiers via state class: .card.expanded, .status-dot.healthy
+   - View-scoped prefixes: .memory-*, .routine-*, .log-*, .dashboard-*
+   - Shared components: .btn, .toast, .badge, .toggle, .form-*
+   - Utilities: .sr-only, .text-muted, .flex-center (in utilities.css)
+   - NOT BEM — no __ or -- separators. This is intentional.
+   ──────────────────────────────────────────────────────────── */
+
+/* ── Buttons ─────────────────────────────────────────────────── */
+
+.btn {
+    padding: var(--space-2) var(--space-5);
+    border: none;
+    border-radius: var(--radius-xl);
+    font-size: var(--text-base);
+    font-weight: 600;
+    cursor: pointer;
+    transition: opacity var(--duration-normal);
+}
+
+.btn:hover { opacity: 0.85; }
+
+.btn:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+}
+
+.btn-primary {
+    background: var(--accent-bold);
+    color: #fff;
+}
+
+.btn-secondary {
+    background: var(--bg-tertiary);
+    color: var(--text-secondary);
+    border: 1px solid var(--border);
+}
+
+.btn-approve {
+    background: var(--green);
+    color: #000;
+}
+
+.btn-deny {
+    background: var(--bg-tertiary);
+    color: var(--text-secondary);
+    border: 1px solid var(--border);
+}
+
+.btn-sm {
+    padding: var(--space-1) var(--space-3);
+    font-size: var(--text-sm);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    background: var(--bg-tertiary);
+    color: var(--text-secondary);
+    cursor: pointer;
+    transition: background var(--duration-normal);
+}
+
+.btn-sm:hover {
+    background: var(--border);
+    color: var(--text-primary);
+}
+.btn-sm.danger { color: var(--red); }
+.btn-sm.danger:hover { background: var(--red-bg); }
+
+.action-btn {
+    padding: var(--space-1) var(--space-3);
+    background: none;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    color: var(--text-secondary);
+    font-family: inherit;
+    font-size: var(--text-xs);
+    font-weight: 600;
+    cursor: pointer;
+    transition: background var(--duration-fast), color var(--duration-fast);
+}
+
+.action-btn:hover {
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
+}
+
+.action-btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+/* ── Toast Notifications ─────────────────────────────────────── */
+
+#toast-container {
+    position: fixed;
+    top: var(--space-4);
+    right: var(--space-4);
+    z-index: var(--z-toast);
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    max-width: 360px;
+}
+
+.toast {
+    padding: var(--space-3) var(--space-4);
+    border-radius: var(--radius-2xl);
+    font-size: var(--text-base);
+    line-height: 1.4;
+    display: flex;
+    align-items: flex-start;
+    gap: var(--space-2);
+    animation: toast-in var(--duration-slow) ease-out;
+    box-shadow: var(--shadow-lg);
+}
+
+.toast.success {
+    background: var(--green-bg);
+    border: 1px solid var(--green);
+    color: var(--green-text);
+}
+
+.toast.error {
+    background: var(--red-bg);
+    border: 1px solid var(--red);
+    color: var(--red);
+}
+
+.toast.info {
+    background: var(--accent-bg);
+    border: 1px solid var(--accent);
+    color: var(--accent);
+}
+
+.toast-message {
+    flex: 1;
+}
+
+.toast-close {
+    background: none;
+    border: none;
+    color: inherit;
+    cursor: pointer;
+    font-size: var(--text-xl);
+    line-height: 1;
+    padding: 0 0 0 var(--space-2);
+    opacity: 0.7;
+    flex-shrink: 0;
+}
+
+.toast-close:hover { opacity: 1; }
+
+.toast.removing {
+    animation: toast-out var(--duration-slow) ease-in forwards;
+}
+
+@keyframes toast-in {
+    from {
+        transform: translateX(100%);
+        opacity: 0;
+    }
+
+    to {
+        transform: translateX(0);
+        opacity: 1;
+    }
+}
+
+@keyframes toast-out {
+    from {
+        transform: translateX(0);
+        opacity: 1;
+    }
+
+    to {
+        transform: translateX(100%);
+        opacity: 0;
+    }
+}
+
+/* ── Spinner ─────────────────────────────────────────────────── */
+
+.spinner {
+    display: inline-block;
+    width: 14px;
+    height: 14px;
+    border: 2px solid var(--text-muted);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+    vertical-align: middle;
+    margin-right: var(--space-2);
+}
+
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* ── Form Shared Styles ──────────────────────────────────────── */
+
+.form-group {
+    margin-bottom: var(--space-3);
+}
+
+.form-group label {
+    display: block;
+    font-size: var(--text-sm);
+    font-weight: 600;
+    color: var(--text-muted);
+    margin-bottom: var(--space-1);
+}
+
+.form-group input,
+.form-group select,
+.form-group textarea {
+    width: 100%;
+    padding: var(--space-2) var(--space-3);
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    color: var(--text-primary);
+    font-family: inherit;
+    font-size: var(--text-md);
+    outline: none;
+    transition: border-color var(--duration-normal), box-shadow var(--duration-normal);
+}
+
+.form-group input:focus,
+.form-group select:focus,
+.form-group textarea:focus {
+    border-color: var(--accent);
+    box-shadow: var(--shadow-focus);
+}
+
+.form-group textarea {
+    resize: vertical;
+    font-family: inherit;
+}
+
+.form-hint {
+    display: block;
+    font-size: var(--text-xs);
+    color: var(--text-muted);
+    margin-top: 2px;
+}
+
+.form-actions {
+    display: flex;
+    gap: var(--space-2);
+    margin-top: var(--space-3);
+}
+
+/* ── Toggle Switch ───────────────────────────────────────────── */
+
+.toggle {
+    position: relative;
+    width: 36px;
+    height: 20px;
+    cursor: pointer;
+}
+
+.toggle input {
+    opacity: 0;
+    width: 0;
+    height: 0;
+}
+
+.toggle-slider {
+    position: absolute;
+    top: 0; left: 0; right: 0; bottom: 0;
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-xl);
+    transition: background var(--duration-normal);
+}
+
+.toggle-slider::before {
+    content: '';
+    position: absolute;
+    width: 14px;
+    height: 14px;
+    left: 2px;
+    bottom: 2px;
+    background: var(--text-muted);
+    border-radius: 50%;
+    transition: transform var(--duration-normal), background var(--duration-normal);
+}
+
+.toggle input:checked + .toggle-slider {
+    background: var(--green);
+    border-color: var(--green);
+}
+
+.toggle input:checked + .toggle-slider::before {
+    transform: translateX(16px);
+    background: #000;
+}
+
+/* ── Badges ──────────────────────────────────────────────────── */
+
+.routine-badge {
+    display: inline-block;
+    font-size: var(--text-2xs);
+    font-weight: 600;
+    padding: 2px var(--space-2);
+    border-radius: var(--radius-pill);
+}
+
+.routine-badge.enabled {
+    background: var(--green);
+    color: #000;
+}
+
+.routine-badge.disabled {
+    background: var(--text-muted);
+    color: #000;
+}
+
+.routine-badge.trigger {
+    background: var(--bg-tertiary);
+    color: var(--text-secondary);
+    border: 1px solid var(--border);
+}
+
+.step-badge {
+    display: inline-block;
+    font-size: var(--text-2xs);
+    font-weight: 600;
+    padding: 1px 5px;
+    margin-right: var(--space-2);
+    border-radius: var(--radius-pill);
+    background: var(--yellow);
+    color: #000;
+    vertical-align: middle;
+}
+
+.step-desc {
+    font-size: var(--text-base);
+    color: var(--text-secondary);
+    flex: 1;
+}
+
+.trust-badge {
+    font-size: var(--text-xs);
+    font-weight: 700;
+    padding: 2px var(--space-2);
+    border-radius: var(--radius-sm);
+}
+
+.trust-badge.tl-0 {
+    background: var(--bg-tertiary);
+    color: var(--text-muted);
+}
+
+.trust-badge.tl-1 {
+    background: var(--green-bg);
+    color: var(--green-text);
+}
+
+.trust-badge.tl-2 {
+    background: var(--yellow-bg);
+    color: var(--yellow);
+}
+
+.trust-badge.tl-3 {
+    background: var(--yellow-bg);
+    color: var(--orange);
+}
+
+.trust-badge.tl-4 {
+    background: var(--green);
+    color: #fff;
+}
+
+/* ── Status Pills ────────────────────────────────────────────
+   Soft-tinted pill with a leading dot. Pair colour with the word —
+   never colour alone (colour-blind accessibility).
+   Variants map to the reserved semantic colours. ───────────── */
+
+.pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: var(--text-sm);
+    font-weight: 600;
+    padding: 2px var(--space-3);
+    border-radius: var(--radius-pill);
+    background: var(--bg-tertiary);
+    color: var(--text-secondary);
+}
+
+.pill::before {
+    content: '';
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: currentcolor;
+    flex-shrink: 0;
+}
+
+.pill.ok {
+    background: var(--green-bg);
+    color: var(--green-text);
+}
+
+.pill.warn {
+    background: var(--yellow-bg);
+    color: var(--yellow-text);
+}
+
+.pill.fail {
+    background: var(--red-bg);
+    color: var(--red);
+}
+
+.pill.off {
+    background: var(--bg-tertiary);
+    color: var(--pill-off-text);
+}
+
+.pill.info {
+    background: var(--peri-bg);
+    color: var(--peri-text);
+}
+
+/* ── Empty State ─────────────────────────────────────────────── */
+
+.empty-state {
+    text-align: center;
+    padding: var(--space-10) var(--space-5);
+    color: var(--text-muted);
+    font-size: var(--text-base);
+}
+
+/* ── Focus Visible (H-13) ───────────────────────────────────── */
+
+/* Keyboard-only focus ring for interactive non-input elements.
+   Inputs keep :focus (always show ring). Buttons, links, tabs,
+   toggles, and clickable elements use :focus-visible. */
+
+.btn:focus-visible,
+.action-btn:focus-visible,
+.toast-close:focus-visible,
+.toggle:focus-visible,
+.nav-item:focus-visible,
+.nav-status:focus-visible,
+.settings-close:focus-visible,
+.settings-tab:focus-visible,
+.subtab:focus-visible,
+.tw-btn:focus-visible,
+.log-task-id:focus-visible,
+.routine-history-title:focus-visible,
+.memory-card:focus-visible,
+.step-header:focus-visible,
+#send-btn:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+}
+
+/* Remove default outline on mouse click for these elements */
+.btn:focus:not(:focus-visible),
+.action-btn:focus:not(:focus-visible),
+.toast-close:focus:not(:focus-visible),
+.toggle:focus:not(:focus-visible),
+.nav-item:focus:not(:focus-visible),
+.nav-status:focus:not(:focus-visible),
+.settings-close:focus:not(:focus-visible),
+.settings-tab:focus:not(:focus-visible),
+.subtab:focus:not(:focus-visible),
+.tw-btn:focus:not(:focus-visible),
+.log-task-id:focus:not(:focus-visible),
+.routine-history-title:focus:not(:focus-visible),
+.memory-card:focus:not(:focus-visible),
+.step-header:focus:not(:focus-visible),
+#send-btn:focus:not(:focus-visible) {
+    outline: none;
+}
+
+/* ── Lazy view loading indicator ─────────────────────────────
+   Used by core/router.js for lazy-loaded views during dynamic import.
+   ──────────────────────────────────────────────────────────── */
+
+.view-loading {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: var(--space-8);
+    color: var(--text-muted);
+    font-size: var(--text-md);
+}
+
+.view-loading.view-error {
+    color: var(--red);
+}
+
+/* ── Confirmation Dialog ────────────────────────────────────── */
+
+.confirm-overlay {
+    position: fixed;
+    inset: 0;
+    background: var(--overlay-bg);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: var(--z-modal);
+}
+
+.confirm-dialog {
+    background: var(--bg-card);
+    border: 1px solid var(--border-card);
+    border-radius: var(--radius-xl);
+    box-shadow: var(--shadow-lg);
+    max-width: 24rem;
+    width: calc(100% - 2rem);
+    padding: var(--space-6);
+}
+
+.confirm-message {
+    font-size: var(--text-md);
+    color: var(--text-primary);
+    margin: 0 0 var(--space-5) 0;
+    line-height: 1.5;
+}
+
+.confirm-actions {
+    display: flex;
+    gap: var(--space-3);
+    justify-content: flex-end;
+}
+
+.confirm-btn {
+    padding: var(--space-2) var(--space-4);
+    border: none;
+    border-radius: var(--radius-lg);
+    font-family: inherit;
+    font-size: var(--text-base);
+    font-weight: 600;
+    cursor: pointer;
+    transition: opacity var(--duration-normal);
+}
+
+.confirm-btn:hover {
+    opacity: 0.85;
+}
+
+.confirm-btn:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+}
+
+.confirm-btn:focus:not(:focus-visible) {
+    outline: none;
+}
+
+.confirm-btn-cancel {
+    background: var(--bg-tertiary);
+    color: var(--text-secondary);
+}
+
+.confirm-btn-cancel:hover {
+    background: var(--bg-secondary);
+}
+
+.confirm-btn-confirm {
+    background: var(--accent);
+    color: #fff;
+}
+
+.confirm-btn-danger {
+    background: var(--red);
+    color: #fff;
+}
+
+/* ── Precise mode — operator data hidden until opted in ─────── */
+
+.precise-only { display: none; }
+
+body.precise .precise-only { display: revert; }

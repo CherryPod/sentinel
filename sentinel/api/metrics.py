@@ -9,23 +9,45 @@ Cutoff timestamps are ISO 8601 strings. PG stores cast with ::timestamptz.
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+import logging
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
-_EMPTY_ROUTINE_HEALTH = {"total": 0, "success": 0, "error": 0, "timeout": 0, "avg_duration_s": 0.0}
+logger = logging.getLogger(__name__)
+
+
+_EMPTY_ROUTINE_HEALTH = {
+    "total": 0,
+    "success": 0,
+    "error": 0,
+    "timeout": 0,
+    "avg_duration_s": 0.0,
+}
 
 _EMPTY_METRICS = {
     "approval_funnel": {
-        "auto_approved": 0, "manually_approved": 0,
-        "denied": 0, "expired": 0, "pending": 0,
+        "auto_approved": 0,
+        "manually_approved": 0,
+        "denied": 0,
+        "expired": 0,
+        "pending": 0,
     },
     "task_outcomes": {
-        "success": 0, "blocked": 0, "error": 0,
-        "refused": 0, "denied": 0, "awaiting_approval": 0,
+        "success": 0,
+        "blocked": 0,
+        "error": 0,
+        "refused": 0,
+        "denied": 0,
+        "awaiting_approval": 0,
     },
     "scanner_blocks": [],
     "routine_health": _EMPTY_ROUTINE_HEALTH,
-    "session_health": {"active": 0, "locked": 0, "avg_risk": 0.0, "total_violations": 0},
+    "session_health": {
+        "active": 0,
+        "locked": 0,
+        "avg_risk": 0.0,
+        "total_violations": 0,
+    },
     "response_times": {"avg_s": 0.0, "p50_s": 0.0, "p95_s": 0.0, "count": 0},
 }
 
@@ -47,6 +69,15 @@ async def get_metrics(
 
     When session_store is None (no backend), returns zeroed metrics.
     """
+    logger.debug(
+        "get_metrics called",
+        extra={
+            "event": "metrics.get_metrics",
+            "session_store_type": type(session_store).__name__,
+            "approval_manager_type": type(approval_manager).__name__,
+            "routine_engine_type": type(routine_engine).__name__,
+        },
+    )
     if session_store is None:
         return dict(_EMPTY_METRICS)
 
@@ -57,7 +88,9 @@ async def get_metrics(
     task_outcomes = await _task_outcomes(session_store, cutoff)
     scanner_blocks = await session_store.get_blocked_by_counts(cutoff)
     routine_health = (
-        await routine_engine.get_execution_stats(cutoff) if routine_engine else _EMPTY_ROUTINE_HEALTH
+        await routine_engine.get_execution_stats(cutoff)
+        if routine_engine
+        else _EMPTY_ROUTINE_HEALTH
     )
     session_health = await session_store.get_session_health()
     response_times = await session_store.get_response_time_stats(cutoff)
@@ -76,7 +109,7 @@ def _cutoff_iso(delta: timedelta | None) -> str | None:
     """Return an ISO 8601 timestamp for the cutoff, or None for 'all'."""
     if delta is None:
         return None
-    return (datetime.now(timezone.utc) - delta).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    return (datetime.now(UTC) - delta).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
 async def _approval_funnel(

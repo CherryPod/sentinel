@@ -29,6 +29,9 @@ use sandbox::SandboxEngine;
 /// How long to wait for in-flight connections to finish before force-stopping.
 const DRAIN_TIMEOUT_SECS: u64 = 10;
 
+/// POSIX SIGKILL signal number for process group termination.
+const SIGKILL: i32 = 9;
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let socket_path = std::env::var("SENTINEL_SIDECAR_SOCKET")
@@ -76,6 +79,14 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let listener = UnixListener::bind(&socket_path)?;
+
+    // Restrict socket to owner-only (defence-in-depth inside container)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))?;
+    }
+
     eprintln!("sidecar: listening on {}", socket_path.display());
 
     // Shutdown signal handler — listens for both SIGINT and SIGTERM (SHUT-1)
@@ -161,12 +172,15 @@ async fn main() -> anyhow::Result<()> {
             );
             #[cfg(unix)]
             for &pid in children.iter() {
-                // Kill the process group (same pattern as shell_exec timeout)
+                // SAFETY: PIDs come from child.id() of processes we spawned with
+                // process_group(0). Linux PIDs are capped at ~4M (pid_max), well
+                // within i32 range. kill(-pid, SIGKILL) sends to process groups
+                // to ensure child trees are cleaned up on shutdown.
                 unsafe {
                     extern "C" {
                         fn kill(pid: i32, sig: i32) -> i32;
                     }
-                    let result = kill(-(pid as i32), 9); // SIGKILL process group
+                    let result = kill(-(pid as i32), SIGKILL); // process group
                     if result != 0 {
                         eprintln!(
                             "sidecar: failed to kill child pgid {pid} (may have already exited)"

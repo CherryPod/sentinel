@@ -12,15 +12,15 @@ Endpoints:
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
-from typing import Any
+from dataclasses import dataclass
+from typing import Annotated, Any
 
 from fastapi import APIRouter, FastAPI, HTTPException, Query, Request
 
+from sentinel.api.role_guard import require_role
 from sentinel.core.config import settings
-from sentinel.core.context import current_user_id
 
-logger = logging.getLogger("sentinel.api")
+logger = logging.getLogger(__name__)
 
 # ── Router ──────────────────────────────────────────────────────────
 # No prefix — health routes serve at /health (root) and /api/health,
@@ -34,6 +34,7 @@ api_router = APIRouter()
 # Bundles the component references that _gather_component_status() needs,
 # replacing the 10+ separate module globals it used to read from app.py.
 
+
 @dataclass
 class HealthState:
     """Snapshot of component availability for health endpoints."""
@@ -44,8 +45,7 @@ class HealthState:
     planner_available: bool = False
     sidecar: Any = None
     sandbox: Any = None
-    signal_channel: Any = None
-    telegram_channel: Any = None
+    channel_registry: Any = None
     engine: Any = None
     pin_verifier: Any = None
 
@@ -60,6 +60,7 @@ _orchestrator: Any = None
 _routine_engine: Any = None
 _get_metrics_fn: Any = None
 _contact_store: Any = None
+_audit_emitter: Any = None
 
 
 def init(
@@ -70,18 +71,29 @@ def init(
     routine_engine: Any = None,
     get_metrics_fn: Any = None,
     contact_store: Any = None,
+    audit_emitter: Any = None,
 ) -> None:
     """Inject dependencies — called once from app.py lifespan."""
-    global _health_state, _session_store, _orchestrator, _routine_engine, _get_metrics_fn, _contact_store
+    logger.debug("init called", extra={"event": "health.init"})
+    global \
+        _health_state, \
+        _session_store, \
+        _orchestrator, \
+        _routine_engine, \
+        _get_metrics_fn, \
+        _contact_store, \
+        _audit_emitter
     _health_state = health_state
     _session_store = session_store
     _orchestrator = orchestrator
     _routine_engine = routine_engine
     _get_metrics_fn = get_metrics_fn
     _contact_store = contact_store
+    _audit_emitter = audit_emitter
 
 
 # ── Accessors ──────────────────────────────────────────────────────
+
 
 def _get_health_state() -> HealthState:
     if _health_state is None:
@@ -107,7 +119,18 @@ def _get_metrics_callable():
     return _get_metrics_fn
 
 
+def _get_contact_store():
+    if _contact_store is None:
+        logger.warning(
+            "dashboard_metrics: role store unavailable — request blocked",
+            extra={"event": "health.contact_store_unavailable"},
+        )
+        raise HTTPException(status_code=503, detail="Auth service not available")
+    return _contact_store
+
+
 # ── Helpers ────────────────────────────────────────────────────────
+
 
 def gather_component_status(state: HealthState | None = None) -> dict:
     """Build component status dict shared by /health, /api/health, and heartbeat.
@@ -115,6 +138,13 @@ def gather_component_status(state: HealthState | None = None) -> dict:
     Accepts an explicit HealthState, or falls back to the module-level one.
     Public because the heartbeat system calls this too.
     """
+    logger.debug(
+        "gather_component_status called",
+        extra={
+            "event": "health.gather_component_status",
+            "has_state": state is not None,
+        },
+    )
     hs = state if state is not None else _health_state
     if hs is None:
         # Pre-init: return safe defaults (all disabled/False)
@@ -126,6 +156,7 @@ def gather_component_status(state: HealthState | None = None) -> dict:
             "sidecar": "disabled",
             "signal": "disabled",
             "telegram": "disabled",
+            "matrix": "disabled",
             "sandbox": "disabled",
         }
 
@@ -133,17 +164,16 @@ def gather_component_status(state: HealthState | None = None) -> dict:
     if hs.sidecar is not None:
         sidecar_status = "running" if hs.sidecar.is_running else "stopped"
 
-    signal_status = "disabled"
-    if hs.signal_channel is not None:
-        signal_status = "running" if hs.signal_channel._running else "stopped"
-
     sandbox_status = "disabled"
     if hs.sandbox is not None:
         sandbox_status = "enabled"
 
-    telegram_status = "disabled"
-    if hs.telegram_channel is not None:
-        telegram_status = "running" if hs.telegram_channel._running else "stopped"
+    # Channel status from registry — replaces per-channel checks
+    channel_status: dict[str, str] = {}
+    if hs.channel_registry is not None:
+        for channel in hs.channel_registry.with_health_check():
+            name = channel.descriptor.name
+            channel_status[name] = "running" if channel.is_running else "stopped"
 
     return {
         "planner_available": hs.planner_available,
@@ -151,8 +181,10 @@ def gather_component_status(state: HealthState | None = None) -> dict:
         "prompt_guard_loaded": hs.prompt_guard_loaded,
         "ollama_reachable": hs.ollama_reachable,
         "sidecar": sidecar_status,
-        "signal": signal_status,
-        "telegram": telegram_status,
+        # Channel statuses — dynamic from registry
+        "signal": channel_status.get("signal", "disabled"),
+        "telegram": channel_status.get("telegram", "disabled"),
+        "matrix": channel_status.get("matrix", "disabled"),
         "sandbox": sandbox_status,
     }
 
@@ -166,15 +198,25 @@ async def check_pg_ready(app_instance: FastAPI) -> bool | None:
         async with pool.acquire() as conn:
             await conn.fetchval("SELECT 1")
         return True
-    except Exception:
+    except Exception:  # catch-all: DB health check (connection, query errors)
+        logger.debug(
+            "check_pg_ready: Exception",
+            extra={"event": "health.check_pg_ready_error"},
+            exc_info=True,
+        )
         return False
 
 
 # ── Root health endpoint (container probes, always outside /api/) ──
 
+
 @root_router.get("/health")
 async def health(request: Request):
     """Container probe — minimal response, no config details."""
+    logger.debug(
+        "health called",
+        extra={"event": "health.health", "request_type": type(request).__name__},
+    )
     hs = _health_state
     # BOOT-1: Flag degraded when both security scanners are offline
     pg_loaded = hs.prompt_guard_loaded if hs else False
@@ -189,25 +231,30 @@ async def health(request: Request):
 
 # ── Client-facing health check at /api/health ─────────────────────
 
+
 @api_router.get("/health")
 async def api_health(request: Request):
     """Client-facing health check at /api/health."""
+    logger.debug(
+        "api_health called",
+        extra={"event": "health.api_health", "request_type": type(request).__name__},
+    )
     hs = _health_state
     status = gather_component_status(hs)
 
     # Email status — config-level (no persistent runtime service)
     # Omit backend technology details (IMAP/Gmail/CalDAV) from response
-    if settings.email_backend == "imap" and settings.imap_host:
-        email_status = "enabled"
-    elif settings.gmail_enabled:
+    if (
+        settings.email_backend == "imap" and settings.imap_host
+    ) or settings.gmail_enabled:
         email_status = "enabled"
     else:
         email_status = "disabled"
 
     # Calendar status — config-level
-    if settings.calendar_backend == "caldav" and settings.caldav_url:
-        calendar_status = "enabled"
-    elif settings.calendar_enabled:
+    if (
+        settings.calendar_backend == "caldav" and settings.caldav_url
+    ) or settings.calendar_enabled:
         calendar_status = "enabled"
     else:
         calendar_status = "disabled"
@@ -236,17 +283,18 @@ async def api_health(request: Request):
 
 # ── Dashboard metrics ──────────────────────────────────────────────
 
+
 @api_router.get("/metrics")
 async def dashboard_metrics(
-    window: str = Query("24h", pattern=r"^(24h|7d|30d|all)$"),
+    window: Annotated[str, Query(pattern=r"^(24h|7d|30d|all)$")] = "24h",
 ):
     """Dashboard metrics aggregated over a time window (admin only)."""
     # Role check — metrics are sensitive operational data
-    uid = current_user_id.get()
-    if _contact_store is not None and uid:
-        role = await _contact_store.get_user_role(uid)
-        if role != "admin":
-            raise HTTPException(status_code=403, detail="Admin access required")
+    logger.debug(
+        "dashboard_metrics called",
+        extra={"event": "health.dashboard_metrics", "window": window},
+    )
+    await require_role("admin", _get_contact_store(), audit_emitter=_audit_emitter)
 
     if _session_store is None or _orchestrator is None:
         raise HTTPException(status_code=503, detail="Database not available")

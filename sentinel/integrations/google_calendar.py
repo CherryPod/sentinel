@@ -15,22 +15,31 @@ from urllib.parse import quote
 
 import httpx
 
-logger = logging.getLogger("sentinel.audit")
+logger = logging.getLogger(__name__)
 
 _CALENDAR_BASE = "https://www.googleapis.com/calendar/v3"
 
+# HTTP status codes — named constants for clarity
+_HTTP_BAD_REQUEST = 400
+_HTTP_UNAUTHORIZED = 401
+_HTTP_RATE_LIMITED = 429
+_HTTP_SERVER_ERROR = 500
 
-class CalendarError(Exception):
-    """Error from Google Calendar API operations."""
+# Maximum length for description preview text in formatted output
+_DESC_PREVIEW_MAX_LEN = 200
 
+# Moved to sentinel.core.exceptions (SH-3) — re-exported here.
+from sentinel.core.exceptions import CalendarError
 
 # ---------------------------------------------------------------------------
 # Data classes
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class CalendarEvent:
     """A single calendar event."""
+
     event_id: str
     summary: str
     start: str
@@ -44,6 +53,7 @@ class CalendarEvent:
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
 
 async def _calendar_request(
     method: str,
@@ -60,6 +70,7 @@ async def _calendar_request(
     """
     headers = {"Authorization": f"Bearer {token}"}
 
+    last_exc: Exception | None = None
     for attempt in range(2):
         try:
             async with httpx.AsyncClient(timeout=timeout) as client:
@@ -69,43 +80,61 @@ async def _calendar_request(
                     json=json_body,
                 )
         except httpx.TimeoutException as exc:
+            last_exc = exc
             if attempt < 1:
-                logger.warning("Calendar API timeout, retrying", extra={"event": "gcal_retry"})
+                logger.warning(
+                    "Calendar API timeout, retrying",
+                    extra={"event": "gcal.retry"},
+                    exc_info=True,
+                )
                 await asyncio.sleep(2)
                 continue
             raise CalendarError(f"Calendar API request timed out: {exc}") from exc
         except httpx.ConnectError as exc:
+            last_exc = exc
             if attempt < 1:
-                logger.warning("Calendar API connect error, retrying", extra={"event": "gcal_retry"})
+                logger.warning(
+                    "Calendar API connect error, retrying",
+                    extra={"event": "gcal.retry"},
+                    exc_info=True,
+                )
                 await asyncio.sleep(2)
                 continue
             raise CalendarError(f"Cannot connect to Calendar API: {exc}") from exc
 
-        if resp.status_code == 429:
+        if resp.status_code == _HTTP_RATE_LIMITED:
             raise CalendarError("Calendar API rate limited")
-        if resp.status_code == 401:
+        if resp.status_code == _HTTP_UNAUTHORIZED:
             raise CalendarError("Calendar API auth failed — token may be expired")
-        if resp.status_code >= 500:
+        if resp.status_code >= _HTTP_SERVER_ERROR:
             if attempt < 1:
                 logger.warning(
                     "Calendar API server error, retrying",
-                    extra={"event": "gcal_retry", "status": resp.status_code},
+                    extra={"event": "gcal.retry", "status": resp.status_code},
+                    exc_info=True,
                 )
                 await asyncio.sleep(2)
                 continue
             raise CalendarError(f"Calendar API error {resp.status_code}")
         # Allow 204 (delete success) through
-        if resp.status_code >= 400:
+        if resp.status_code >= _HTTP_BAD_REQUEST:
             raise CalendarError(f"Calendar API client error {resp.status_code}")
 
         return resp
 
-    raise CalendarError("Calendar API request failed after retry")
+    raise CalendarError("Calendar API request failed after retry") from last_exc
 
 
 def _parse_event(data: dict) -> CalendarEvent:
     """Parse a Calendar API event response into a CalendarEvent."""
     # Start/end can be dateTime (timed) or date (all-day)
+    logger.debug(
+        "_parse_event called",
+        extra={
+            "event": "google_calendar._parse_event",
+            "data_len": len(data) if hasattr(data, "__len__") else 0,
+        },
+    )  # auto:entry
     start_obj = data.get("start", {})
     end_obj = data.get("end", {})
     start = start_obj.get("dateTime") or start_obj.get("date", "")
@@ -127,6 +156,7 @@ def _parse_event(data: dict) -> CalendarEvent:
 # Public API
 # ---------------------------------------------------------------------------
 
+
 async def list_events(
     token: str,
     calendar_id: str = "primary",
@@ -138,9 +168,17 @@ async def list_events(
     """List events from a calendar, ordered by start time."""
     # N-003: URL-encode parameters to prevent injection via special characters
     # in calendar_id or RFC3339 timestamps (which contain : and +).
+    logger.debug(
+        "list_events called",
+        extra={
+            "event": "google_calendar.list_events",
+            "calendar_id": calendar_id,
+            "time_min": time_min,
+        },
+    )
     params = [
-        f"singleEvents=true",
-        f"orderBy=startTime",
+        "singleEvents=true",
+        "orderBy=startTime",
         f"maxResults={max_results}",
     ]
     if time_min:
@@ -152,10 +190,7 @@ async def list_events(
     resp = await _calendar_request("get", url, token, timeout)
     data = resp.json()
 
-    events = []
-    for item in data.get("items", []):
-        events.append(_parse_event(item))
-    return events
+    return [_parse_event(item) for item in data.get("items", [])]
 
 
 async def create_event(
@@ -169,6 +204,14 @@ async def create_event(
     timeout: int = 15,
 ) -> CalendarEvent:
     """Create a new calendar event. Returns the created event."""
+    logger.debug(
+        "create_event called",
+        extra={
+            "event": "google_calendar.create_event",
+            "calendar_id": calendar_id,
+            "summary": summary,
+        },
+    )
     body: dict = {
         "summary": summary,
         "start": {"dateTime": start},
@@ -192,6 +235,14 @@ async def update_event(
     **fields,
 ) -> CalendarEvent:
     """Update an existing event (PATCH — partial update). Returns updated event."""
+    logger.debug(
+        "update_event called",
+        extra={
+            "event": "google_calendar.update_event",
+            "event_id": event_id,
+            "calendar_id": calendar_id,
+        },
+    )
     body: dict = {}
     if "summary" in fields:
         body["summary"] = fields["summary"]
@@ -224,6 +275,7 @@ async def delete_event(
 # Formatters — produce LLM-friendly text
 # ---------------------------------------------------------------------------
 
+
 def format_events(events: list[CalendarEvent]) -> str:
     """Format events as numbered text for LLM consumption."""
     if not events:
@@ -236,8 +288,8 @@ def format_events(events: list[CalendarEvent]) -> str:
         if e.location:
             lines.append(f"   Where: {e.location}")
         if e.description:
-            desc_preview = e.description[:200]
-            if len(e.description) > 200:
+            desc_preview = e.description[:_DESC_PREVIEW_MAX_LEN]
+            if len(e.description) > _DESC_PREVIEW_MAX_LEN:
                 desc_preview += "..."
             lines.append(f"   Details: {desc_preview}")
         lines.append(f"   ID: {e.event_id}")

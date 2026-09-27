@@ -4,8 +4,11 @@ Used by the Semgrep scanner to scan only actual code blocks
 rather than mixed prose+code, which Semgrep can't parse reliably.
 """
 
+import logging
 import re
 from dataclasses import dataclass
+
+logger = logging.getLogger(__name__)
 
 # Fenced code block: ``` with optional language tag, content, closing ```
 _FENCED_BLOCK_RE = re.compile(
@@ -34,10 +37,16 @@ _LANGUAGE_MAP: dict[str, str] = {
 }
 
 # Heuristics for language detection when no tag is provided
-_PYTHON_HINTS = re.compile(r"^\s*(?:import |from \w+ import |def |class )", re.MULTILINE)
-_JS_HINTS = re.compile(r"^\s*(?:const |let |var |function |=>|require\(|import \{)", re.MULTILINE)
+_PYTHON_HINTS = re.compile(
+    r"^\s*(?:import |from \w+ import |def |class )", re.MULTILINE
+)
+_JS_HINTS = re.compile(
+    r"^\s*(?:const |let |var |function |=>|require\(|import \{)", re.MULTILINE
+)
 _RUST_HINTS = re.compile(r"^\s*(?:fn |let mut |pub fn |use \w+::|impl )", re.MULTILINE)
-_JAVA_HINTS = re.compile(r"^\s*(?:public class |private |protected |System\.)", re.MULTILINE)
+_JAVA_HINTS = re.compile(
+    r"^\s*(?:public class |private |protected |System\.)", re.MULTILINE
+)
 _C_HINTS = re.compile(r"^\s*#include\s+[<\"]", re.MULTILINE)
 _PHP_HINTS = re.compile(r"<\?php|\$\w+\s*=", re.MULTILINE)
 
@@ -52,31 +61,60 @@ class CodeBlock:
 
 def _detect_language(code: str) -> str | None:
     """Attempt to detect the programming language from code content."""
+    detected: str | None = None
     if _PYTHON_HINTS.search(code):
-        return "python"
+        detected = "python"
     # Check Rust before JS — "let mut" is more specific than "let "
-    if _RUST_HINTS.search(code):
-        return "rust"
-    if _JS_HINTS.search(code):
-        return "javascript"
-    if _JAVA_HINTS.search(code):
-        return "java"
-    if _C_HINTS.search(code):
-        return "c"
-    if _PHP_HINTS.search(code):
-        return "php"
-    return None
+    elif _RUST_HINTS.search(code):
+        logger.debug(
+            "_detect_language: clean",
+            extra={"event": "code_extractor._detect_language.branch.clean"},
+        )
+        detected = "rust"
+    elif _JS_HINTS.search(code):
+        logger.debug(
+            "_detect_language: clean",
+            extra={"event": "code_extractor._detect_language.branch.clean"},
+        )
+        detected = "javascript"
+    elif _JAVA_HINTS.search(code):
+        logger.debug(
+            "_detect_language: clean",
+            extra={"event": "code_extractor._detect_language.branch.clean"},
+        )
+        detected = "java"
+    elif _C_HINTS.search(code):
+        logger.debug(
+            "_detect_language: clean",
+            extra={"event": "code_extractor._detect_language.branch.clean"},
+        )
+        detected = "c"
+    elif _PHP_HINTS.search(code):
+        logger.debug(
+            "_detect_language: clean",
+            extra={"event": "code_extractor._detect_language.branch.clean"},
+        )
+        detected = "php"
+    logger.debug(
+        "Language detection result",
+        extra={
+            "event": "code_extractor.detect_language_result",
+            "detected": detected,
+            "code_len": len(code) if code else 0,
+        },
+    )
+    return detected
 
 
 # Emoji and symbol Unicode ranges that cause syntax errors in code.
 # Covers emoticons, dingbats, pictographs, transport symbols, etc.
 _EMOJI_RE = re.compile(
     "["
-    "\u2600-\u27BF"          # Misc Symbols + Dingbats (✅, ✓, ☀, etc.)
-    "\uFE00-\uFE0F"          # Variation Selectors
-    "\u200D"                  # Zero Width Joiner (composite emoji)
-    "\u20E3"                  # Combining Enclosing Keycap
-    "\U0001F000-\U0001FAFF"  # Supplemental symbol planes (all emoji)
+    "\u2600-\u27bf"  # Misc Symbols + Dingbats (✅, ✓, ☀, etc.)
+    "\ufe00-\ufe0f"  # Variation Selectors
+    "\u200d"  # Zero Width Joiner (composite emoji)
+    "\u20e3"  # Combining Enclosing Keycap
+    "\U0001f000-\U0001faff"  # Supplemental symbol planes (all emoji)
     "]+",
 )
 
@@ -87,7 +125,15 @@ def strip_emoji_from_code_blocks(text: str) -> str:
     Only modifies content inside ``` fences — prose, headings, and other
     text outside code blocks is left untouched.
     """
-    def _clean_block(match: re.Match) -> str:
+
+    def _clean_block(match: re.Match) -> str:  # audit_fix:skip (per-iteration callback)
+        logger.debug(
+            "_clean_block called",
+            extra={
+                "event": "code_extractor._clean_block",
+                "match_type": type(match).__name__,
+            },
+        )  # auto:entry
         lang_tag = match.group(1) or ""
         code = match.group(2)
         cleaned = _EMOJI_RE.sub("", code)

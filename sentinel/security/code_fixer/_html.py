@@ -11,6 +11,7 @@ Finding fixes applied:
   #53: recursion depth cap documented
   #56: recursive calls merge errors_found and warnings (not just fixes_applied)
 """
+
 import logging
 import re
 
@@ -18,14 +19,27 @@ from ._core import FixResult, _current_filename
 
 logger = logging.getLogger(__name__)
 
-
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-_HTML_VOID_ELEMENTS = frozenset({
-    "area", "base", "br", "col", "embed", "hr", "img", "input",
-    "link", "meta", "param", "source", "track", "wbr",
-})
+_HTML_VOID_ELEMENTS = frozenset(
+    {
+        "area",
+        "base",
+        "br",
+        "col",
+        "embed",
+        "hr",
+        "img",
+        "input",
+        "link",
+        "meta",
+        "param",
+        "source",
+        "track",
+        "wbr",
+    }
+)
 
 # Finding #53: recursion depth cap — prevents infinite loops on pathological
 # input where misnested tag repair keeps producing new mismatches.
@@ -42,14 +56,13 @@ _SKIP_ENTITY_TAGS = frozenset({"script", "style", "pre", "code", "textarea"})
 def _fix_doctype(content: str, result: FixResult) -> str:
     """Add <!DOCTYPE html> if <html> tag is present but no doctype."""
     stripped = content.lstrip()
-    if ("<html" in stripped.lower()
-            and not stripped.lower().startswith("<!doctype")):
+    if "<html" in stripped.lower() and not stripped.lower().startswith("<!doctype"):
         content = "<!DOCTYPE html>\n" + content
         result.fixes_applied.append("Added <!DOCTYPE html>")
         logger.debug(
             "Added missing DOCTYPE",
             extra={
-                "event": "html_doctype_added",
+                "event": "html.doctype_added",
                 "file": _current_filename.get(),
             },
         )
@@ -59,9 +72,7 @@ def _fix_doctype(content: str, result: FixResult) -> str:
 # ---------------------------------------------------------------------------
 # Helper: Tag balancing (stack-based)
 # ---------------------------------------------------------------------------
-def _balance_tags(
-    content: str, result: FixResult, _depth: int = 0
-) -> tuple[str, bool]:
+def _balance_tags(content: str, result: FixResult, _depth: int = 0) -> tuple[str, bool]:
     """Track and fix unclosed/misnested tags.
 
     Returns (content, needs_rerun) — if misnested tags were fixed by
@@ -74,6 +85,16 @@ def _balance_tags(
     - Misnested tags trigger insertion of closing tags at the correct position
     - Unclosed tags at EOF get closing tags appended
     """
+    logger.debug(
+        "Balancing HTML tags (depth=%d)",
+        _depth,
+        extra={
+            "event": "html.balance_tags",
+            "content_length": len(content),
+            "depth": _depth,
+        },
+    )
+
     # WONTFIX (audit #21): This regex terminates at the first > character,
     # so attributes containing > (e.g. data-value="a>b") will truncate the
     # tag match. This is a fundamental limitation of regex-based HTML parsing.
@@ -103,9 +124,7 @@ def _balance_tags(
                 if unclosed:
                     insert_pos = m.start()
                     closing_str = "".join(f"</{t}>" for t in unclosed)
-                    content = (
-                        content[:insert_pos] + closing_str + content[insert_pos:]
-                    )
+                    content = content[:insert_pos] + closing_str + content[insert_pos:]
                     result.fixes_applied.append(
                         f"Auto-closed {len(unclosed)} misnested tag(s): "
                         f"{', '.join(unclosed)}"
@@ -114,7 +133,7 @@ def _balance_tags(
                         "Auto-closed %d misnested tags",
                         len(unclosed),
                         extra={
-                            "event": "html_misnested_fixed",
+                            "event": "html.misnested_fixed",
                             "file": _current_filename.get(),
                             "tags": unclosed,
                         },
@@ -130,14 +149,13 @@ def _balance_tags(
         closing_tags = "".join(f"</{tag}>" for tag in reversed(tag_names))
         content = content.rstrip("\n") + "\n" + closing_tags + "\n"
         result.fixes_applied.append(
-            f"Closed {len(stack)} unclosed tag(s): "
-            f"{', '.join(reversed(tag_names))}"
+            f"Closed {len(stack)} unclosed tag(s): {', '.join(reversed(tag_names))}"
         )
         logger.debug(
             "Closed %d unclosed tags at EOF",
             len(stack),
             extra={
-                "event": "html_unclosed_tags_fixed",
+                "event": "html.unclosed_tags_fixed",
                 "file": _current_filename.get(),
                 "tags": tag_names,
             },
@@ -158,10 +176,25 @@ def _normalise_attributes(content: str, result: FixResult) -> str:
     between single and double in complex patterns.  This is acceptable for
     LLM output which rarely produces such edge cases.
     """
+    logger.debug(
+        "Normalising HTML attributes",
+        extra={
+            "event": "html.normalise_attrs",
+            "content_length": len(content),
+        },
+    )
+
     # Skip template files (Jinja2, Django, ERB) — template syntax looks like
     # unquoted attributes and would be corrupted by quoting
     has_templates = "{{" in content or "{%" in content or "<%" in content
     if has_templates:
+        logger.debug(
+            "_normalise_attributes: has_templates",
+            extra={
+                "event": "_html._normalise_attributes.match",
+                "reason": "has_templates",
+            },
+        )  # auto:neg
         return content
 
     pre_attr = content
@@ -183,10 +216,17 @@ def _normalise_attributes(content: str, result: FixResult) -> str:
         Finding #22: the alternating-segment split is a known constraint
         documented above.
         """
+        logger.debug(
+            "_fix_tag_attrs called",
+            extra={
+                "event": "html.fix_tag_attrs",
+                "tag_len": len(tag_match.group(0)),
+            },
+        )
         tag_content = tag_match.group(0)
         # Split into segments: quoted strings vs everything else
         # This preserves content="width=device-width" as-is
-        segments = re.split(r'''("[^"]*"|'[^']*')''', tag_content)
+        segments = re.split(r"""("[^"]*"|'[^']*')""", tag_content)
         result_parts = []
         for i, seg in enumerate(segments):
             if i % 2 == 1:
@@ -203,7 +243,7 @@ def _normalise_attributes(content: str, result: FixResult) -> str:
                 )
         return "".join(result_parts)
 
-    content = re.sub(r'<[a-zA-Z][^>]*>', _fix_tag_attrs, content)
+    content = re.sub(r"<[a-zA-Z][^>]*>", _fix_tag_attrs, content)
 
     def _fix_tag_mixed_quotes(tag_match: re.Match) -> str:
         """Fix mismatched quote pairs (opening single, closing double
@@ -211,22 +251,18 @@ def _normalise_attributes(content: str, result: FixResult) -> str:
         tag_content = tag_match.group(0)
         return re.sub(
             r"""(\w+)='([^']*?)"|(\w+)="([^"]*?)'""",
-            lambda m: (
-                f'{m.group(1) or m.group(3)}="{m.group(2) or m.group(4)}"'
-            ),
+            lambda m: f'{m.group(1) or m.group(3)}="{m.group(2) or m.group(4)}"',
             tag_content,
         )
 
-    content = re.sub(r'<[a-zA-Z][^>]*>', _fix_tag_mixed_quotes, content)
+    content = re.sub(r"<[a-zA-Z][^>]*>", _fix_tag_mixed_quotes, content)
 
     if content != pre_attr:
-        result.fixes_applied.append(
-            "Normalised attribute quotes to double-quoted"
-        )
+        result.fixes_applied.append("Normalised attribute quotes to double-quoted")
         logger.debug(
             "Normalised HTML attribute quotes",
             extra={
-                "event": "html_attributes_normalised",
+                "event": "html.attributes_normalised",
                 "file": _current_filename.get(),
             },
         )
@@ -247,6 +283,14 @@ def _encode_entities(content: str, result: FixResult) -> str:
     f"<script" in line_lower, which could false-positive on attribute
     values like data-script="...".
     """
+    logger.debug(
+        "Encoding HTML entities",
+        extra={
+            "event": "html.encode_entities",
+            "content_length": len(content),
+        },
+    )
+
     in_skip_tag = None
     entity_lines = content.split("\n")
     entity_fixed = False
@@ -255,13 +299,12 @@ def _encode_entities(content: str, result: FixResult) -> str:
         line_lower = line.lower()
         for tag in _SKIP_ENTITY_TAGS:
             # Check close before open — handles same-line open+close correctly
-            if f"</{tag}" in line_lower:
+            if f"</{tag}" in line_lower and in_skip_tag == tag:
                 in_skip_tag = None
             # Finding #11: use regex with tag boundary check instead of
             # bare substring match, to avoid matching things like
             # data-script-name="..." or <scriptalert>
-            if (re.search(rf'<{tag}[\s>]', line_lower)
-                    and f"</{tag}" not in line_lower):
+            if re.search(rf"<{tag}[\s>]", line_lower) and f"</{tag}" not in line_lower:
                 # Only enter skip mode if the tag opens but doesn't close
                 # on this line
                 in_skip_tag = tag
@@ -271,7 +314,7 @@ def _encode_entities(content: str, result: FixResult) -> str:
 
         # Split line into tag and non-tag segments, only fix non-tag segments
         # Use [a-zA-Z/] after < to only match real HTML tags, not bare < in text
-        parts = re.split(r'(<[a-zA-Z/][^>]*>)', line)
+        parts = re.split(r"(<[a-zA-Z/][^>]*>)", line)
         line_changed = False
         # Track skip-tag state within a single line (handles inline
         # <script>...</script>)
@@ -281,7 +324,7 @@ def _encode_entities(content: str, result: FixResult) -> str:
                 part_lower = part.lower()
                 for tag in _SKIP_ENTITY_TAGS:
                     # Finding #11: tag boundary check for inline skip tracking
-                    if re.match(rf'<{tag}[\s>]', part_lower):
+                    if re.match(rf"<{tag}[\s>]", part_lower):
                         inline_skip = True
                     elif part_lower == f"</{tag}>":
                         inline_skip = False
@@ -291,12 +334,12 @@ def _encode_entities(content: str, result: FixResult) -> str:
             original_part = part
             # Encode bare ampersands (not already part of an entity reference)
             part = re.sub(
-                r'&(?!(?:amp|lt|gt|quot|apos|#\d+|#x[\da-fA-F]+);)',
-                '&amp;',
+                r"&(?!(?:amp|lt|gt|quot|apos|#\d+|#x[\da-fA-F]+);)",
+                "&amp;",
                 part,
             )
             # Encode < that isn't a tag start (followed by space, digit, or =)
-            part = re.sub(r'<(?=[\s\d=])', '&lt;', part)
+            part = re.sub(r"<(?=[\s\d=])", "&lt;", part)
             if part != original_part:
                 parts[j] = part
                 line_changed = True
@@ -306,13 +349,11 @@ def _encode_entities(content: str, result: FixResult) -> str:
 
     if entity_fixed:
         content = "\n".join(entity_lines)
-        result.fixes_applied.append(
-            "Encoded bare HTML entities in text content"
-        )
+        result.fixes_applied.append("Encoded bare HTML entities in text content")
         logger.debug(
             "Encoded bare HTML entities",
             extra={
-                "event": "html_entities_encoded",
+                "event": "html.entities_encoded",
                 "file": _current_filename.get(),
             },
         )
@@ -326,9 +367,7 @@ def _encode_entities(content: str, result: FixResult) -> str:
 def _check_accessibility(content: str, result: FixResult) -> None:
     """Non-blocking warnings: missing lang attribute, missing charset."""
     if re.search(r"<html\s*>", content, re.IGNORECASE):
-        result.warnings.append(
-            '<html> missing lang attribute (e.g. <html lang="en">)'
-        )
+        result.warnings.append('<html> missing lang attribute (e.g. <html lang="en">)')
     if "<head" in content.lower() and "charset" not in content.lower():
         result.warnings.append("Missing charset meta tag in <head>")
 
@@ -362,7 +401,7 @@ def fix_html(content: str, _depth: int = 0) -> FixResult:
         "HTML fixer starting (depth=%d)",
         _depth,
         extra={
-            "event": "html_fixer_start",
+            "event": "html.fixer_start",
             "file": _current_filename.get(),
             "content_length": len(content),
             "depth": _depth,

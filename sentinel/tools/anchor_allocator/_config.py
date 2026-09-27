@@ -20,9 +20,14 @@ def parse_yaml_anchors(content: str) -> list[AnchorEntry]:
 
     try:
         import yaml
+
         data = yaml.safe_load(content)
-    except Exception as exc:
-        logger.warning("yaml_anchor_parse_failed", exc_info=exc)
+    except Exception:  # catch-all: YAML parsing on untrusted content
+        logger.warning(
+            "yaml_anchor_parse_failed",
+            extra={"event": "config.yaml_parse_failed"},
+            exc_info=True,
+        )
         return []
 
     if not isinstance(data, dict):
@@ -52,8 +57,12 @@ def parse_json_anchors(content: str) -> list[AnchorEntry]:
 
     try:
         data = json.loads(content)
-    except Exception as exc:
-        logger.warning("json_anchor_parse_failed", exc_info=exc)
+    except Exception:  # catch-all: JSON parsing on untrusted content
+        logger.warning(
+            "json_anchor_parse_failed",
+            extra={"event": "config.json_parse_failed"},
+            exc_info=True,
+        )
         return []
 
     if not isinstance(data, dict):
@@ -81,9 +90,14 @@ def parse_toml_anchors(content: str) -> list[AnchorEntry]:
 
     try:
         import tomllib
+
         data = tomllib.loads(content)
-    except Exception as exc:
-        logger.warning("toml_anchor_parse_failed", exc_info=exc)
+    except Exception:  # catch-all: TOML parsing on untrusted content
+        logger.warning(
+            "toml_anchor_parse_failed",
+            extra={"event": "config.toml_parse_failed"},
+            exc_info=True,
+        )
         return []
 
     if not isinstance(data, dict):

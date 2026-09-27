@@ -9,7 +9,15 @@ execution constraints.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
+
+from sentinel.core.decorators import no_audit_log
+
+logger = logging.getLogger(__name__)
+
+# Maximum characters to show in confirmation preview messages
+_PREVIEW_TRUNCATE_LEN = 200
 
 
 @dataclass(frozen=True)
@@ -26,8 +34,6 @@ class Template:
             (e.g. {"title": "summary"}).
         side_effect: True if the tool mutates state (send, create, delete).
         requires_confirmation: True if user must confirm before execution.
-        source_is_user: True if the content originates from the user (not
-            external data). Affects trust classification.
     """
 
     name: str
@@ -38,18 +44,20 @@ class Template:
     param_aliases: dict[str, str] = field(default_factory=dict)
     side_effect: bool = False
     requires_confirmation: bool = False
-    source_is_user: bool = True
 
     @property
+    @no_audit_log
     def is_chain(self) -> bool:
         """True if this template invokes multiple tools in sequence."""
         return "+" in self.tool
 
     @property
+    @no_audit_log
     def tool_chain(self) -> list[str]:
         """Ordered list of tool names to invoke."""
         return self.tool.split("+")
 
+    @no_audit_log
     def validate_params(self, params: dict) -> bool:
         """Check that all required_params are present in params."""
         return all(p in params for p in self.required_params)
@@ -59,6 +67,13 @@ class Template:
 
         Returns empty string for templates that don't require confirmation.
         """
+        logger.debug(
+            "format_preview called",
+            extra={
+                "event": "templates.format_preview",
+                "params_len": len(params) if hasattr(params, "__len__") else 0,
+            },
+        )
         if not self.requires_confirmation:
             return ""
 
@@ -72,30 +87,34 @@ class Template:
                 preview += f" @ {location}"
             return preview
 
-        if self.name == "signal_send":
-            return self._send_preview("Signal", params)
-
-        if self.name == "telegram_send":
-            return self._send_preview("Telegram", params)
+        # Messaging channel send preview — generic for any *_send template
+        if self.name.endswith("_send") and self.name != "email_send":
+            channel_label = self.name.replace("_send", "").title()
+            return self._send_preview(channel_label, params)
 
         if self.name == "email_send":
             recipient = params.get("recipient", "")
             subject = params.get("subject", "")
             body = params.get("body", "")
-            if len(body) > 200:
-                body = body[:200] + "..."
+            if len(body) > _PREVIEW_TRUNCATE_LEN:
+                body = body[:_PREVIEW_TRUNCATE_LEN] + "..."
             return f"Send email to {recipient} -- Subject: {subject}\n{body}"
 
         # Fallback for unknown side-effect templates
+        logger.debug(
+            "format_preview: fallback for unknown template",
+            extra={"event": "templates.format_preview.fallback", "template": self.name},
+        )
         return f"Execute {self.tool} with params: {params}"
 
     @staticmethod
+    @no_audit_log
     def _send_preview(channel_name: str, params: dict) -> str:
         """Format a send-message preview, truncating long messages."""
         recipient = params.get("recipient", "")
         message = params.get("message", "")
-        if len(message) > 200:
-            message = message[:200] + "..."
+        if len(message) > _PREVIEW_TRUNCATE_LEN:
+            message = message[:_PREVIEW_TRUNCATE_LEN] + "..."
         return f"Send via {channel_name} to {recipient}: {message}"
 
     def resolve_aliases(self, params: dict) -> dict:
@@ -104,6 +123,14 @@ class Template:
         If both an alias and its canonical name are present, the canonical
         value takes precedence and the alias is dropped.
         """
+        logger.debug(
+            "templates.resolve_aliases",
+            extra={
+                "event": "templates.resolve_aliases",
+                "template": self.name,
+                "param_count": len(params),
+            },
+        )
         resolved = {}
         for key, value in params.items():
             canonical = self.param_aliases.get(key)
@@ -126,14 +153,17 @@ class TemplateRegistry:
     def __init__(self) -> None:
         self._templates: dict[str, Template] = {}
 
+    @no_audit_log
     def register(self, template: Template) -> None:
         """Add or replace a template in the registry."""
         self._templates[template.name] = template
 
+    @no_audit_log
     def get(self, name: str) -> Template | None:
         """Look up a template by name. Returns None if not found."""
         return self._templates.get(name)
 
+    @no_audit_log
     def names(self) -> list[str]:
         """Return a list of all registered template names."""
         return list(self._templates.keys())
@@ -144,6 +174,13 @@ class TemplateRegistry:
         Legacy — retained for the Qwen Classifier (sentinel/router/classifier.py)
         which is kept as a fallback. The active keyword classifier does not use this.
         """
+        logger.debug(
+            "templates.build_classifier_prompt",
+            extra={
+                "event": "templates.build_classifier_prompt",
+                "template_count": len(self._templates),
+            },
+        )
         if not self._templates:
             return ""
 
@@ -162,7 +199,7 @@ class TemplateRegistry:
 
     @classmethod
     def default(cls) -> TemplateRegistry:
-        """Return a registry pre-loaded with the 9 active fast-path templates."""
+        """Return a registry pre-loaded with the 12 active fast-path templates."""
         registry = cls()
 
         templates = [
@@ -218,7 +255,6 @@ class TemplateRegistry:
                 param_aliases={"to": "recipient"},
                 side_effect=True,
                 requires_confirmation=True,
-                source_is_user=True,
             ),
             Template(
                 name="signal_send",
@@ -229,7 +265,6 @@ class TemplateRegistry:
                 param_aliases={"to": "recipient"},
                 side_effect=True,
                 requires_confirmation=True,
-                source_is_user=True,
             ),
             Template(
                 name="telegram_send",
@@ -240,7 +275,32 @@ class TemplateRegistry:
                 param_aliases={"to": "recipient", "chat_id": "recipient"},
                 side_effect=True,
                 requires_confirmation=True,
-                source_is_user=True,
+            ),
+            Template(
+                name="matrix_send",
+                description="Send a message via Matrix",
+                tool="matrix_send",
+                required_params=["message"],
+                optional_params=["recipient"],
+                param_aliases={"to": "recipient"},
+                side_effect=True,
+                requires_confirmation=True,
+            ),
+            # weather — get forecast (read-only, no confirmation)
+            Template(
+                name="weather",
+                description="Get weather forecast",
+                tool="weather",
+                required_params=[],
+                optional_params=["location"],
+            ),
+            # crypto_price — get crypto price (read-only, no confirmation)
+            Template(
+                name="crypto_price",
+                description="Get cryptocurrency price",
+                tool="crypto_price",
+                required_params=["coin"],
+                optional_params=["currency"],
             ),
             # memory_search: tool exists in planner safe_tools but is not
             # wired into the ToolExecutor for fast-path use. Commented out

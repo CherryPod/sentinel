@@ -9,6 +9,7 @@ Detects and fixes content placed outside its proper container:
 Runs as a post-chain step in fix_code() — after language-specific fixers
 but before truncation/duplicate detection.
 """
+
 import logging
 import re
 from pathlib import Path
@@ -17,15 +18,14 @@ from ._core import FixResult, _current_filename
 
 logger = logging.getLogger(__name__)
 
-
 # ── File type groupings ─────────────────────────────────────────────────
 
 _HTML_LIKE_EXTS = frozenset({".html", ".htm", ".svg"})
 _CSS_EXTS = frozenset({".css"})
 _JS_EXTS = frozenset({".js", ".ts", ".jsx", ".tsx", ".mjs", ".cjs"})
 
-
 # ── CSS wrapper stripping (.css files) ──────────────────────────────────
+
 
 def _fix_css_wrapper_tags(content: str) -> FixResult:
     """Strip <style>...</style> wrapper from .css file content.
@@ -36,6 +36,15 @@ def _fix_css_wrapper_tags(content: str) -> FixResult:
     result = FixResult(content=content)
     fname = _current_filename.get()
 
+    logger.debug(
+        "Checking CSS file for wrapper tags",
+        extra={
+            "event": "cross_language.css_wrapper_check",
+            "content_length": len(content),
+            "file": fname,
+        },
+    )
+
     stripped = content.strip()
 
     # Check for <style> at start (with optional attributes)
@@ -43,24 +52,29 @@ def _fix_css_wrapper_tags(content: str) -> FixResult:
     if not open_match:
         logger.debug(
             "cross_language: no <style> wrapper in CSS file",
-            extra={"event": "cross_lang_css_no_wrapper", "file": fname},
+            extra={"event": "cross_language.css_no_wrapper", "file": fname},
         )
         return result
+    logger.debug(
+        "_fix_css_wrapper_tags: not_open_match_passed",
+        extra={
+            "event": "cross_language.css_no_wrapper.passed",
+            "reason": "not_open_match_passed",
+        },
+    )  # auto:neg
 
     # Check for </style> at end
     close_match = re.search(r"\n?\s*</style>\s*$", stripped, re.IGNORECASE)
     if not close_match:
         logger.debug(
             "cross_language: <style> open but no close in CSS file",
-            extra={"event": "cross_lang_css_partial_wrapper", "file": fname},
+            extra={"event": "cross_language.css_partial_wrapper", "file": fname},
         )
-        result.warnings.append(
-            "CSS file starts with <style> but has no </style>"
-        )
+        result.warnings.append("CSS file starts with <style> but has no </style>")
         return result
 
     # Strip the wrapper tags, preserve the inner content
-    inner = stripped[open_match.end():close_match.start()]
+    inner = stripped[open_match.end() : close_match.start()]
     result.content = inner.strip() + "\n"
 
     result.changed = result.content != content
@@ -68,13 +82,14 @@ def _fix_css_wrapper_tags(content: str) -> FixResult:
         result.fixes_applied.append("Stripped <style> wrapper from CSS file")
         logger.debug(
             "cross_language: stripped <style> wrapper from CSS file",
-            extra={"event": "cross_lang_css_wrapper_stripped", "file": fname},
+            extra={"event": "cross_language.css_wrapper_stripped", "file": fname},
         )
 
     return result
 
 
 # ── JS/TS wrapper stripping (.js/.ts files) ─────────────────────────────
+
 
 def _fix_js_wrapper_tags(content: str) -> FixResult:
     """Strip <script>...</script> wrapper from .js/.ts file content.
@@ -85,28 +100,42 @@ def _fix_js_wrapper_tags(content: str) -> FixResult:
     result = FixResult(content=content)
     fname = _current_filename.get()
 
+    logger.debug(
+        "Checking JS file for wrapper tags",
+        extra={
+            "event": "cross_language.js_wrapper_check",
+            "content_length": len(content),
+            "file": fname,
+        },
+    )
+
     stripped = content.strip()
 
     open_match = re.match(r"^<script[^>]*>\s*\n?", stripped, re.IGNORECASE)
     if not open_match:
         logger.debug(
             "cross_language: no <script> wrapper in JS file",
-            extra={"event": "cross_lang_js_no_wrapper", "file": fname},
+            extra={"event": "cross_language.js_no_wrapper", "file": fname},
         )
         return result
+    logger.debug(
+        "_fix_js_wrapper_tags: not_open_match_passed",
+        extra={
+            "event": "cross_language.js_no_wrapper.passed",
+            "reason": "not_open_match_passed",
+        },
+    )  # auto:neg
 
     close_match = re.search(r"\n?\s*</script>\s*$", stripped, re.IGNORECASE)
     if not close_match:
         logger.debug(
             "cross_language: <script> open but no close in JS file",
-            extra={"event": "cross_lang_js_partial_wrapper", "file": fname},
+            extra={"event": "cross_language.js_partial_wrapper", "file": fname},
         )
-        result.warnings.append(
-            "JS file starts with <script> but has no </script>"
-        )
+        result.warnings.append("JS file starts with <script> but has no </script>")
         return result
 
-    inner = stripped[open_match.end():close_match.start()]
+    inner = stripped[open_match.end() : close_match.start()]
     result.content = inner.strip() + "\n"
 
     result.changed = result.content != content
@@ -114,7 +143,7 @@ def _fix_js_wrapper_tags(content: str) -> FixResult:
         result.fixes_applied.append("Stripped <script> wrapper from JS file")
         logger.debug(
             "cross_language: stripped <script> wrapper from JS file",
-            extra={"event": "cross_lang_js_wrapper_stripped", "file": fname},
+            extra={"event": "cross_language.js_wrapper_stripped", "file": fname},
         )
 
     return result
@@ -126,11 +155,11 @@ def _fix_js_wrapper_tags(content: str) -> FixResult:
 _CSS_SELECTOR_RE = re.compile(
     r"^\s*"
     r"(?:"
-    r"[.#][\w-]+"                          # .class or #id
-    r"|[\w*][\w-]*"                        # tag name or *
+    r"[.#][\w-]+"  # .class or #id
+    r"|[\w*][\w-]*"  # tag name or *
     r")"
-    r"(?:\s*[>+~,]\s*[\w.#*][\w-]*)*"     # optional combinators
-    r"(?:[\s.#:\[\]='\"-][\w-]*)*"         # pseudo-classes, attribute selectors
+    r"(?:\s*[>+~,]\s*[\w.#*][\w-]*)*"  # optional combinators
+    r"(?:[\s.#:\[\]='\"-][\w-]*)*"  # pseudo-classes, attribute selectors
     r"\s*\{"
 )
 
@@ -141,7 +170,6 @@ _CSS_PROPERTY_RE = re.compile(r"^\s*[\w-]+\s*:\s*[^;]+;\s*$")
 _CSS_AT_RULE_RE = re.compile(
     r"^\s*@(?:media|keyframes|import|font-face|charset|supports|layer|namespace)\b"
 )
-
 
 # ── JS detection patterns (for HTML/SVG text nodes) ─────────────────────
 
@@ -163,18 +191,15 @@ _JS_DOM_RE = re.compile(
 # addEventListener standalone
 _JS_LISTENER_RE = re.compile(r"\.addEventListener\s*\(")
 
-
 # ── Protected tag tracking ──────────────────────────────────────────────
 
 _PROTECTED_TAGS = ("style", "script", "pre", "code", "textarea")
 
 _OPEN_TAG_RES = {
-    tag: re.compile(rf"<{tag}[\s>]", re.IGNORECASE)
-    for tag in _PROTECTED_TAGS
+    tag: re.compile(rf"<{tag}[\s>]", re.IGNORECASE) for tag in _PROTECTED_TAGS
 }
 _CLOSE_TAG_RES = {
-    tag: re.compile(rf"</{tag}\s*>", re.IGNORECASE)
-    for tag in _PROTECTED_TAGS
+    tag: re.compile(rf"</{tag}\s*>", re.IGNORECASE) for tag in _PROTECTED_TAGS
 }
 
 
@@ -216,11 +241,20 @@ def _fix_html_misplaced_content(content: str) -> FixResult:
     result = FixResult(content=content)
     fname = _current_filename.get()
 
+    logger.debug(
+        "Checking HTML for misplaced content",
+        extra={
+            "event": "cross_language.html_misplaced_check",
+            "content_length": len(content),
+            "file": fname,
+        },
+    )
+
     # Skip template files
     if "{{" in content or "{%" in content or "<%" in content:
         logger.debug(
             "cross_language: skipping template file",
-            extra={"event": "cross_lang_skip_template", "file": fname},
+            extra={"event": "cross_language.skip_template", "file": fname},
         )
         return result
 
@@ -279,9 +313,21 @@ def _fix_html_misplaced_content(content: str) -> FixResult:
                 current_block = {"start": i, "end": i, "type": lang}
         elif not line.strip() and current_block:
             # Blank line inside a block — extend (CSS/JS blocks have blanks)
+            logger.debug(
+                "_fix_html_misplaced_content: clean",
+                extra={
+                    "event": "cross_language._fix_html_misplaced_content.branch.clean"
+                },
+            )
             current_block["end"] = i
         else:
             if current_block:
+                logger.debug(
+                    "_fix_html_misplaced_content: clean",
+                    extra={
+                        "event": "cross_language._fix_html_misplaced_content.branch.clean"
+                    },
+                )
                 blocks.append(current_block)
                 current_block = None
 
@@ -293,9 +339,9 @@ def _fix_html_misplaced_content(content: str) -> FixResult:
         count = 0
         for j in range(block["start"], block["end"] + 1):
             bline = lines[j]
-            if block["type"] == "css" and _is_css_line(bline):
-                count += 1
-            elif block["type"] == "js" and _is_js_line(bline):
+            if (block["type"] == "css" and _is_css_line(bline)) or (
+                block["type"] == "js" and _is_js_line(bline)
+            ):
                 count += 1
         return count
 
@@ -304,7 +350,7 @@ def _fix_html_misplaced_content(content: str) -> FixResult:
     if not significant:
         logger.debug(
             "cross_language: no misplaced content in HTML",
-            extra={"event": "cross_lang_html_clean", "file": fname},
+            extra={"event": "cross_language.html_clean", "file": fname},
         )
         return result
 
@@ -333,7 +379,7 @@ def _fix_html_misplaced_content(content: str) -> FixResult:
             block["type"],
             tag,
             extra={
-                "event": "cross_lang_html_wrapped",
+                "event": "cross_language.html_wrapped",
                 "file": fname,
                 "type": block["type"],
                 "tag": tag,
@@ -349,6 +395,7 @@ def _fix_html_misplaced_content(content: str) -> FixResult:
 
 # ── Entry point ─────────────────────────────────────────────────────────
 
+
 def fix_cross_language(content: str) -> FixResult:
     """Detect and fix cross-language content issues.
 
@@ -361,18 +408,18 @@ def fix_cross_language(content: str) -> FixResult:
 
     logger.debug(
         "cross_language: checking file",
-        extra={"event": "cross_lang_check", "file": fname, "ext": ext},
+        extra={"event": "cross_language.check", "file": fname, "ext": ext},
     )
 
     if ext in _HTML_LIKE_EXTS:
         return _fix_html_misplaced_content(content)
-    elif ext in _CSS_EXTS:
+    if ext in _CSS_EXTS:
         return _fix_css_wrapper_tags(content)
-    elif ext in _JS_EXTS:
+    if ext in _JS_EXTS:
         return _fix_js_wrapper_tags(content)
 
     logger.debug(
         "cross_language: no checks for extension",
-        extra={"event": "cross_lang_skip", "file": fname, "ext": ext},
+        extra={"event": "cross_language.skip", "file": fname, "ext": ext},
     )
     return FixResult(content=content)

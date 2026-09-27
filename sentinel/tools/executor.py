@@ -1,39 +1,30 @@
-import asyncio
 import hashlib
 import json
 import logging
 import os
 import re
-import shlex
-import shutil
 import time
+from typing import TYPE_CHECKING
 
-from sentinel.core.models import DataSource, PolicyResult, TaggedData, TrustLevel
+if TYPE_CHECKING:
+    from sentinel.tools.sandbox import PodmanSandbox
+
+from sentinel.audit import AuditEmitter, SecurityAuditEvent
 from sentinel.core.config import settings
 from sentinel.core.context import current_user_id, get_task_id
-from sentinel.core.workspace import get_user_workspace
-from sentinel.security.code_extractor import extract_code_blocks
+from sentinel.core.models import DataSource, TaggedData, TrustLevel
 from sentinel.security.policy_engine import PolicyEngine
-from sentinel.security.provenance import create_tagged_data, get_file_writer, get_tagged_data, record_file_write
+from sentinel.security.provenance import create_tagged_data
+from sentinel.tools._handlers._registry import _DYNAMIC_DESCRIPTION
+from sentinel.tools._handlers._task_exec_context import (
+    TaskExecutionContext,
+    get_current_task_context,
+    reset_current_task_context,
+    set_current_task_context,
+)
+from sentinel.tools.sidecar import SidecarClient
 
-from sentinel.security import semgrep_scanner
-from sentinel.security.code_fixer import fix_code as code_fixer_fix
-from sentinel.tools.anchor_allocator import allocate_anchors
-from sentinel.tools.anchor_allocator._core import build_marker
-from sentinel.tools.anchor_allocator._memory import clear_anchor_map
-from sentinel.tools.sidecar import SidecarClient, SidecarResponse
-
-logger = logging.getLogger("sentinel.audit")
-
-# Podman operation timeouts (seconds). Extracted from inline values so they
-# can be tuned in one place (BH3-096).
-PODMAN_BUILD_TIMEOUT = 300
-PODMAN_RUN_TIMEOUT = 60
-PODMAN_STOP_TIMEOUT = 30
-
-# Maximum file size for file_read and pre-read diff in file_write (1 MiB).
-# Prevents OOM on large files. Referenced by _file_read and _file_write.
-FILE_READ_MAX_BYTES = 1_048_576
+logger = logging.getLogger(__name__)
 
 # Tools that can be dispatched to the WASM sidecar when enabled
 WASM_TOOLS = frozenset({"file_read", "file_write", "shell_exec", "http_fetch"})
@@ -51,89 +42,56 @@ _EXTERNAL_DATA_TOOLS: dict[str, tuple[DataSource, TrustLevel]] = {
     "http_fetch": (DataSource.WEB, TrustLevel.UNTRUSTED),
 }
 
-# Podman flags that must never be passed, even if the tool interface is extended
-_DANGEROUS_PODMAN_FLAG_NAMES = frozenset({
-    "-v", "--volume", "-p", "--publish", "--privileged",
-    "--cap-add", "--security-opt", "--device",
-    "--mount", "--sysctl",
-})
-_DANGEROUS_PODMAN_FLAG_VALUES = frozenset({
-    "--pid=host", "--network=host", "--userns=host", "--ipc=host",
-    "--cgroupns=host", "--uts=host",
-})
+# Sentinel for "no authenticated user" — infrastructure tasks run at user_id 0
+_NO_USER_CONTEXT = 0
+
+# Shared types — canonical definitions in _handlers/_types.py.
+# Re-exported here for backwards compatibility with existing imports.
+from sentinel.tools._handlers._calendar import CalendarHandlerMixin
+from sentinel.tools._handlers._constants import _MANIFEST_EXTENSIONS
+from sentinel.tools._handlers._container import ContainerHandlerMixin
+from sentinel.tools._handlers._email import EmailHandlerMixin
+from sentinel.tools._handlers._external_data import ExternalDataHandlerMixin
+from sentinel.tools._handlers._file_ops import (
+    FILE_READ_MAX_BYTES,  # noqa: F401 — re-export for backwards compat
+    FileOpsHandlerMixin,
+)
+from sentinel.tools._handlers._file_patch import PatchHandlerMixin
+from sentinel.tools._handlers._file_write import WriteHandlerMixin
+from sentinel.tools._handlers._messaging import MessagingHandlerMixin
+from sentinel.tools._handlers._types import (  # noqa: F401
+    ToolBlockedError,
+    ToolError,
+    _CredentialOverlay,
+)
+from sentinel.tools._handlers._website import WebsiteHandlerMixin
 
 
-# Map file extensions to Semgrep language hints for pre-write scanning (D4)
-_EXT_TO_LANG: dict[str, str] = {
-    ".py": "python",
-    ".js": "javascript",
-    ".ts": "typescript",
-    ".java": "java",
-    ".c": "c",
-    ".cpp": "cpp",
-    ".cs": "csharp",
-    ".php": "php",
-    ".rb": "ruby",
-    ".go": "go",
-    ".rs": "rust",
-    ".sh": "bash",
-}
-
-
-# Code file extensions for defence-in-depth stripping of <RESPONSE> tags
-# and markdown fences before writing to disk (see _file_write).
-_CODE_EXTENSIONS = frozenset({
-    ".py", ".rs", ".js", ".ts", ".jsx", ".tsx", ".c", ".cpp", ".h",
-    ".hpp", ".java", ".go", ".rb", ".sh", ".bash", ".zsh", ".pl",
-    ".lua", ".zig", ".swift", ".kt", ".scala", ".r", ".cs", ".toml",
-    # Config/data formats — Qwen wraps these in fences/RESPONSE tags too
-    ".yaml", ".yml", ".json", ".xml", ".html", ".css", ".sql",
-    ".dockerfile", ".containerfile", ".cfg", ".ini", ".conf", ".php",
-    ".svg",
-})
-
-
-def _detect_language_from_path(path: str) -> str | None:
-    """Extract language hint from file extension for Semgrep scanning."""
-    _, ext = os.path.splitext(path)
-    return _EXT_TO_LANG.get(ext.lower())
-
-
-class ToolError(Exception):
-    """Error during tool execution."""
-
-
-class ToolBlockedError(ToolError):
-    """Tool execution blocked by policy."""
-
-
-class _CredentialOverlay:
-    """Proxy that overlays per-user credentials onto base settings.
-
-    Looks up attribute names in field_map -> creds dict. Falls through
-    to base settings for anything not in the map or not in creds.
-    Replaces the per-service inner classes (_UserCalDavConfig, _UserEmailConfig).
-    """
-
-    def __init__(self, creds: dict, base, field_map: dict[str, str]):
-        self._creds = creds
-        self._base = base
-        self._field_map = field_map
-
-    def __getattr__(self, name: str):
-        if name in self._field_map:
-            cred_key = self._field_map[name]
-            if cred_key in self._creds:
-                return self._creds[cred_key]
-        return getattr(self._base, name)
-
-
-class ToolExecutor:
+class ToolExecutor(
+    EmailHandlerMixin,
+    CalendarHandlerMixin,
+    MessagingHandlerMixin,
+    WriteHandlerMixin,
+    PatchHandlerMixin,
+    FileOpsHandlerMixin,
+    WebsiteHandlerMixin,
+    ExternalDataHandlerMixin,
+    ContainerHandlerMixin,
+):
     """Executes tool actions with policy validation before every operation.
 
     When a SidecarClient is provided and a tool is in WASM_TOOLS, the tool
     is dispatched to the Rust WASM sidecar for sandboxed execution. Non-WASM
     tools (podman_*, mkdir) always use the Python handlers.
+
+    Handler groups are defined in mixin classes under _handlers/:
+    - EmailHandlerMixin: email_search, email_read, email_send, email_draft (Gmail + IMAP)
+    - CalendarHandlerMixin: calendar_list/create/update/delete (Google + CalDAV)
+    - MessagingHandlerMixin: signal_send, telegram_send, matrix_send
+    - WriteHandlerMixin / PatchHandlerMixin / FileOpsHandlerMixin: file_write, file_read, file_patch, mkdir, shell, sandbox
+    - WebsiteHandlerMixin: website create/list/remove
+    - ExternalDataHandlerMixin: web_search, x_search, crypto_price, weather
+    - ContainerHandlerMixin: podman_build, podman_run, podman_stop
     """
 
     def __init__(
@@ -143,56 +101,110 @@ class ToolExecutor:
         google_oauth: object | None = None,
         sandbox: "PodmanSandbox | None" = None,
         trust_level: int = 0,
+        audit_emitter: "AuditEmitter | None" = None,
     ):
         self._engine = policy_engine
         self._sidecar = sidecar
         self._google_oauth = google_oauth
         self._sandbox = sandbox
         self._trust_level = trust_level
-        self._signal_channel = None
-        self._telegram_channel = None
+        self._audit_emitter: AuditEmitter | None = audit_emitter
+        self._channel_registry = None
         self._credential_store = None
         self._episodic_store = None
-        self._session_file_reads: set[str] = set()
+        self._ingester = None
 
-        # Handler dispatch — built once, not on every execute() call.
-        self._handlers = {
-            "file_write": self._file_write,
-            "file_read": self._file_read,
-            "file_patch": self._file_patch,
-            "mkdir": self._mkdir,
-            "shell": self._shell,
-            "shell_exec": self._shell,
-            "podman_build": self._podman_build,
-            "podman_run": self._podman_run,
-            "podman_stop": self._podman_stop,
-            "web_search": self._web_search,
-            "email_search": self._email_search,
-            "email_read": self._email_read,
-            "email_send": self._email_send,
-            "email_draft": self._email_draft,
-            "calendar_list_events": self._calendar_list_events,
-            "calendar_create_event": self._calendar_create_event,
-            "calendar_update_event": self._calendar_update_event,
-            "calendar_delete_event": self._calendar_delete_event,
-            "signal_send": self._signal_send,
-            "telegram_send": self._telegram_send,
-            "x_search": self._x_search,
-            "website": self._website,
-        }
+        # Handler dispatch — auto-discovered from @tool_handler decorators on
+        # mixin methods. Dynamic handlers (messaging channels) are added later
+        # via set_channel_registry(). See tools/_handlers/_registry.py.
+        self._handlers = self._discover_handlers()
 
-    def reset_session_state(self):
-        """Clear per-session tracking state between tasks.
+    def _discover_handlers(self) -> dict:
+        """Build handler dispatch dict from @tool_handler-decorated mixin methods.
 
-        Prevents cross-request leakage of file read tracking
-        (Finding #14: _session_file_reads grows unboundedly).
+        Scans all methods on the instance for a __tool_meta__ attribute
+        (set by the @tool_handler decorator). Maps tool name and aliases
+        to the bound method.
         """
-        self._session_file_reads.clear()
+        handlers = {}
+        # Track seen methods to avoid processing the same method twice
+        # (Python MRO can expose the same method via multiple inheritance paths).
+        seen = set()
+        for attr_name in dir(self):
+            # Skip dunder and known non-handler attributes for speed.
+            if attr_name.startswith("__"):
+                continue
+            try:
+                method = getattr(self, attr_name)
+            except AttributeError:
+                continue
+            if not callable(method):
+                continue
+            meta = getattr(method, "__tool_meta__", None)
+            if meta is None:
+                continue
+            if id(method) in seen:
+                continue
+            seen.add(id(method))
+            handlers[meta.name] = method
+            for alias in meta.aliases:
+                handlers[alias] = method
+        logger.debug(
+            "Tool handlers discovered: %d tools",
+            len(handlers),
+            extra={
+                "event": "executor.handlers_discovered",
+                "tool_count": len(handlers),
+                "tools": sorted(handlers.keys()),
+            },
+        )
+        return handlers
+
+    def _iter_tool_meta(self) -> list[tuple]:
+        """Return (method, ToolMeta) for all @tool_handler-decorated methods.
+
+        Deduplicates by method identity — aliases don't produce extra entries.
+        Walks the MRO class hierarchy via vars() to preserve definition order
+        within each class (dir() sorts alphabetically, which would change the
+        tool description ordering seen by the planner). Final order:
+        sorted by meta.order, then by MRO + definition order within ties.
+        """
+        logger.debug(
+            "_iter_tool_meta called", extra={"event": "executor._iter_tool_meta"}
+        )  # auto:entry
+        seen_names: set[str] = set()
+        items: list[tuple] = []
+        # Walk MRO in reverse so that the most-derived class's definitions
+        # appear first when there are overrides. For our mixin chain this
+        # gives us: ToolExecutor → EmailHandler → Calendar → Messaging →
+        # FileHandler → WebsiteHandler → ExternalDataHandler → ContainerHandler
+        # But since we sort by order field, the MRO order only matters within
+        # same-order ties.
+        for cls in type(self).__mro__:
+            for attr_name, attr_value in vars(cls).items():
+                meta = getattr(attr_value, "__tool_meta__", None)
+                if meta is None:
+                    continue
+                if meta.name in seen_names:
+                    continue
+                seen_names.add(meta.name)
+                # Get the bound method from the instance
+                method = getattr(self, attr_name)
+                items.append((method, meta))
+        items.sort(key=lambda x: x[1].order)
+        return items
 
     # Tools whose "path" arg should be rewritten to per-user workspace dirs.
-    _PATH_REWRITE_TOOLS = frozenset({
-        "file_write", "file_read", "file_patch", "mkdir", "shell", "shell_exec",
-    })
+    _PATH_REWRITE_TOOLS = frozenset(
+        {
+            "file_write",
+            "file_read",
+            "file_patch",
+            "mkdir",
+            "shell",
+            "shell_exec",
+        }
+    )
 
     def _rewrite_workspace_paths(self, tool_name: str, args: dict) -> dict:
         """Rewrite /workspace/ paths to /workspace/{user_id}/ for multi-user isolation.
@@ -208,16 +220,32 @@ class ToolExecutor:
         if tool_name not in self._PATH_REWRITE_TOOLS:
             return args
 
+        # Type validation at the trust boundary: applied regardless of user context
+        # so non-string args always raise ToolError (not AttributeError/TypeError).
+        if tool_name in ("shell", "shell_exec"):
+            command = args.get("command", "")
+            if not isinstance(command, str):
+                raise ToolError(
+                    "Invalid argument: command must be a string",
+                    category="validation",
+                )
+        else:
+            path = args.get("path", "")
+            if not isinstance(path, str):
+                raise ToolError(
+                    "Invalid argument: path must be a string",
+                    category="validation",
+                )
+
         user_id = current_user_id.get()
-        if user_id == 0:
+        if user_id == _NO_USER_CONTEXT:
             # No user context (infrastructure task) — pass through unchanged
             return args
 
         workspace_prefix = settings.workspace_path.rstrip("/") + "/"  # "/workspace/"
-        user_prefix = f"{workspace_prefix}{user_id}/"                 # "/workspace/1/"
+        user_prefix = f"{workspace_prefix}{user_id}/"  # "/workspace/1/"
 
         if tool_name in ("shell", "shell_exec"):
-            command = args.get("command", "")
             # Rewrite /workspace/ refs that aren't already user-scoped.
             # Negative lookahead: don't rewrite if already /workspace/{digit}/
             rewritten = re.sub(
@@ -229,16 +257,15 @@ class ToolExecutor:
                 args = {**args, "command": rewritten}
                 logger.debug(
                     "Rewrote workspace path in shell command",
-                    extra={"event": "workspace_path_rewrite", "tool": tool_name},
+                    extra={"event": "workspace.path_rewrite", "tool": tool_name},
                 )
             return args
 
         # File tools: rewrite "path" arg
-        path = args.get("path", "")
         if not path.startswith(workspace_prefix):
             return args
         # Already user-scoped? (e.g. /workspace/1/sites/...) — skip
-        remainder = path[len(workspace_prefix):]
+        remainder = path[len(workspace_prefix) :]
         if remainder and remainder.split("/", 1)[0].isdigit():
             return args
 
@@ -247,7 +274,7 @@ class ToolExecutor:
         logger.debug(
             "Rewrote workspace path for multi-user isolation",
             extra={
-                "event": "workspace_path_rewrite",
+                "event": "workspace.path_rewrite",
                 "tool": tool_name,
                 "original": path,
                 "rewritten": rewritten_path,
@@ -255,31 +282,42 @@ class ToolExecutor:
         )
         return args
 
-    def set_channels(self, signal_channel: object | None = None, telegram_channel: object | None = None):
-        """Wire messaging channels for signal_send / telegram_send tools."""
-        if self._signal_channel is not None and signal_channel is not None:
-            logger.warning(
-                "Overwriting existing signal channel — possible lifecycle bug",
-                extra={"event": "channel_overwrite", "channel": "signal"},
-            )
-        if self._telegram_channel is not None and telegram_channel is not None:
-            logger.warning(
-                "Overwriting existing telegram channel — possible lifecycle bug",
-                extra={"event": "channel_overwrite", "channel": "telegram"},
-            )
-        self._signal_channel = signal_channel
-        self._telegram_channel = telegram_channel
+    def set_channel_registry(self, registry: object) -> None:
+        """Wire channel registry — dynamically registers messaging tool handlers.
 
-    def set_episodic_store(self, episodic_store: object | None):
+        For each channel with a tool_name, creates a handler via
+        _make_channel_handler() and registers it in the dispatch dict.
+        """
+        if self._channel_registry is not None:
+            logger.warning(
+                "Overwriting existing channel registry — possible lifecycle bug",
+                extra={"event": "channel_registry.overwrite"},
+            )
+        self._channel_registry = registry
+        for channel in registry.with_tools():
+            tool_name = channel.descriptor.tool_name
+            handler = self._make_channel_handler(channel)
+            self._handlers[tool_name] = lambda args, h=handler: h(self, args)
+            logger.debug(
+                "Registered messaging handler: %s",
+                tool_name,
+                extra={"event": "executor.handler_registered", "tool": tool_name},
+            )
+
+    def set_episodic_store(self, episodic_store: object | None) -> None:
         """Wire episodic store for anchor map persistence."""
         self._episodic_store = episodic_store
 
-    def set_credential_store(self, credential_store: object | None):
+    def set_ingester(self, ingester: object | None) -> None:
+        """Wire attachment ingester for email attachment ingestion."""
+        self._ingester = ingester
+
+    def set_credential_store(self, credential_store: object | None) -> None:
         """Wire per-user credential store for email/calendar tools."""
         if self._credential_store is not None and credential_store is not None:
             logger.warning(
                 "Overwriting existing credential store — possible lifecycle bug",
-                extra={"event": "credential_store_overwrite"},
+                extra={"event": "credential.store_overwrite"},
             )
         self._credential_store = credential_store
 
@@ -289,319 +327,122 @@ class ToolExecutor:
             return None
         return await self._credential_store.get(service)
 
-    async def _get_caldav_config(self):
-        """Return config with per-user CalDAV credentials overlaid.
-
-        Falls back to system settings if no per-user credentials are configured.
-        Raises ToolError if neither per-user nor system credentials exist.
-        """
-        from sentinel.core.config import settings
-        user_caldav = await self._resolve_credentials("caldav")
-        if user_caldav is None:
-            if not settings.caldav_url:
-                raise ToolError(
-                    "Calendar not configured for your account. "
-                    "Ask an admin to set up your CalDAV credentials via PUT /api/credentials/caldav"
-                )
-            return settings
-
-        return _CredentialOverlay(user_caldav, settings, {
-            "caldav_url": "url",
-            "caldav_username": "username",
-            "caldav_password": "password",
-        })
-
-    async def _get_email_config(self):
-        """Return a config object with per-user IMAP/SMTP credentials overlaid.
-
-        Falls back to system settings if no per-user credentials are configured.
-        Raises ToolError if neither per-user nor system credentials exist.
-        """
-        from sentinel.core.config import settings
-        user_imap = await self._resolve_credentials("imap")
-        if user_imap is None:
-            # Fall back to system config
-            if not settings.imap_host:
-                raise ToolError(
-                    "Email not configured for your account. "
-                    "Ask an admin to set up your IMAP credentials via PUT /api/credentials/imap"
-                )
-            return settings
-
-        return _CredentialOverlay(user_imap, settings, {
-            "imap_host": "host", "imap_port": "port",
-            "imap_username": "username", "imap_password": "password",
-            "imap_use_ssl": "use_ssl",
-            "smtp_host": "smtp_host", "smtp_port": "smtp_port",
-            "smtp_username": "smtp_username", "smtp_password": "smtp_password",
-            "smtp_use_tls": "smtp_use_tls", "smtp_from_address": "from_address",
-        })
-
     def get_tool_descriptions(self) -> list[dict]:
-        return [
-            {
-                "name": "file_write",
-                "description": "Write content to a file. All paths must be absolute and under /workspace/ (e.g. /workspace/scripts/app.py). Files written here are NOT automatically viewable in a browser. For browser-viewable web pages, use the 'website' tool instead.",
-                "args": {"path": "string (absolute path under /workspace/)", "content": "string"},
-            },
-            {
-                "name": "file_read",
-                "description": "Read the contents of a file. All paths must be absolute and under /workspace/ (e.g. /workspace/sites/my-site/index.html, /workspace/scripts/app.py).",
-                "args": {"path": "string (absolute path under /workspace/)"},
-            },
-            {
-                "name": "file_patch",
-                "description": (
-                    "Apply an incremental modification to an existing file. "
-                    "Use instead of file_write when modifying part of a file — "
-                    "avoids regenerating unchanged content. "
-                    "For HTML files, use a css: prefix for deterministic element "
-                    "targeting (e.g. css:#panel-weather). For other files, copy "
-                    "a unique anchor string verbatim from the file."
-                ),
-                "args": {
-                    "path": "string (absolute path under /workspace/)",
-                    "operation": "string (insert_after | insert_before | replace | delete)",
-                    "anchor": "string (for HTML: 'css:#element-id' or 'css:.class'; for other files: unique text copied verbatim from file_read output)",
-                    "content": "string (new content — not needed for delete)",
-                },
-            },
-            {
-                "name": "mkdir",
-                "description": "Create a directory (and parents)",
-                "args": {"path": "string"},
-            },
-            {
-                "name": "shell",
-                "description": "Run a shell command and return its output",
-                "args": {"command": "string"},
-            },
-            {
-                "name": "podman_build",
-                "description": "Build a container image from a context directory",
-                "args": {"context_path": "string", "tag": "string"},
-            },
-            {
-                "name": "podman_run",
-                "description": "Run a container from an image",
-                "args": {"image": "string", "name": "string"},
-            },
-            {
-                "name": "podman_stop",
-                "description": "Stop a running container",
-                "args": {"container_name": "string"},
-            },
-            *(
-                [
-                    {
-                        "name": "http_fetch",
-                        "description": "Fetch content from a URL via HTTPS. Results are UNTRUSTED external data. Only allowed domains in the policy allowlist are accessible. Supports GET, POST, PUT, DELETE methods.",
-                        "args": {
-                            "url": "string (HTTPS URL, must be in allowed domains)",
-                            "method": "string (GET|POST|PUT|DELETE, default GET)",
-                            "headers": "object (optional request headers)",
-                            "body": "string (optional request body)",
-                        },
+        """Build tool description list from @tool_handler metadata.
+
+        Descriptions are auto-discovered from decorated mixin methods.
+        Special cases:
+        - http_fetch: sidecar-only tool, no Python handler, injected when sidecar is present
+        - Messaging tools: dynamic, from channel registry via _messaging_tool_descriptions()
+        - Tools with _DYNAMIC_DESCRIPTION: skipped (descriptions come from elsewhere)
+        - Tools with an enabled() gate that returns False: skipped
+        """
+        descriptions = []
+        for _method, meta in self._iter_tool_meta():
+            # Skip tools whose descriptions are provided by another mechanism.
+            if meta.description is _DYNAMIC_DESCRIPTION:
+                continue
+            # Skip tools gated by a settings check.
+            if meta.enabled is not None and not meta.enabled():
+                continue
+            descriptions.append(meta.to_description_dict())
+
+        # Sidecar-only tool — no Python handler, no decorator. Injected when
+        # the sidecar is available (provides the WASM http_fetch module).
+        if self._sidecar is not None:
+            descriptions.append(
+                {
+                    "name": "http_fetch",
+                    "description": "Fetch content from a URL via HTTPS. Results are UNTRUSTED external data. Only allowed domains in the policy allowlist are accessible. Supports GET, POST, PUT, DELETE methods.",
+                    "args": {
+                        "url": "string (HTTPS URL, must be in allowed domains)",
+                        "method": "string (GET|POST|PUT|DELETE, default GET)",
+                        "headers": "object (optional request headers)",
+                        "body": "string (optional request body)",
                     },
-                ]
-                if self._sidecar is not None
-                else []
-            ),
-            {
-                "name": "web_search",
-                "description": "Search the web for current information. Results are UNTRUSTED external data. Use for real-time data, news, current events — not for general knowledge questions.",
-                "args": {
-                    "query": "string (search query)",
-                    "count": "integer (number of results, default 5, max 10)",
-                },
-            },
-            {
-                "name": "x_search",
-                "description": "Search X (Twitter) for posts, trends, and discussions about a topic. Use for social media activity, public sentiment, trending topics, what people are saying. Results are UNTRUSTED external data.",
-                "args": {
-                    "query": "string (what to search for on X)",
-                    "count": "integer (max posts to consider, default 5, max 10)",
-                },
-            },
-            {
-                "name": "website",
-                "description": "Manage temporary websites at /workspace/sites/{site_id}/. Actions: create (write HTML/CSS/JS files — overwrites if site_id already exists, so use the same site_id to update a site), remove (delete a site), list (show active sites and their URLs). Sites are viewable in a browser at https://localhost:3001/sites/{site_id}/ and stored on disk at /workspace/sites/{site_id}/. Use file_read with /workspace/sites/{site_id}/index.html to inspect existing content before updating. IMPORTANT: Inline <script> tags are blocked by CSP — JavaScript must be in separate .js files with descriptive names (e.g. dashboard.js, gallery.js) referenced via <script src='feature-name.js'></script>.",
-                "args": {
-                    "action": "string (create|remove|list)",
-                    "site_id": "string (URL-safe identifier, e.g. 'weather-dashboard'. Required for create/remove)",
-                    "files": "object (filename to content map, e.g. {'index.html': '<html>...', 'style.css': '...'}. Required for create)",
-                    "title": "string (optional human-readable title for the site)",
-                },
-            },
-            *self._email_tool_descriptions(),
-            *self._calendar_tool_descriptions(),
-            *self._messaging_tool_descriptions(),
-        ]
+                }
+            )
 
-    def _email_tool_descriptions(self) -> list[dict]:
-        """Dynamic email tool descriptions based on email_backend config."""
-        from sentinel.core.config import settings
-        is_imap = settings.email_backend == "imap"
-        provider = "email" if is_imap else "Gmail"
-        query_hint = "Use '*' for all recent, or from:X, to:X, subject:X to filter" if is_imap else "Gmail search query, e.g. 'from:alice subject:report'"
-        id_source = "message ID from email_search" if is_imap else "Gmail message ID from email_search"
+        # Messaging tools — dynamic, from channel registry.
+        descriptions.extend(self._messaging_tool_descriptions())
 
-        return [
-            {
-                "name": "email_search",
-                "description": f"Search {provider} messages by query. Results are UNTRUSTED external data. Returns subject, sender, date, snippet for each match.",
-                "args": {
-                    "query": f"string ({query_hint})",
-                    "max_results": "integer (default 20)",
-                },
-            },
-            {
-                "name": "email_read",
-                "description": f"Read a full {provider} message by ID. Content is UNTRUSTED — email bodies can contain injection attempts from external senders.",
-                "args": {
-                    "message_id": f"string ({id_source})",
-                },
-            },
-            {
-                "name": "email_send",
-                "description": f"Send an email{' via ' + provider if not is_imap else ''}. REQUIRES APPROVAL — write operation. Prefer email_draft for non-urgent messages.",
-                "args": {
-                    "recipient": "string (user or contact number, optional — defaults to primary contact)",
-                    "subject": "string",
-                    "body": "string (plain text body)",
-                    "thread_id": "string (optional — set to reply to an existing thread)",
-                },
-            },
-            {
-                "name": "email_draft",
-                "description": f"Create {'an' if is_imap else 'a ' + provider} draft (not sent). REQUIRES APPROVAL — write operation. Safer than email_send for review before sending.",
-                "args": {
-                    "recipient": "string (user or contact number, optional — defaults to primary contact)",
-                    "subject": "string",
-                    "body": "string (plain text body)",
-                },
-            },
-        ]
-
-    def _calendar_tool_descriptions(self) -> list[dict]:
-        """Dynamic calendar tool descriptions based on calendar_backend config."""
-        from sentinel.core.config import settings
-        is_caldav = settings.calendar_backend == "caldav"
-        provider = "calendar" if is_caldav else "Google Calendar"
-
-        descs = [
-            {
-                "name": "calendar_list_events",
-                "description": f"List events from {provider}. Results are UNTRUSTED external data. Returns summary, time, location for each event.",
-                "args": {
-                    "time_min": "string (optional RFC3339 timestamp, e.g. '2026-02-19T00:00:00Z')",
-                    "time_max": "string (optional RFC3339 timestamp)",
-                    "max_results": "integer (default 50)",
-                },
-            },
-            {
-                "name": "calendar_create_event",
-                "description": f"Create a {provider} event. REQUIRES APPROVAL — write operation.",
-                "args": {
-                    "summary": "string (event title)",
-                    "start": "string (RFC3339 datetime, e.g. '2026-02-20T10:00:00Z')",
-                    "end": "string (RFC3339 datetime)",
-                    "location": "string (optional)",
-                    "description": "string (optional)",
-                },
-            },
-            {
-                "name": "calendar_update_event",
-                "description": f"Update an existing {provider} event (partial). REQUIRES APPROVAL — write operation.",
-                "args": {
-                    "event_id": f"string ({provider} event ID)",
-                    "summary": "string (optional new title)",
-                    "start": "string (optional new start datetime)",
-                    "end": "string (optional new end datetime)",
-                    "location": "string (optional)",
-                    "description": "string (optional)",
-                },
-            },
-            {
-                "name": "calendar_delete_event",
-                "description": f"Delete a {provider} event. REQUIRES APPROVAL — destructive operation.",
-                "args": {
-                    "event_id": f"string ({provider} event ID)",
-                },
-            },
-        ]
-
-        # Google Calendar has calendar_id arg; CalDAV uses config
-        if not is_caldav:
-            for desc in descs:
-                desc["args"]["calendar_id"] = "string (default 'primary')"
-
-        return descs
-
-    def _messaging_tool_descriptions(self) -> list[dict]:
-        """Dynamic messaging tool descriptions gated on channel config."""
-        from sentinel.core.config import settings
-        descs: list[dict] = []
-        if settings.signal_enabled:
-            descs.append({
-                "name": "signal_send",
-                "description": "Send a message via Signal. Write op — REQUIRES APPROVAL.",
-                "args": {
-                    "message": "string (message text, required)",
-                    "recipient": "string (user or contact number, optional — defaults to primary contact)",
-                },
-            })
-        if settings.telegram_enabled:
-            descs.append({
-                "name": "telegram_send",
-                "description": "Send a Telegram message. Write op — REQUIRES APPROVAL.",
-                "args": {
-                    "message": "string (message text, required)",
-                    "recipient": "string (user or contact number, optional — defaults to primary contact)",
-                },
-            })
-        return descs
+        return descriptions
 
     def _get_http_allowlist(self) -> list[str]:
         """Read http_tool_allowed_domains from policy YAML."""
         return self._engine.get_http_allowlist()
 
-    def _check_podman_flags(self, cmd: list[str]) -> None:
-        """Reject dangerous podman flags before policy check."""
-        for arg in cmd:
-            # Check exact flag names (e.g. -v, --volume)
-            flag_name = arg.split("=", 1)[0] if "=" in arg else arg
-            if flag_name in _DANGEROUS_PODMAN_FLAG_NAMES:
-                logger.warning(
-                    "Dangerous podman flag blocked",
-                    extra={"event": "podman_flag_blocked", "flag": arg, "cmd": shlex.join(cmd)},
-                )
-                raise ToolBlockedError(f"Dangerous podman flag blocked: {arg}")
-            # Check full flag=value entries (e.g. --network=host)
-            if arg in _DANGEROUS_PODMAN_FLAG_VALUES:
-                logger.warning(
-                    "Dangerous podman flag blocked",
-                    extra={"event": "podman_flag_blocked", "flag": arg, "cmd": shlex.join(cmd)},
-                )
-                raise ToolBlockedError(f"Dangerous podman flag blocked: {arg}")
-
-    async def execute(self, tool_name: str, args: dict) -> tuple[TaggedData, dict | None]:
+    async def execute(
+        self,
+        tool_name: str,
+        args: dict,
+        task_context: TaskExecutionContext | None = None,
+        *,
+        pipeline_run_id: str | None = None,
+    ) -> tuple[TaggedData, dict | None]:
         """Execute a tool by name with policy checks.
 
         Returns (tagged_data, exec_meta) where exec_meta contains tool-specific
         metadata (exit_code, stderr, file sizes) or None if not applicable.
 
         WASM-capable tools are dispatched to the sidecar when available.
+
+        Q17-F4 (D3, 2026-04-24): ``pipeline_run_id`` is a new optional
+        caller-owned correlation id.  ``_dispatch_external_tool``
+        allocates the id and threads it here so the ``tool.*`` envelope
+        emitted by this method shares the same key as the downstream
+        ``scan.*`` events.  ``scan_triggered`` is ``True`` only on
+        ``tool.completed`` when **both** (a) the caller threaded a
+        correlation id AND (b) the tagged output has non-empty content
+        (the condition under which ``_scan_tool_output`` will actually
+        fire ``pipeline.scan_output`` and produce ``scan.*`` events
+        under that id).  ``False`` on dispatch entry (scan has not
+        run yet), ``tool.blocked`` (block terminates before scan),
+        ``tool.timeout`` (timeout terminates before scan), and on
+        ``tool.completed`` with empty content (scan is short-circuited
+        by ``_scan_tool_output``).  MG-1 Q17.fix.d merge-review fix:
+        the content inspection closes a false-positive audit gap where
+        operators querying ``tool.completed AND scan_triggered=True
+        AND NOT EXISTS (scan.* WHERE details.pipeline_run_id = ...)``
+        previously flagged empty-content tool calls.  Direct callers
+        outside the tool-dispatch seam (tests, internal callers,
+        fast-path routes) omit the kwarg — the details payload
+        records ``pipeline_run_id=None`` + ``scan_triggered=False``
+        in that case, keeping the schema shape stable.
         """
+        # Extract args keys safely before the mapping check so tool.dispatch
+        # is always emitted even for non-dict payloads — provides an audit trail
+        # when an adversarial worker sends a malformed args value.
+        args_keys = list(args.keys()) if isinstance(args, dict) else None
         logger.info(
             "Tool execution requested",
             extra={
-                "event": "tool_execute",
+                "event": "tool.execute",
                 "tool": tool_name,
-                "args_keys": list(args.keys()),
+                "args_keys": args_keys,
                 "task_id": get_task_id(),
+                "has_pipeline_run_id": pipeline_run_id is not None,
             },
         )
+
+        # Emit tool.dispatch audit event at entry.  scan_triggered=False
+        # regardless of pipeline_run_id presence — the scan has not
+        # run yet at dispatch time.
+        await self._emit_tool_audit(
+            "tool.dispatch",
+            tool_name,
+            "SUCCESS",
+            "INFO",
+            details={"tool_name": tool_name, "args_keys": args_keys},
+            pipeline_run_id=pipeline_run_id,
+            scan_triggered=False,
+        )
+
+        if not isinstance(args, dict):
+            raise ToolError(
+                "Invalid argument: args must be a mapping",
+                category="validation",
+            )
 
         # Multi-user workspace path translation: the planner uses /workspace/
         # as a virtual root but files actually live at /workspace/{user_id}/.
@@ -609,6 +450,173 @@ class ToolExecutor:
         # the real per-user path. The planner never decides the user directory.
         args = self._rewrite_workspace_paths(tool_name, args)
 
+        # Loop detection: check for repeated identical tool calls before dispatch.
+        # Per-task detector created fresh in TaskExecutionContext — no cross-task state.
+        # Skip when task_context is None (backward compatibility with direct callers).
+        if task_context is not None:
+            task_context.loop_detector.check_and_record(tool_name, args)
+
+        # Expose task context for handler mixins during this execute() call
+        # via a per-asyncio-Task ContextVar (C45 2026-04-26 — replaces the
+        # previous singleton instance attribute that raced under concurrent
+        # execute() calls across cross-channel + multi-WebSocket reachability).
+        # set/reset live in try/finally so each Task sees its own binding.
+        try:
+            token = set_current_task_context(task_context)
+            t0 = time.monotonic()
+            result = await self._execute_dispatch(tool_name, args)
+            elapsed_ms = int((time.monotonic() - t0) * 1000)
+            # Q17-F4 MG-1 (2026-04-24): scan_triggered is True only when
+            # (a) the caller threaded a pipeline_run_id AND (b) the
+            # tagged output has non-empty content.  _scan_tool_output
+            # (the only production caller of scan.* with the threaded
+            # id) short-circuits on empty content (tool_dispatch.py
+            # _scan_tool_output — `if not tagged.content: return None`),
+            # so flagging scan_triggered=True here when content="" would
+            # be a wire-contract lie — operators querying for "tool.completed
+            # with scan_triggered=True AND no matching scan.manifest by
+            # pipeline_run_id" would see false-positive audit gaps.  The
+            # tagged content is the result[0] of the execute_dispatch
+            # tuple per the return annotation.
+            tagged_has_content = bool(
+                result[0].content
+                if (
+                    isinstance(result, tuple)
+                    and result
+                    and hasattr(result[0], "content")
+                )
+                else False
+            )
+            await self._emit_tool_audit(
+                "tool.completed",
+                tool_name,
+                "SUCCESS",
+                "INFO",
+                duration_ms=elapsed_ms,
+                details={"tool_name": tool_name},
+                pipeline_run_id=pipeline_run_id,
+                scan_triggered=pipeline_run_id is not None and tagged_has_content,
+            )
+            return result
+        except ToolBlockedError as exc:
+            logger.exception(
+                "execute: ToolBlockedError",
+                extra={"event": "executor.execute_toolblockederror"},
+            )  # auto:except
+            # Block during execute terminates before _scan_tool_output
+            # fires — scan_triggered=False.
+            await self._emit_tool_audit(
+                "tool.blocked",
+                tool_name,
+                "BLOCKED",
+                "HIGH",
+                details={"tool_name": tool_name, "reason": str(exc)[:200]},
+                pipeline_run_id=pipeline_run_id,
+                scan_triggered=False,
+            )
+            # Emit specific access event based on tool type
+            await self._emit_access_blocked(tool_name, str(exc))
+            raise
+        except ToolError as exc:
+            if "timed out" in str(exc):
+                # Timeout terminates before scan — scan_triggered=False.
+                await self._emit_tool_audit(
+                    "tool.timeout",
+                    tool_name,
+                    "TIMEOUT",
+                    "HIGH",
+                    details={"tool_name": tool_name},
+                    pipeline_run_id=pipeline_run_id,
+                    scan_triggered=False,
+                )
+            raise
+        finally:
+            reset_current_task_context(token)
+
+    # Tools where ToolBlockedError means file access was denied by policy
+    _FILE_TOOLS = frozenset({"file_read", "file_write", "file_patch"})
+    # Tools where ToolBlockedError means a command was denied by policy
+    _COMMAND_TOOLS = frozenset({"shell", "shell_exec"})
+
+    async def _emit_tool_audit(
+        self,
+        event_type: str,
+        tool_name: str,
+        outcome: str,
+        severity: str,
+        duration_ms: int | None = None,
+        details: dict | None = None,
+        *,
+        pipeline_run_id: str | None = None,
+        scan_triggered: bool = False,
+    ) -> None:
+        """Fire-and-forget tool audit event. Never raises to caller.
+
+        Q17-F4 (D3, 2026-04-24): ``pipeline_run_id`` + ``scan_triggered``
+        are included in the details payload so operators can join
+        ``tool.*`` events to the downstream ``scan.*`` events from the
+        same ingress via the correlation id directly.  ``scan_triggered``
+        disambiguates the absence case: ``True`` means the caller
+        (``_dispatch_external_tool``) will fire an output scan with
+        the same ``pipeline_run_id`` after this audit event; ``False``
+        means no scan runs in this outcome path (dispatch entry,
+        blocked-during-execute, timeout, or tools whose output never
+        flows through the scan seam).
+        """
+        if self._audit_emitter is None:
+            return
+        merged_details: dict = dict(details or {})
+        merged_details["pipeline_run_id"] = pipeline_run_id
+        merged_details["scan_triggered"] = scan_triggered
+        try:
+            await self._audit_emitter.emit(
+                SecurityAuditEvent(
+                    event_type=event_type,
+                    source_component="executor",
+                    outcome=outcome,
+                    severity=severity,
+                    duration_ms=duration_ms,
+                    details=merged_details,
+                )
+            )
+        except Exception:
+            logger.debug(
+                "Tool audit emit failed (non-fatal)",
+                extra={"event": "tool.audit_emit_failed", "event_type": event_type},
+            )
+
+    async def _emit_access_blocked(self, tool_name: str, reason: str) -> None:
+        """Emit access.file_blocked or access.command_blocked based on tool type."""
+        if self._audit_emitter is None:
+            return
+        if tool_name in self._FILE_TOOLS:
+            event_type = "access.file_blocked"
+        elif tool_name in self._COMMAND_TOOLS:
+            event_type = "access.command_blocked"
+        else:
+            return
+        try:
+            await self._audit_emitter.emit(
+                SecurityAuditEvent(
+                    event_type=event_type,
+                    source_component="policy_engine",
+                    outcome="BLOCKED",
+                    severity="HIGH",
+                    details={"tool_name": tool_name, "reason": reason[:200]},
+                )
+            )
+        except Exception:
+            logger.debug(
+                "Access audit emit failed (non-fatal)",
+                extra={"event": "access.audit_emit_failed", "event_type": event_type},
+            )
+
+    async def _execute_dispatch(
+        self,
+        tool_name: str,
+        args: dict,
+    ) -> tuple[TaggedData, dict | None]:
+        """Inner dispatch — separated so execute() can wrap with context cleanup."""
         # NOTE: See U4/SIMP-1 — 18 tool handlers follow 3 repetitive patterns
         # (~600 lines of structural duplication in backend dispatch). Deduplication
         # deferred: the handler-per-tool pattern is more readable than a generic
@@ -621,7 +629,44 @@ class ToolExecutor:
         if self._sidecar is not None and tool_name in WASM_TOOLS:
             try:
                 tagged = await self._execute_via_sidecar(tool_name, args)
-                return tagged, None  # Sidecar tools don't produce exec_meta
+                # Build minimal exec_meta for file_write so the goal verifier
+                # can see file sizes. Without this, the judge sees "no file
+                # changes" and retries endlessly on completed tasks.
+                sidecar_meta = None
+                if tool_name == "file_write":
+                    logger.debug(
+                        "_execute_dispatch: tool_name_eq_file_write",
+                        extra={
+                            "event": "file.read_hash_skip_redacted.clean",
+                            "reason": "tool_name_eq_file_write",
+                        },
+                    )  # auto:neg
+                    sidecar_meta = self._build_sidecar_file_meta(args)
+                elif tool_name == "file_read":
+                    if tagged.content.startswith("[REDACTED"):
+                        # Skip manifest/hash when sidecar redacted a credential
+                        # leak — hashing the placeholder would poison before_hashes.
+                        logger.info(
+                            "file_read: skipping manifest/hash capture — "
+                            "content redacted due to credential leak",
+                            extra={
+                                "event": "file.read_hash_skip_redacted",
+                                "path": args.get("path", ""),
+                            },
+                        )
+                    else:
+                        logger.debug(
+                            "_execute_dispatch: startswith_[REDACTED",
+                            extra={
+                                "event": "file.read_hash_skip_redacted.clean",
+                                "reason": "startswith_[REDACTED",
+                            },
+                        )  # auto:neg
+                        sidecar_meta = self._build_sidecar_file_read_meta(
+                            args.get("path", ""),
+                            tagged.content,
+                        )
+                return tagged, sidecar_meta
             except ToolBlockedError:
                 raise  # Security blocks must never fall back
             except ToolError as exc:
@@ -630,20 +675,23 @@ class ToolExecutor:
                 logger.warning(
                     "Sidecar dispatch failed, falling back to Python handler",
                     extra={
-                        "event": "sidecar_fallback",
+                        "event": "sidecar.fallback",
                         "tool": tool_name,
                         "error": str(exc),
+                        "error_category": exc.category,
+                        "error_class": "transient",
                         "task_id": get_task_id(),
                     },
+                    exc_info=True,
                 )
                 # Fall through to Python handler below
 
         if handler is None:
             logger.warning(
                 "Unknown tool requested",
-                extra={"event": "tool_unknown", "tool": tool_name},
+                extra={"event": "tool.unknown", "tool": tool_name},
             )
-            raise ToolError(f"Unknown tool: {tool_name}")
+            raise ToolError(f"Unknown tool: {tool_name}", category="validation")
 
         t0 = time.monotonic()
         result, exec_meta = await handler(args)
@@ -651,7 +699,7 @@ class ToolExecutor:
         logger.info(
             "Tool execution complete",
             extra={
-                "event": "tool_complete",
+                "event": "tool.complete",
                 "tool": tool_name,
                 "data_id": result.id,
                 "elapsed_s": round(elapsed, 3),
@@ -682,19 +730,19 @@ class ToolExecutor:
             logger.warning(
                 "Sidecar tool execution failed",
                 extra={
-                    "event": "sidecar_tool_failed",
+                    "event": "sidecar.tool_failed",
                     "tool": tool_name,
-                    "error": response.result,
+                    "error_len": len(str(response.result)),
                     "elapsed_s": round(elapsed, 3),
                 },
             )
-            raise ToolError(f"sidecar: {response.result}")
+            raise ToolError(f"sidecar: {response.result}", category="internal")
 
         if response.leaked:
             logger.warning(
                 "Sidecar detected credential leak in output",
                 extra={
-                    "event": "sidecar_leak_detected",
+                    "event": "sidecar.leak_detected",
                     "tool": tool_name,
                 },
             )
@@ -707,9 +755,17 @@ class ToolExecutor:
             # as structured data. Extract just the file content so downstream
             # consumers (Qwen via $var substitution) receive raw file content,
             # not a JSON wrapper they'd have to parse.
+            logger.debug(
+                "_execute_via_sidecar: leaked",
+                extra={"event": "sidecar.leak_detected.clean", "reason": "leaked"},
+            )  # auto:neg
             content = response.result
             if response.data is not None:
-                if tool_name == "file_read" and isinstance(response.data, dict) and "content" in response.data:
+                if (
+                    tool_name == "file_read"
+                    and isinstance(response.data, dict)
+                    and "content" in response.data
+                ):
                     content = response.data["content"]
                 else:
                     content = json.dumps(response.data)
@@ -729,7 +785,7 @@ class ToolExecutor:
         logger.info(
             "Sidecar tool execution complete",
             extra={
-                "event": "sidecar_tool_complete",
+                "event": "sidecar.tool_complete",
                 "tool": tool_name,
                 "data_id": tagged.id,
                 "elapsed_s": round(elapsed, 3),
@@ -739,2334 +795,111 @@ class ToolExecutor:
         )
         return tagged
 
-    async def _web_search(self, args: dict) -> tuple[TaggedData, dict | None]:
-        """Execute a web search via the configured backend."""
-        from sentinel.core.config import settings
-        from sentinel.tools.web_search import SearchError, create_search_backend, format_results
-
-        if not settings.web_search_enabled:
-            raise ToolError("Web search is disabled")
-
-        query = args.get("query", "").strip()
-        if not query:
-            raise ToolError("Search query is required")
-
-        try:
-            count = min(int(args.get("count", 5)), settings.web_search_max_results)
-        except (ValueError, TypeError):
-            raise ToolError("'count' must be a valid integer")
-
-        backend = create_search_backend(settings)
-        try:
-            results = await backend.search(query, count)
-        except SearchError as e:
-            raise ToolError(f"Web search failed: {e}") from e
-
-        content = format_results(results)
-        return await create_tagged_data(
-            content=content,
-            source=DataSource.WEB,
-            trust_level=TrustLevel.UNTRUSTED,
-            originated_from=f"web_search:{settings.web_search_backend}",
-        ), None
-
-    async def _x_search(self, args: dict) -> tuple[TaggedData, dict | None]:
-        """Search X (Twitter) via Grok API."""
-        from sentinel.core.config import settings
-        from sentinel.tools.x_search import XSearchError, search_x
-
-        if not settings.x_search_enabled:
-            raise ToolError("X search is disabled")
-
-        query = args.get("query", "").strip()
-        if not query:
-            raise ToolError("Search query is required")
-
-        try:
-            content = await search_x(
-                query,
-                api_url=settings.x_search_api_url,
-                api_key_file=settings.x_search_api_key_file,
-                model=settings.x_search_model,
-                timeout=settings.x_search_timeout,
-            )
-        except XSearchError as e:
-            raise ToolError(f"X search failed: {e}") from e
-
-        return await create_tagged_data(
-            content=content,
-            source=DataSource.WEB,
-            trust_level=TrustLevel.UNTRUSTED,
-            originated_from="x_search:grok",
-        ), None
-
-    # -- Email handlers (B4 Gmail / IMAP) ------------------------------------
-
-    async def _email_search(self, args: dict) -> tuple[TaggedData, dict | None]:
-        """Search emails — dispatches to Gmail or IMAP based on config."""
-        from sentinel.core.config import settings
-        if settings.email_backend == "imap":
-            return await self._imap_email_search(args)
-        return await self._gmail_email_search(args)
-
-    async def _email_read(self, args: dict) -> tuple[TaggedData, dict | None]:
-        """Read email — dispatches to Gmail or IMAP based on config."""
-        from sentinel.core.config import settings
-        if settings.email_backend == "imap":
-            return await self._imap_email_read(args)
-        return await self._gmail_email_read(args)
-
-    async def _email_send(self, args: dict) -> tuple[TaggedData, dict | None]:
-        """Send email — dispatches to Gmail or IMAP/SMTP based on config."""
-        from sentinel.core.config import settings
-        if settings.email_backend == "imap":
-            return await self._imap_email_send(args)
-        return await self._gmail_email_send(args)
-
-    async def _email_draft(self, args: dict) -> tuple[TaggedData, dict | None]:
-        """Create draft — dispatches to Gmail or IMAP based on config."""
-        from sentinel.core.config import settings
-        if settings.email_backend == "imap":
-            return await self._imap_email_draft(args)
-        return await self._gmail_email_draft(args)
-
-    # -- Gmail handlers (B4) ------------------------------------------------
-
-    async def _gmail_email_search(self, args: dict) -> tuple[TaggedData, dict | None]:
-        """Search Gmail messages via the Gmail API."""
-        from sentinel.core.config import settings
-        from sentinel.integrations.gmail import GmailError, format_search_results, search_emails
-
-        if not settings.gmail_enabled:
-            raise ToolError("Gmail integration is disabled")
-        if self._google_oauth is None:
-            raise ToolError("Google OAuth not configured")
-
-        query = args.get("query", "").strip()
-        if not query:
-            raise ToolError("Search query is required")
-
-        try:
-            max_results = min(int(args.get("max_results", 20)), settings.gmail_max_search_results)
-        except (ValueError, TypeError):
-            raise ToolError("'max_results' must be a valid integer")
-
-        token = await self._google_oauth.get_access_token()
-        try:
-            results = await search_emails(
-                token, query, max_results=max_results, timeout=settings.gmail_api_timeout,
-            )
-        except GmailError as e:
-            raise ToolError(f"Gmail search failed: {e}") from e
-
-        content = format_search_results(results)
-        return await create_tagged_data(
-            content=content,
-            source=DataSource.WEB,
-            trust_level=TrustLevel.UNTRUSTED,
-            originated_from="tool:email_search",
-        ), None
-
-    async def _gmail_email_read(self, args: dict) -> tuple[TaggedData, dict | None]:
-        """Read a full Gmail message by ID."""
-        from sentinel.core.config import settings
-        from sentinel.integrations.gmail import GmailError, format_email, read_email
-
-        if not settings.gmail_enabled:
-            raise ToolError("Gmail integration is disabled")
-        if self._google_oauth is None:
-            raise ToolError("Google OAuth not configured")
-
-        message_id = args.get("message_id", "").strip()
-        if not message_id:
-            raise ToolError("message_id is required")
-
-        token = await self._google_oauth.get_access_token()
-        try:
-            msg = await read_email(
-                token, message_id,
-                max_body_length=settings.gmail_max_body_length,
-                timeout=settings.gmail_api_timeout,
-            )
-        except GmailError as e:
-            raise ToolError(f"Gmail read failed: {e}") from e
-
-        content = format_email(msg)
-        return await create_tagged_data(
-            content=content,
-            source=DataSource.WEB,
-            trust_level=TrustLevel.UNTRUSTED,
-            originated_from="tool:email_read",
-        ), None
-
-    async def _gmail_email_send(self, args: dict) -> tuple[TaggedData, dict | None]:
-        """Send an email via Gmail."""
-        from sentinel.core.config import settings
-        from sentinel.integrations.gmail import GmailError, send_email
-
-        if not settings.gmail_enabled:
-            raise ToolError("Gmail integration is disabled")
-        if self._google_oauth is None:
-            raise ToolError("Google OAuth not configured")
-
-        to = (args.get("recipient") or "").strip()
-        subject = args.get("subject", "").strip()
-        body = args.get("body", "")
-        thread_id = args.get("thread_id")
-
-        if not to:
-            raise ToolError("No recipient — contact resolution failed or no default contact configured")
-        if not subject:
-            raise ToolError("'subject' is required")
-
-        token = await self._google_oauth.get_access_token()
-        try:
-            msg_id = await send_email(
-                token, to, subject, body,
-                thread_id=thread_id,
-                timeout=settings.gmail_api_timeout,
-            )
-        except GmailError as e:
-            raise ToolError(f"Gmail send failed: {e}") from e
-
-        # tagged_data stays in controller (never reaches planner), but
-        # defence-in-depth: use "recipient" instead of the actual address
-        return await create_tagged_data(
-            content=f"Email sent to recipient (message ID: {msg_id})",
-            source=DataSource.WEB,
-            trust_level=TrustLevel.UNTRUSTED,
-            originated_from="tool:email_send",
-        ), None
-
-    async def _gmail_email_draft(self, args: dict) -> tuple[TaggedData, dict | None]:
-        """Create a Gmail draft."""
-        from sentinel.core.config import settings
-        from sentinel.integrations.gmail import GmailError, create_draft
-
-        if not settings.gmail_enabled:
-            raise ToolError("Gmail integration is disabled")
-        if self._google_oauth is None:
-            raise ToolError("Google OAuth not configured")
-
-        to = (args.get("recipient") or "").strip()
-        subject = args.get("subject", "").strip()
-        body = args.get("body", "")
-
-        if not to:
-            raise ToolError("No recipient — contact resolution failed or no default contact configured")
-        if not subject:
-            raise ToolError("'subject' is required")
-
-        token = await self._google_oauth.get_access_token()
-        try:
-            draft_id = await create_draft(
-                token, to, subject, body,
-                timeout=settings.gmail_api_timeout,
-            )
-        except GmailError as e:
-            raise ToolError(f"Gmail draft failed: {e}") from e
-
-        return await create_tagged_data(
-            content=f"Draft created for recipient (draft ID: {draft_id})",
-            source=DataSource.WEB,
-            trust_level=TrustLevel.UNTRUSTED,
-            originated_from="tool:email_draft",
-        ), None
-
-    # -- IMAP handlers -------------------------------------------------------
-
-    async def _imap_email_search(self, args: dict) -> tuple[TaggedData, dict | None]:
-        """Search emails via IMAP (per-user credentials if available)."""
-        from sentinel.core.config import settings
-        from sentinel.integrations.imap_email import ImapEmailError, format_search_results, search_emails
-
-        config = await self._get_email_config()
-        query = args.get("query", "").strip()
-        if not query:
-            query = "*"  # List all recent emails
-
-        # NOTE: Uses gmail_max_search_results for IMAP too — the setting name
-        # is Gmail-specific but the value applies to all email backends.
-        # Tracked as Finding #33 in audit_executor_20260323.md.
-        try:
-            max_results = min(int(args.get("max_results", 20)), settings.gmail_max_search_results)
-        except (ValueError, TypeError):
-            raise ToolError("'max_results' must be a valid integer")
-
-        try:
-            results = await search_emails(config, query, max_results=max_results)
-        except ImapEmailError as e:
-            raise ToolError(f"IMAP search failed: {e}") from e
-
-        content = format_search_results(results)
-        return await create_tagged_data(
-            content=content,
-            source=DataSource.WEB,
-            trust_level=TrustLevel.UNTRUSTED,
-            originated_from="tool:email_search",
-        ), None
-
-    async def _imap_email_read(self, args: dict) -> tuple[TaggedData, dict | None]:
-        """Read a full email via IMAP (per-user credentials if available)."""
-        from sentinel.core.config import settings
-        from sentinel.integrations.imap_email import ImapEmailError, format_email, read_email
-
-        config = await self._get_email_config()
-        message_id = args.get("message_id", "").strip()
-        if not message_id:
-            raise ToolError("message_id is required")
-
-        try:
-            msg = await read_email(
-                config, message_id,
-                max_body_length=settings.gmail_max_body_length,
-            )
-        except ImapEmailError as e:
-            raise ToolError(f"IMAP read failed: {e}") from e
-
-        content = format_email(msg)
-        return await create_tagged_data(
-            content=content,
-            source=DataSource.WEB,
-            trust_level=TrustLevel.UNTRUSTED,
-            originated_from="tool:email_read",
-        ), None
-
-    async def _imap_email_send(self, args: dict) -> tuple[TaggedData, dict | None]:
-        """Send an email via SMTP (per-user credentials if available)."""
-        from sentinel.integrations.imap_email import ImapEmailError, send_email
-
-        config = await self._get_email_config()
-        to = (args.get("recipient") or "").strip()
-        subject = args.get("subject", "").strip()
-        body = args.get("body", "")
-        thread_id = args.get("thread_id")
-
-        if not to:
-            raise ToolError("No recipient — contact resolution failed or no default contact configured")
-        if not subject:
-            raise ToolError("'subject' is required")
-
-        try:
-            msg_id = await send_email(config, to, subject, body, thread_id=thread_id)
-        except ImapEmailError as e:
-            raise ToolError(f"SMTP send failed: {e}") from e
-
-        return await create_tagged_data(
-            content=f"Email sent to recipient (message ID: {msg_id})",
-            source=DataSource.WEB,
-            trust_level=TrustLevel.UNTRUSTED,
-            originated_from="tool:email_send",
-        ), None
-
-    async def _imap_email_draft(self, args: dict) -> tuple[TaggedData, dict | None]:
-        """Create a draft via IMAP APPEND (per-user credentials if available)."""
-        from sentinel.integrations.imap_email import ImapEmailError, create_draft
-
-        config = await self._get_email_config()
-        to = (args.get("recipient") or "").strip()
-        subject = args.get("subject", "").strip()
-        body = args.get("body", "")
-
-        if not to:
-            raise ToolError("No recipient — contact resolution failed or no default contact configured")
-        if not subject:
-            raise ToolError("'subject' is required")
-
-        try:
-            draft_id = await create_draft(config, to, subject, body)
-        except ImapEmailError as e:
-            raise ToolError(f"IMAP draft failed: {e}") from e
-
-        return await create_tagged_data(
-            content=f"Draft created for recipient (draft ID: {draft_id})",
-            source=DataSource.WEB,
-            trust_level=TrustLevel.UNTRUSTED,
-            originated_from="tool:email_draft",
-        ), None
-
-    # -- Calendar handlers (B5 Google / CalDAV) --------------------------------
-
-    async def _calendar_list_events(self, args: dict) -> tuple[TaggedData, dict | None]:
-        """List calendar events — dispatches to Google or CalDAV based on config."""
-        from sentinel.core.config import settings
-        if settings.calendar_backend == "caldav":
-            return await self._caldav_list_events(args)
-        return await self._google_calendar_list_events(args)
-
-    async def _calendar_create_event(self, args: dict) -> tuple[TaggedData, dict | None]:
-        """Create calendar event — dispatches to Google or CalDAV based on config."""
-        from sentinel.core.config import settings
-        if settings.calendar_backend == "caldav":
-            return await self._caldav_create_event(args)
-        return await self._google_calendar_create_event(args)
-
-    async def _calendar_update_event(self, args: dict) -> tuple[TaggedData, dict | None]:
-        """Update calendar event — dispatches to Google or CalDAV based on config."""
-        from sentinel.core.config import settings
-        if settings.calendar_backend == "caldav":
-            return await self._caldav_update_event(args)
-        return await self._google_calendar_update_event(args)
-
-    async def _calendar_delete_event(self, args: dict) -> tuple[TaggedData, dict | None]:
-        """Delete calendar event — dispatches to Google or CalDAV based on config."""
-        from sentinel.core.config import settings
-        if settings.calendar_backend == "caldav":
-            return await self._caldav_delete_event(args)
-        return await self._google_calendar_delete_event(args)
-
-    # -- Google Calendar handlers (B5) ----------------------------------------
-
-    async def _google_calendar_list_events(self, args: dict) -> tuple[TaggedData, dict | None]:
-        """List events from Google Calendar."""
-        from sentinel.core.config import settings
-        from sentinel.integrations.google_calendar import CalendarError, format_events, list_events
-
-        if not settings.calendar_enabled:
-            raise ToolError("Calendar integration is disabled")
-        if self._google_oauth is None:
-            raise ToolError("Google OAuth not configured")
-
-        calendar_id = args.get("calendar_id", "primary")
-        time_min = args.get("time_min")
-        time_max = args.get("time_max")
-        try:
-            max_results = min(int(args.get("max_results", 50)), settings.calendar_max_results)
-        except (ValueError, TypeError):
-            raise ToolError("'max_results' must be a valid integer")
-
-        token = await self._google_oauth.get_access_token()
-        try:
-            events = await list_events(
-                token, calendar_id,
-                time_min=time_min, time_max=time_max,
-                max_results=max_results,
-                timeout=settings.calendar_api_timeout,
-            )
-        except CalendarError as e:
-            raise ToolError(f"Calendar list failed: {e}") from e
-
-        content = format_events(events)
-        return await create_tagged_data(
-            content=content,
-            source=DataSource.WEB,
-            trust_level=TrustLevel.UNTRUSTED,
-            originated_from="tool:calendar_list_events",
-        ), None
-
-    async def _google_calendar_create_event(self, args: dict) -> tuple[TaggedData, dict | None]:
-        """Create a Google Calendar event."""
-        from sentinel.core.config import settings
-        from sentinel.integrations.google_calendar import CalendarError, create_event, format_event_detail
-
-        if not settings.calendar_enabled:
-            raise ToolError("Calendar integration is disabled")
-        if self._google_oauth is None:
-            raise ToolError("Google OAuth not configured")
-
-        summary = args.get("summary", "").strip()
-        start = args.get("start", "").strip()
-        end = args.get("end", "").strip()
-        if not summary:
-            raise ToolError("'summary' is required")
-        if not start or not end:
-            raise ToolError("'start' and 'end' are required")
-
-        token = await self._google_oauth.get_access_token()
-        try:
-            event = await create_event(
-                token,
-                calendar_id=args.get("calendar_id", "primary"),
-                summary=summary,
-                start=start,
-                end=end,
-                location=args.get("location", ""),
-                description=args.get("description", ""),
-                timeout=settings.calendar_api_timeout,
-            )
-        except CalendarError as e:
-            raise ToolError(f"Calendar create failed: {e}") from e
-
-        content = format_event_detail(event)
-        return await create_tagged_data(
-            content=content,
-            source=DataSource.WEB,
-            trust_level=TrustLevel.UNTRUSTED,
-            originated_from="tool:calendar_create_event",
-        ), None
-
-    async def _google_calendar_update_event(self, args: dict) -> tuple[TaggedData, dict | None]:
-        """Update an existing Google Calendar event."""
-        from sentinel.core.config import settings
-        from sentinel.integrations.google_calendar import CalendarError, format_event_detail, update_event
-
-        if not settings.calendar_enabled:
-            raise ToolError("Calendar integration is disabled")
-        if self._google_oauth is None:
-            raise ToolError("Google OAuth not configured")
-
-        event_id = args.get("event_id", "").strip()
-        if not event_id:
-            raise ToolError("'event_id' is required")
-
-        # Collect optional fields to update
-        fields = {}
-        for key in ("summary", "start", "end", "location", "description"):
-            if key in args and args[key]:
-                fields[key] = args[key]
-        if not fields:
-            raise ToolError("At least one field to update is required")
-
-        token = await self._google_oauth.get_access_token()
-        try:
-            event = await update_event(
-                token, event_id,
-                calendar_id=args.get("calendar_id", "primary"),
-                timeout=settings.calendar_api_timeout,
-                **fields,
-            )
-        except CalendarError as e:
-            raise ToolError(f"Calendar update failed: {e}") from e
-
-        content = format_event_detail(event)
-        return await create_tagged_data(
-            content=content,
-            source=DataSource.WEB,
-            trust_level=TrustLevel.UNTRUSTED,
-            originated_from="tool:calendar_update_event",
-        ), None
-
-    async def _google_calendar_delete_event(self, args: dict) -> tuple[TaggedData, dict | None]:
-        """Delete a Google Calendar event."""
-        from sentinel.core.config import settings
-        from sentinel.integrations.google_calendar import CalendarError, delete_event
-
-        if not settings.calendar_enabled:
-            raise ToolError("Calendar integration is disabled")
-        if self._google_oauth is None:
-            raise ToolError("Google OAuth not configured")
-
-        event_id = args.get("event_id", "").strip()
-        if not event_id:
-            raise ToolError("'event_id' is required")
-
-        token = await self._google_oauth.get_access_token()
-        try:
-            await delete_event(
-                token, event_id,
-                calendar_id=args.get("calendar_id", "primary"),
-                timeout=settings.calendar_api_timeout,
-            )
-        except CalendarError as e:
-            raise ToolError(f"Calendar delete failed: {e}") from e
-
-        return await create_tagged_data(
-            content=f"Event deleted: {event_id}",
-            source=DataSource.WEB,
-            trust_level=TrustLevel.UNTRUSTED,
-            originated_from="tool:calendar_delete_event",
-        ), None
-
-    # -- CalDAV handlers ------------------------------------------------------
-
-    async def _caldav_list_events(self, args: dict) -> tuple[TaggedData, dict | None]:
-        """List events from CalDAV calendar (per-user credentials if available)."""
-        from sentinel.core.config import settings
-        from sentinel.integrations.caldav_calendar import CalDavError, format_events, list_events
-
-        config = await self._get_caldav_config()
-        time_min = args.get("time_min")
-        time_max = args.get("time_max")
-        try:
-            max_results = min(int(args.get("max_results", 50)), settings.calendar_max_results)
-        except (ValueError, TypeError):
-            raise ToolError("'max_results' must be a valid integer")
-
-        try:
-            events = await list_events(
-                config, time_min=time_min, time_max=time_max, max_results=max_results,
-            )
-        except CalDavError as e:
-            raise ToolError(f"CalDAV list failed: {e}") from e
-
-        content = format_events(events)
-        return await create_tagged_data(
-            content=content,
-            source=DataSource.WEB,
-            trust_level=TrustLevel.UNTRUSTED,
-            originated_from="tool:calendar_list_events",
-        ), None
-
-    async def _caldav_create_event(self, args: dict) -> tuple[TaggedData, dict | None]:
-        """Create a CalDAV calendar event (per-user credentials if available)."""
-        from sentinel.integrations.caldav_calendar import CalDavError, create_event, format_event_detail
-
-        config = await self._get_caldav_config()
-        summary = args.get("summary", "").strip()
-        start = args.get("start", "").strip()
-        end = args.get("end", "").strip()
-        if not summary:
-            raise ToolError("'summary' is required")
-        if not start or not end:
-            raise ToolError("'start' and 'end' are required")
-
-        try:
-            event = await create_event(
-                config,
-                summary=summary,
-                start=start,
-                end=end,
-                location=args.get("location", ""),
-                description=args.get("description", ""),
-            )
-        except CalDavError as e:
-            raise ToolError(f"CalDAV create failed: {e}") from e
-
-        content = format_event_detail(event)
-        return await create_tagged_data(
-            content=content,
-            source=DataSource.WEB,
-            trust_level=TrustLevel.UNTRUSTED,
-            originated_from="tool:calendar_create_event",
-        ), None
-
-    async def _caldav_update_event(self, args: dict) -> tuple[TaggedData, dict | None]:
-        """Update an existing CalDAV event (per-user credentials if available)."""
-        from sentinel.integrations.caldav_calendar import CalDavError, format_event_detail, update_event
-
-        config = await self._get_caldav_config()
-        event_id = args.get("event_id", "").strip()
-        if not event_id:
-            raise ToolError("'event_id' is required")
-
-        fields = {}
-        for key in ("summary", "start", "end", "location", "description"):
-            if key in args and args[key]:
-                fields[key] = args[key]
-        if not fields:
-            raise ToolError("At least one field to update is required")
-
-        try:
-            event = await update_event(config, event_id, **fields)
-        except CalDavError as e:
-            raise ToolError(f"CalDAV update failed: {e}") from e
-
-        content = format_event_detail(event)
-        return await create_tagged_data(
-            content=content,
-            source=DataSource.WEB,
-            trust_level=TrustLevel.UNTRUSTED,
-            originated_from="tool:calendar_update_event",
-        ), None
-
-    async def _caldav_delete_event(self, args: dict) -> tuple[TaggedData, dict | None]:
-        """Delete a CalDAV event (per-user credentials if available)."""
-        from sentinel.integrations.caldav_calendar import CalDavError, delete_event
-
-        config = await self._get_caldav_config()
-        event_id = args.get("event_id", "").strip()
-        if not event_id:
-            raise ToolError("'event_id' is required")
-
-        try:
-            await delete_event(config, event_id)
-        except CalDavError as e:
-            raise ToolError(f"CalDAV delete failed: {e}") from e
-
-        return await create_tagged_data(
-            content=f"Event deleted: {event_id}",
-            source=DataSource.WEB,
-            trust_level=TrustLevel.UNTRUSTED,
-            originated_from="tool:calendar_delete_event",
-        ), None
-
-    # -- Messaging handlers (Signal / Telegram) --------------------------------
-
-    async def _signal_send(self, args: dict) -> tuple[TaggedData, dict | None]:
-        """Send a message via Signal channel."""
-        from sentinel.channels.base import OutgoingMessage
-        from sentinel.core.config import settings
-
-        if not settings.signal_enabled:
-            raise ToolError("Signal integration is disabled")
-        if self._signal_channel is None:
-            raise ToolError("Signal channel not available")
-
-        message = args.get("message", "").strip()
-        if not message:
-            logger.warning(
-                "signal_send rejected: empty message",
-                extra={"event": "tool_signal_send_rejected", "reason": "empty_message"},
-            )
-            raise ToolError("'message' is required")
-
-        # Recipient is pre-resolved by tool dispatch (contact registry)
-        recipient = (args.get("recipient") or "").strip()
-        if not recipient:
-            logger.warning(
-                "signal_send rejected: no recipient",
-                extra={"event": "tool_signal_send_rejected", "reason": "no_recipient"},
-            )
-            raise ToolError("No recipient — contact resolution failed or no default contact configured")
-
-        out = OutgoingMessage(
-            channel_id=recipient,
-            event_type="tool.signal_send",
-            data={"response": message},
-        )
-        await self._signal_channel.send(out)
-
-        # Log without PII — recipient is a UUID/phone after contact resolution.
-        # Server-side logs are on the user's own server, but defence-in-depth
-        # still applies: use opaque reference in both logs and tagged_data.
-        logger.info(
-            "Signal message sent via tool",
-            extra={"event": "tool_signal_send"},
-        )
-        return await create_tagged_data(
-            content="Signal message sent to recipient",
-            source=DataSource.TOOL,
-            trust_level=TrustLevel.TRUSTED,
-            originated_from="tool:signal_send",
-        ), None
-
-    async def _telegram_send(self, args: dict) -> tuple[TaggedData, dict | None]:
-        """Send a message via Telegram channel."""
-        from sentinel.channels.base import OutgoingMessage
-        from sentinel.core.config import settings
-
-        if not settings.telegram_enabled:
-            raise ToolError("Telegram integration is disabled")
-        if self._telegram_channel is None:
-            raise ToolError("Telegram channel not available")
-
-        message = args.get("message", "").strip()
-        if not message:
-            logger.warning(
-                "telegram_send rejected: empty message",
-                extra={"event": "tool_telegram_send_rejected", "reason": "empty_message"},
-            )
-            raise ToolError("'message' is required")
-
-        # Recipient is pre-resolved by tool dispatch (contact registry)
-        chat_id = (args.get("recipient") or "").strip()
-        if not chat_id:
-            logger.warning(
-                "telegram_send rejected: no recipient",
-                extra={"event": "tool_telegram_send_rejected", "reason": "no_recipient"},
-            )
-            raise ToolError("No recipient — contact resolution failed or no default contact configured")
-
-        out = OutgoingMessage(
-            channel_id=chat_id,
-            event_type="tool.telegram_send",
-            data={"result": message},
-        )
-        await self._telegram_channel.send(out)
-
-        logger.info(
-            "Telegram message sent via tool",
-            extra={"event": "tool_telegram_send"},
-        )
-        return await create_tagged_data(
-            content="Telegram message sent to recipient",
-            source=DataSource.TOOL,
-            trust_level=TrustLevel.TRUSTED,
-            originated_from="tool:telegram_send",
-        ), None
-
-    async def _file_write(self, args: dict) -> tuple[TaggedData, dict | None]:
-        path = args.get("path", "")
-        content = args.get("content", "")
-
-        result = self._engine.check_file_write(path)
-        if result.status != PolicyResult.ALLOWED:
-            logger.warning(
-                "file_write blocked by policy",
-                extra={"event": "file_write_blocked", "path": path, "reason": result.reason},
-            )
-            raise ToolBlockedError(f"file_write blocked: {result.reason}")
-
-        logger.debug(
-            "file_write policy passed",
-            extra={"event": "file_write_allowed", "path": path},
-        )
-
-        # D4: Pre-write Semgrep scan at TL3+ — defense-in-depth
-        if self._trust_level >= 3 and semgrep_scanner.is_loaded():
-            lang_hint = _detect_language_from_path(path)
-            try:
-                sg_result = await semgrep_scanner.scan_blocks([(content, lang_hint)])
-                if sg_result.found:
-                    match_names = [m.pattern_name for m in sg_result.matches]
-                    logger.warning(
-                        "file_write blocked by pre-write Semgrep scan",
-                        extra={
-                            "event": "file_write_semgrep_blocked",
-                            "path": path,
-                            "matches": match_names,
-                        },
-                    )
-                    raise ToolBlockedError(
-                        f"Semgrep pre-write scan blocked: {len(sg_result.matches)} issue(s) "
-                        f"detected in content for {path}"
-                    )
-            except ToolBlockedError:
-                raise  # Re-raise our own ToolBlockedError
-            except Exception as exc:
-                # B-001: Fail-closed — if Semgrep crashes, block the write
-                logger.error(
-                    "Pre-write Semgrep scan failed — blocking write (fail-closed)",
-                    extra={
-                        "event": "file_write_semgrep_error",
-                        "path": path,
-                        "error": str(exc),
-                    },
-                )
-                raise ToolBlockedError(
-                    f"Pre-write scan failed (fail-closed): {exc}"
-                ) from exc
-
-        # Defence-in-depth: strip <RESPONSE> tags from code files.
-        # Primary stripping is in orchestrator (before code block extraction),
-        # but if tags survive (e.g. edge case, new code path), catch them here
-        # before writing to disk. Without this, <RESPONSE> on line 1 causes
-        # SyntaxError in every language.
-        _, ext = os.path.splitext(path)
-        if ext.lower() in _CODE_EXTENSIONS and "<RESPONSE>" in content:
-            if "</RESPONSE>" in content:
-                match = re.search(r"<RESPONSE>(.*?)</RESPONSE>", content, re.DOTALL)
-                if match:
-                    content = match.group(1).strip()
-            else:
-                # Truncated — opening tag but no closing tag (output cap hit).
-                # Strip the opening tag and keep everything after it.
-                start = content.index("<RESPONSE>") + len("<RESPONSE>")
-                content = content[start:].strip()
-            if "<RESPONSE>" not in content:  # only log if we actually stripped
-                logger.warning(
-                    "Defence-in-depth: stripped <RESPONSE> tags from file_write content",
-                    extra={
-                        "event": "file_write_response_tag_strip",
-                        "path": path,
-                    },
-                )
-
-        # Defence-in-depth: strip <FILE path="..."> tags from code files.
-        # When the worker generates multi-file output (e.g. during debug/fix),
-        # it sometimes wraps each file in <FILE path="...">...</FILE> tags.
-        # If the planner stores the entire multi-file output in one variable
-        # and resolves it into multiple file_write steps, every file gets the
-        # full blob — starting with <FILE> on line 1 → SyntaxError.
-        # Fix: extract just the block matching this file's path.
-        if ext.lower() in _CODE_EXTENSIONS and "<FILE" in content and "</FILE>" in content:
-            # Find all <FILE path="...">...</FILE> blocks
-            file_blocks = re.findall(
-                r'<FILE\s+path="([^"]+)">\s*(.*?)\s*</FILE>',
-                content,
-                re.DOTALL,
-            )
-            if file_blocks:
-                # Try to match by target path: exact match, then basename
-                target_basename = os.path.basename(path)
-                matched_content = None
-                for block_path, block_content in file_blocks:
-                    if block_path == path or block_path.rstrip("/") == path.rstrip("/"):
-                        matched_content = block_content.strip()
-                        break
-                if matched_content is None:
-                    for block_path, block_content in file_blocks:
-                        if os.path.basename(block_path) == target_basename:
-                            matched_content = block_content.strip()
-                            break
-                # Fallback: if only one block and no path match, use it anyway
-                if matched_content is None and len(file_blocks) == 1:
-                    matched_content = file_blocks[0][1].strip()
-
-                if matched_content is not None:
-                    content = matched_content
-                    logger.warning(
-                        "Defence-in-depth: extracted content from <FILE> tags",
-                        extra={
-                            "event": "file_write_file_tag_strip",
-                            "path": path,
-                            "blocks_found": len(file_blocks),
-                        },
-                    )
-
-        # Defence-in-depth: strip markdown fences from code files.
-        # If the upstream fence unwrap in orchestrator missed a case (e.g.
-        # prose-wrapped code for DISPLAY destination), catch it here before
-        # writing fences to disk.  Only applies to code file types.
-        if ext.lower() in _CODE_EXTENSIONS and "```" in content:
-            stripped_fence = False
-            original_content = content
-
-            # Check for outer wrapping fence first: the entire content is
-            # wrapped in ```lang ... ```.  Inner embedded fences (e.g. Rust
-            # doc comments with /// ```) cause extract_code_blocks() to find
-            # multiple blocks, but the fix is simple — peel the outer fence.
-            lines = content.split("\n")
-            if (
-                len(lines) >= 3
-                and re.match(r"^```\w*\s*$", lines[0])
-                and lines[-1].strip() == "```"
-            ):
-                content = "\n".join(lines[1:-1])
-                stripped_fence = True
-            else:
-                # Fallback: single code block extraction
-                blocks = extract_code_blocks(content)
-                if len(blocks) == 1 and blocks[0].code.strip():
-                    content = blocks[0].code
-                    stripped_fence = True
-
-            if stripped_fence:
-                logger.debug(
-                    "Stripped markdown fences from file_write content",
-                    extra={
-                        "event": "file_write_fence_strip",
-                        "path": path,
-                        "original_len": len(original_content),
-                        "stripped_len": len(content),
-                    },
-                )
-
-        # Code fixer: deterministic repair of common LLM output errors.
-        # Handles trailing newline, BOM, CRLF, trailing whitespace, prose
-        # stripping, and language-specific fixes (brackets, imports, etc.).
-        # Only runs on known code/config file types — non-code files (plain
-        # text, unknown extensions) pass through unchanged.
-        # Fail-safe: if fix_code crashes, original content passes through.
-        _fixer_names = {"Dockerfile", "Containerfile", "Makefile", "GNUmakefile", "makefile"}
-        fix_result = None
-        _basename = os.path.basename(path)
-        if ext.lower() in _CODE_EXTENSIONS or _basename in _fixer_names:
-            try:
-                fix_result = code_fixer_fix(path, content)
-                if fix_result.changed:
-                    content = fix_result.content
-                    logger.info(
-                        "Code fixer applied fixes",
-                        extra={
-                            "event": "code_fixer_applied",
-                            "path": path,
-                            "fixes": fix_result.fixes_applied,
-                            "errors_found": fix_result.errors_found,
-                            "warnings": fix_result.warnings,
-                        },
-                    )
-                elif fix_result.errors_found:
-                    logger.warning(
-                        "Code fixer found unfixable errors",
-                        extra={
-                            "event": "code_fixer_errors",
-                            "path": path,
-                            "errors": fix_result.errors_found,
-                        },
-                    )
-            except Exception as exc:
-                # Fail-safe: fixer crash must never block a file write
-                logger.error(
-                    "Code fixer crashed — writing original content",
-                    extra={
-                        "event": "code_fixer_crash",
-                        "path": path,
-                        "error": str(exc),
-                    },
-                    exc_info=True,
-                )
-                fix_result = None
-
-        # --- Anchor allocator ---
-        from sentinel.core.config import settings as _aa_settings
-        _aa_user_id = current_user_id.get()
-        if _aa_settings.anchor_allocator_enabled and ext.lower() in _CODE_EXTENSIONS:
-            _structural_fail = (
-                fix_result is not None
-                and any("structural_integrity_failure" in e for e in fix_result.errors_found)
-            )
-            if _structural_fail:
-                _ep_store = getattr(self, '_episodic_store', None)
-                if _ep_store:
-                    try:
-                        await clear_anchor_map(path, _ep_store, _aa_user_id)
-                    except Exception:
-                        pass
-                logger.warning(
-                    "File structurally invalid — anchor allocation skipped",
-                    extra={"event": "anchor_allocator_skipped_integrity", "path": path},
-                )
-            else:
-                try:
-                    _anchor_result = await allocate_anchors(
-                        path=path,
-                        content=content,
-                        episodic_store=getattr(self, '_episodic_store', None),
-                        user_id=_aa_user_id,
-                        tier=_aa_settings.anchor_allocator_tier,
-                    )
-                    if _anchor_result.changed:
-                        content = _anchor_result.content
-                    if _anchor_result.parse_failed:
-                        logger.warning(
-                            "Anchor allocation parse failed",
-                            extra={"event": "anchor_allocation_failed", "path": path,
-                                   "error": _anchor_result.error},
-                        )
-                except Exception:
-                    logger.warning(
-                        "Anchor allocator crash — writing content without anchors",
-                        extra={"event": "anchor_allocator_error", "path": path},
-                        exc_info=True,
-                    )
-
-        # F1: Pre-read existing file for diff_stats metadata.
-        # Cap to FILE_READ_MAX_BYTES (module constant) — prevents OOM.
-        _before_content = None
-        _before_size = None
-        try:
-            file_size = os.path.getsize(path)
-            _before_size = file_size
-            if file_size <= FILE_READ_MAX_BYTES:
-                with open(path, encoding="utf-8") as f:
-                    _before_content = f.read()
-            else:
-                # File too large for diff — record size but skip content
-                _before_content = None
-        except OSError:
-            pass  # New file — no before content
-
-        try:
-            parent = os.path.dirname(path)
-            if parent:
-                # E-002: Validate parent path against policy before creating
-                parent_result = self._engine.check_file_write(parent)
-                if parent_result.status != PolicyResult.ALLOWED:
-                    raise ToolBlockedError(
-                        f"Parent directory blocked by policy: {parent_result.reason}"
-                    )
-                os.makedirs(parent, exist_ok=True)
-
-            # Defence-in-depth: auto-create missing __init__.py in Python
-            # packages. Qwen frequently forgets __init__.py in subdirs,
-            # causing ModuleNotFoundError on import. Only create if file
-            # doesn't already exist (preserves Qwen's version with imports).
-            if ext.lower() == ".py" and path.startswith("/workspace/"):
-                parts = path.split("/")
-                # Walk /workspace/<pkg>/ … <parent>/ creating __init__.py.
-                # Skip /workspace/ itself — it's not a package.
-                for i in range(3, len(parts)):
-                    pkg_dir = "/".join(parts[:i])
-                    init_path = os.path.join(pkg_dir, "__init__.py")
-                    if os.path.isdir(pkg_dir) and not os.path.exists(init_path):
-                        with open(init_path, "w") as f:
-                            f.write("")
-                        logger.info(
-                            "Auto-created missing __init__.py",
-                            extra={
-                                "event": "auto_init_py",
-                                "init_path": init_path,
-                                "trigger_file": path,
-                            },
-                        )
-
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(content)
-        except OSError as exc:
-            logger.error(
-                "file_write OS error",
-                extra={"event": "file_write_error", "path": path, "error": str(exc)},
-            )
-            # Clean up partial file if it was created (e.g. disk full mid-write)
-            try:
-                if os.path.exists(path):
-                    os.remove(path)
-            except OSError:
-                pass
-            raise ToolError(f"file_write failed: {exc}") from exc
-
-        logger.info(
-            "File written",
-            extra={"event": "file_written", "path": path, "size": len(content)},
-        )
-        tagged = await create_tagged_data(
-            content=f"File written: {path}",
-            source=DataSource.TOOL,
-            trust_level=TrustLevel.TRUSTED,
-            originated_from=f"file_write:{path}",
-        )
-        # Record file provenance so file_read can inherit trust from the writer.
-        # Pass the post-transform content so the hash matches what's on disk.
-        await record_file_write(path, tagged.id, content=content)
-        exec_meta = {
-            "file_size_before": _before_size,
-            "file_size_after": len(content),
-            "file_content_before": _before_content,
-            "code_fixer_changed": fix_result.changed if fix_result else False,
-            "code_fixer_fixes": fix_result.fixes_applied if fix_result else [],
-            "code_fixer_errors": fix_result.errors_found if fix_result else [],
-            "code_fixer_warnings": fix_result.warnings if fix_result else [],
-        }
-        if path in self._session_file_reads:
-            exec_meta["file_write_after_read_warning"] = (
-                "file_write used on a previously-read file — "
-                "consider file_patch for partial modifications"
-            )
-            logger.info(
-                "file_write on previously-read file",
-                extra={
-                    "event": "file_write_after_read",
-                    "path": path,
-                    "hint": "consider file_patch",
-                },
-            )
-        return tagged, exec_meta
-
-    async def _file_patch(self, args: dict) -> tuple[TaggedData, dict | None]:
-        """Apply an incremental modification to an existing file.
-
-        Deterministic string operation — no LLM involved. The anchor and
-        operation come from the planner (trusted), the content comes from
-        the worker (already scanned by the security pipeline).
+    def _build_sidecar_file_meta(self, args: dict) -> dict | None:
+        """Build exec_meta for sidecar file_write by statting the file.
+
+        The sidecar doesn't return file sizes in its response, so the
+        goal verifier sees "no file changes" and retries on success.
+        This stats the file after write to provide the data the verifier
+        needs.
         """
         path = args.get("path", "")
-        operation = args.get("operation", "")
-        anchor = args.get("anchor", "")
-        content = args.get("content")
-        exec_meta: dict = {}
-
-        valid_ops = {"insert_after", "insert_before", "replace", "delete"}
-        if operation not in valid_ops:
-            raise ToolError(f"Invalid operation: {operation!r}. Must be one of {valid_ops}")
-
-        if not anchor:
-            raise ToolError("anchor is required")
-
-        # replace with empty content is equivalent to delete — allow it
-        if operation not in ("delete", "replace") and not content:
-            raise ToolError(f"Operation {operation!r} requires content")
-
-        # ── Policy gate ──────────────────────────────────────────────
-        result = self._engine.check_file_write(path)
-        if result.status != PolicyResult.ALLOWED:
-            logger.warning(
-                "file_patch blocked by policy",
-                extra={"event": "file_patch_blocked", "path": path, "reason": result.reason},
-            )
-            raise ToolBlockedError(f"file_patch blocked: {result.reason}")
-        logger.debug(
-            "file_patch policy passed",
-            extra={"event": "file_patch_policy_allowed", "path": path, "operation": operation},
-        )
-
-        # ── Read current file ────────────────────────────────────────
-        try:
-            with open(path, encoding="utf-8") as fh:
-                current = fh.read()
-        except FileNotFoundError:
-            raise ToolError(f"File not found: {path}")
-        except OSError as exc:
-            raise ToolError(f"Cannot read {path}: {exc}")
-
-        _, ext = os.path.splitext(path)
-        exec_meta["file_size_before"] = len(current.encode("utf-8"))
-        exec_meta["file_content_before"] = current[:1_048_576]  # 1MB cap for diff
-        logger.debug(
-            "file_patch read base file",
-            extra={
-                "event": "file_patch_read_base",
-                "path": path,
-                "size": exec_meta["file_size_before"],
-                "operation": operation,
-                "anchor_length": len(anchor),
-            },
-        )
-
-        # ── Backup before modification ───────────────────────────────
-        backup_dir = os.path.join(os.path.dirname(path), ".patch_backups")
-        os.makedirs(backup_dir, exist_ok=True)
-        backup_name = f"{os.path.basename(path)}.{time.time_ns()}"
-        backup_path = os.path.join(backup_dir, backup_name)
-        shutil.copy2(path, backup_path)
-        exec_meta["backup_path"] = backup_path
-        logger.debug(
-            "file_patch backup created",
-            extra={"event": "file_patch_backup", "path": path, "backup": backup_path},
-        )
-
-        # Cleanup: keep only 5 most recent backups for this filename
-        prefix = os.path.basename(path) + "."
-        backups = sorted(
-            [os.path.join(backup_dir, b) for b in os.listdir(backup_dir) if b.startswith(prefix)],
-            key=lambda b: os.path.getmtime(b),
-        )
-        for old_backup in backups[:-5]:
-            os.unlink(old_backup)
-            logger.debug(
-                "file_patch old backup removed",
-                extra={"event": "file_patch_backup_cleanup", "removed": old_backup},
-            )
-
-        # ── CSS selector anchors (HTML files only) ─────────────────
-        # The css: prefix triggers BeautifulSoup-based selector resolution.
-        # The selector is resolved to the element's outer HTML, which then
-        # becomes the text anchor for the standard string operations below.
-        # This is deterministic — no LLM involved in anchor resolution.
-        # Design: docs/design/incremental-update-tool-20260322.md §4.4
-        _html_extensions = {".html", ".htm"}
-        if anchor.startswith("css:"):
-            selector = anchor[4:].strip()
-            if not selector:
-                raise ToolError("css: prefix requires a CSS selector (e.g. css:#panel-weather)")
-
-            if ext.lower() not in _html_extensions:
-                # Non-HTML file: css: prefix is meaningless, treat as literal text.
-                # This preserves backwards compatibility — if someone stores a file
-                # that literally contains "css:something", it works as a text anchor.
-                logger.debug(
-                    "file_patch css: prefix on non-HTML file, treating as literal",
-                    extra={
-                        "event": "file_patch_css_literal_fallback",
-                        "path": path,
-                        "ext": ext,
-                    },
-                )
-            else:
-                from bs4 import BeautifulSoup
-
-                soup = BeautifulSoup(current, "html.parser")
-                matches = soup.select(selector)
-
-                if len(matches) == 0:
-                    logger.debug(
-                        "file_patch css selector not found",
-                        extra={
-                            "event": "file_patch_css_miss",
-                            "path": path,
-                            "selector": selector,
-                        },
-                    )
-                    raise ToolError(
-                        f"CSS selector '{selector}' matched no elements in {path}."
-                    )
-                if len(matches) > 1:
-                    logger.debug(
-                        "file_patch css selector ambiguous",
-                        extra={
-                            "event": "file_patch_css_ambiguous",
-                            "path": path,
-                            "selector": selector,
-                            "match_count": len(matches),
-                        },
-                    )
-                    raise ToolError(
-                        f"CSS selector '{selector}' matched {len(matches)} elements in "
-                        f"{path}. Use a more specific selector (e.g. add an ID)."
-                    )
-
-                # Resolve selector to source position using BeautifulSoup's
-                # sourceline/sourcepos tracking. This avoids the round-trip
-                # fidelity problem where str(element) doesn't exactly match
-                # the source HTML (whitespace normalisation, attribute order).
-                #
-                # We find the element's start position in the raw source, then
-                # find the corresponding closing tag to get the full span.
-                element = matches[0]
-
-                if element.sourceline is None or element.sourcepos is None:
-                    raise ToolError(
-                        f"CSS selector '{selector}' matched but element has no "
-                        "source position. Try a text anchor instead."
-                    )
-
-                # Calculate byte offset from sourceline + sourcepos
-                lines = current.split("\n")
-                css_start = (
-                    sum(len(l) + 1 for l in lines[:element.sourceline - 1])
-                    + element.sourcepos
-                )
-
-                # Find the end of this element in the raw source.
-                # The source from css_start begins with the opening tag.
-                # We need the full element including closing tag.
-                # Use str(element) length as a guide, then scan for the
-                # actual closing tag in the source.
-                serialised = str(element)
-                tag_name = element.name
-
-                # For self-closing or void elements, the span is just the tag
-                if element.is_empty_element:
-                    # Find end of opening tag
-                    css_end = current.index(">", css_start) + 1
-                else:
-                    # Find the matching closing tag. Since we know the element
-                    # is unique via CSS selector, we can search for </tag>
-                    # starting from after the opening tag, counting nesting.
-                    depth = 0
-                    i = css_start
-                    while i < len(current):
-                        open_tag = current.find(f"<{tag_name}", i)
-                        close_tag = current.find(f"</{tag_name}>", i)
-                        if close_tag == -1:
-                            # No closing tag found — use serialised length
-                            css_end = css_start + len(serialised)
-                            break
-                        if open_tag != -1 and open_tag < close_tag:
-                            depth += 1
-                            i = open_tag + 1
-                        else:
-                            if depth == 0:
-                                css_end = close_tag + len(f"</{tag_name}>")
-                                break
-                            depth -= 1
-                            i = close_tag + 1
-                    else:
-                        css_end = css_start + len(serialised)
-
-                # Extract the actual source text for this element
-                anchor = current[css_start:css_end]
-                exec_meta["css_position"] = css_start
-
-                logger.debug(
-                    "file_patch css selector resolved",
-                    extra={
-                        "event": "file_patch_css_resolved",
-                        "path": path,
-                        "selector": selector,
-                        "resolved_length": len(anchor),
-                        "position": css_start,
-                    },
-                )
-                exec_meta["css_selector"] = selector
-                exec_meta["css_resolved_length"] = len(anchor)
-
-        # ── Range anchor syntax (name...name-end) ────────────────────
-        if "..." in anchor and not anchor.startswith("css:") and "css_position" not in exec_meta:
-            start_name, end_name = anchor.split("...", 1)
-            start_marker = build_marker(path, start_name.strip())
-            end_marker = build_marker(path, end_name.strip())
-
-            if start_marker is None or end_marker is None:
-                raise ToolError(
-                    f"Range anchors not supported for {os.path.splitext(path)[1]} files"
-                )
-
-            start_count = current.count(start_marker)
-            end_count = current.count(end_marker)
-
-            if start_count != 1:
-                raise ToolError(
-                    f"Range anchor start '{start_name.strip()}' found {start_count} times "
-                    f"(expected 1) in {path}"
-                )
-            if end_count != 1:
-                raise ToolError(
-                    f"Range anchor end '{end_name.strip()}' found {end_count} times "
-                    f"(expected 1) in {path}"
-                )
-
-            start_idx = current.index(start_marker)
-            end_idx = current.index(end_marker) + len(end_marker)
-
-            if start_idx >= end_idx:
-                raise ToolError(f"Range anchor start must come before end in {path}")
-
-            anchor = current[start_idx:end_idx]
-            exec_meta["range_anchor"] = True
-            exec_meta["range_start"] = start_name.strip()
-            exec_meta["range_end"] = end_name.strip()
-            logger.debug(
-                "Range anchor resolved",
-                extra={
-                    "event": "range_anchor_resolved",
-                    "start": start_name.strip(), "end": end_name.strip(),
-                    "span_length": end_idx - start_idx,
-                },
-            )
-
-        # ── Find text anchor ─────────────────────────────────────────
-        # If CSS selector already resolved the position, skip text matching.
-        # The CSS path guarantees a unique element match via BeautifulSoup;
-        # the text representation may not be unique but the position is.
-        if "css_position" not in exec_meta and not exec_meta.get("range_anchor"):
-            count = current.count(anchor)
-            if count == 0:
-                logger.debug(
-                    "file_patch anchor not found",
-                    extra={
-                        "event": "file_patch_anchor_miss",
-                        "path": path,
-                        "anchor_length": len(anchor),
-                        "anchor_preview": anchor[:100],
-                    },
-                )
-                raise ToolError(
-                    f"Anchor not found in {path}. Re-read the file and copy an exact string."
-                )
-            if count > 1:
-                logger.debug(
-                    "file_patch anchor ambiguous",
-                    extra={
-                        "event": "file_patch_anchor_ambiguous",
-                        "path": path,
-                        "match_count": count,
-                        "anchor_preview": anchor[:100],
-                    },
-                )
-                raise ToolError(
-                    f"Anchor matches {count} locations in {path}. "
-                    "Use a longer or more specific anchor string."
-                )
-
-        # ── Replace anchor size sanity check ─────────────────────────
-        if operation == "replace":
-            anchor_len = len(anchor)
-            if anchor_len > 2000:
-                logger.warning(
-                    "file_patch replace anchor too large",
-                    extra={
-                        "event": "file_patch_anchor_too_large",
-                        "path": path,
-                        "anchor_length": anchor_len,
-                    },
-                )
-                raise ToolError(
-                    f"Replace anchor is {anchor_len} chars — too large for safe "
-                    "replacement. Use a smaller anchor targeting a specific section, "
-                    "or use file_write for large-scale rewrites."
-                )
-            if anchor_len > 500:
-                exec_meta["anchor_size_warning"] = (
-                    f"Replace anchor is {anchor_len} chars — "
-                    "verify this targets the intended section"
-                )
-                logger.debug(
-                    "file_patch replace anchor large",
-                    extra={
-                        "event": "file_patch_anchor_large_warning",
-                        "path": path,
-                        "anchor_length": anchor_len,
-                    },
-                )
-
-        exec_meta["patch_anchor_length"] = len(anchor)
-
-        # ── Apply content through code fixer ─────────────────────────
-        if content:
-            # Defence-in-depth: strip RESPONSE tags, FILE tags, fences
-            if ext.lower() in _CODE_EXTENSIONS:
-                # Strip <RESPONSE> tags
-                if "<RESPONSE>" in content:
-                    if "</RESPONSE>" in content:
-                        match = re.search(r"<RESPONSE>(.*?)</RESPONSE>", content, re.DOTALL)
-                        if match:
-                            content = match.group(1).strip()
-                    else:
-                        start = content.index("<RESPONSE>") + len("<RESPONSE>")
-                        content = content[start:].strip()
-
-                # Strip markdown fences
-                if "```" in content:
-                    lines = content.split("\n")
-                    if (
-                        len(lines) >= 3
-                        and re.match(r"^```\w*\s*$", lines[0])
-                        and lines[-1].strip() == "```"
-                    ):
-                        content = "\n".join(lines[1:-1])
-                    else:
-                        blocks = extract_code_blocks(content)
-                        if len(blocks) == 1 and blocks[0].code.strip():
-                            content = blocks[0].code
-
-                # Code fixer — crash must never block a patch (matches
-                # _file_write policy). Log and continue with original content.
-                try:
-                    fix_result = code_fixer_fix(path, content)
-                    if fix_result and not fix_result.skipped:
-                        content = fix_result.content
-                        exec_meta["code_fixer_changed"] = fix_result.changed
-                        exec_meta["code_fixer_fixes"] = fix_result.fixes_applied
-                        exec_meta["code_fixer_errors"] = fix_result.errors_found
-                        exec_meta["code_fixer_warnings"] = fix_result.warnings
-                        if fix_result.changed:
-                            logger.debug(
-                                "file_patch code fixer applied",
-                                extra={
-                                    "event": "file_patch_code_fixer",
-                                    "path": path,
-                                    "fixes": fix_result.fixes_applied,
-                                },
-                            )
-                    else:
-                        exec_meta["code_fixer_changed"] = False
-                        exec_meta["code_fixer_fixes"] = []
-                        exec_meta["code_fixer_errors"] = []
-                        exec_meta["code_fixer_warnings"] = []
-                except Exception:
-                    logger.warning(
-                        "Code fixer crash in file_patch — using original content",
-                        extra={
-                            "event": "code_fixer_error_patch",
-                            "path": path,
-                        },
-                        exc_info=True,
-                    )
-                    exec_meta["code_fixer_changed"] = False
-                    exec_meta["code_fixer_fixes"] = []
-                    exec_meta["code_fixer_errors"] = []
-                    exec_meta["code_fixer_warnings"] = []
-            else:
-                exec_meta["code_fixer_changed"] = False
-                exec_meta["code_fixer_fixes"] = []
-                exec_meta["code_fixer_errors"] = []
-                exec_meta["code_fixer_warnings"] = []
-
-        # --- Anchor allocator (file_patch) ---
-        # Skip for delete operations (content is None) and when allocator is disabled
-        from sentinel.core.config import settings as _aa_settings_patch
-        _aa_patch_user_id = current_user_id.get()
-        if _aa_settings_patch.anchor_allocator_enabled and content:
-            _structural_fail = any(
-                "structural_integrity_failure" in e
-                for e in exec_meta.get("code_fixer_errors", [])
-            )
-            if _structural_fail:
-                _ep_store = getattr(self, '_episodic_store', None)
-                if _ep_store:
-                    try:
-                        await clear_anchor_map(path, _ep_store, _aa_patch_user_id)
-                    except Exception:
-                        pass
-                logger.warning(
-                    "File structurally invalid — anchor allocation skipped (file_patch)",
-                    extra={"event": "anchor_allocator_skipped_integrity_patch", "path": path},
-                )
-                exec_meta["anchor_allocator_changed"] = False
-                exec_meta["anchor_count"] = 0
-            else:
-                try:
-                    _anchor_result = await allocate_anchors(
-                        path=path,
-                        content=content,
-                        episodic_store=getattr(self, '_episodic_store', None),
-                        user_id=_aa_patch_user_id,
-                        tier=_aa_settings_patch.anchor_allocator_tier,
-                    )
-                    if _anchor_result.changed:
-                        content = _anchor_result.content
-                    exec_meta["anchor_allocator_changed"] = _anchor_result.changed
-                    exec_meta["anchor_count"] = len(_anchor_result.anchors)
-                    if _anchor_result.parse_failed:
-                        logger.warning(
-                            "Anchor allocation parse failed (file_patch)",
-                            extra={"event": "anchor_allocation_failed_patch",
-                                   "path": path, "error": _anchor_result.error},
-                        )
-                except Exception:
-                    logger.warning(
-                        "Anchor allocator crash in file_patch",
-                        extra={"event": "anchor_allocator_error_patch", "path": path},
-                        exc_info=True,
-                    )
-                    exec_meta["anchor_allocator_changed"] = False
-                    exec_meta["anchor_count"] = 0
-
-        # ── Apply operation ──────────────────────────────────────────
-        # Use CSS-resolved position if available, otherwise find by text.
-        idx = exec_meta.get("css_position", current.index(anchor))
-        logger.debug(
-            "file_patch applying operation",
-            extra={
-                "event": "file_patch_apply",
-                "path": path,
-                "operation": operation,
-                "anchor_position": idx,
-                "content_length": len(content) if content else 0,
-            },
-        )
-
-        if operation == "insert_after":
-            end = idx + len(anchor)
-            # Ensure newline separation — the worker often omits the leading
-            # newline on fragments, causing content to join the anchor line.
-            if content and not anchor.endswith("\n") and not content.startswith("\n"):
-                content = "\n" + content
-            patched = current[:end] + content + current[end:]
-        elif operation == "insert_before":
-            # Same for insert_before — ensure trailing newline on content
-            if content and not content.endswith("\n") and not anchor.startswith("\n"):
-                content = content + "\n"
-            patched = current[:idx] + content + current[idx:]
-        elif operation == "replace":
-            patched = current[:idx] + content + current[idx + len(anchor):]
-        elif operation == "delete":
-            patched = current[:idx] + current[idx + len(anchor):]
-
-        # ── Full-file code fixer (post-patch) ────────────────────────
-        # Runs the same fixer chain as file_write() on the FULL patched
-        # file. Catches cross-language issues that only appear in the
-        # context of the complete file (e.g., CSS dumped outside <style>
-        # after a patch inserts content at the wrong position).
-        # The fragment-level fixer (above) catches syntax issues in the
-        # new content; this catches structural issues in the result.
-        _fixer_names_full = {
-            "Dockerfile", "Containerfile", "Makefile",
-            "GNUmakefile", "makefile",
-        }
-        _basename_full = os.path.basename(path)
-        full_fix_result = None
-        if ext.lower() in _CODE_EXTENSIONS or _basename_full in _fixer_names_full:
-            try:
-                full_fix_result = code_fixer_fix(path, patched)
-                if full_fix_result.changed:
-                    patched = full_fix_result.content
-                    logger.debug(
-                        "file_patch full-file code fixer applied",
-                        extra={
-                            "event": "file_patch_full_fixer",
-                            "path": path,
-                            "fixes": full_fix_result.fixes_applied,
-                            "errors": full_fix_result.errors_found,
-                        },
-                    )
-                elif full_fix_result.errors_found:
-                    logger.debug(
-                        "file_patch full-file fixer found errors",
-                        extra={
-                            "event": "file_patch_full_fixer_errors",
-                            "path": path,
-                            "errors": full_fix_result.errors_found,
-                        },
-                    )
-                exec_meta["full_file_fixer_changed"] = full_fix_result.changed
-                exec_meta["full_file_fixer_fixes"] = full_fix_result.fixes_applied
-                exec_meta["full_file_fixer_errors"] = full_fix_result.errors_found
-                exec_meta["full_file_fixer_warnings"] = full_fix_result.warnings
-            except Exception:
-                logger.warning(
-                    "Full-file code fixer crash in file_patch — "
-                    "using patched content",
-                    extra={
-                        "event": "file_patch_full_fixer_crash",
-                        "path": path,
-                    },
-                    exc_info=True,
-                )
-                full_fix_result = None
-                exec_meta["full_file_fixer_changed"] = False
-                exec_meta["full_file_fixer_fixes"] = []
-                exec_meta["full_file_fixer_errors"] = []
-                exec_meta["full_file_fixer_warnings"] = []
-        else:
-            exec_meta["full_file_fixer_changed"] = False
-            exec_meta["full_file_fixer_fixes"] = []
-            exec_meta["full_file_fixer_errors"] = []
-            exec_meta["full_file_fixer_warnings"] = []
-
-        # ── Write result ─────────────────────────────────────────────
-        try:
-            with open(path, "w", encoding="utf-8") as fh:
-                fh.write(patched)
-        except OSError as exc:
-            # Restore from backup on write failure
-            shutil.copy2(backup_path, path)
-            logger.error(
-                "file_patch write failed, restored backup",
-                extra={"event": "file_patch_write_error", "path": path, "error": str(exc)},
-            )
-            raise ToolError(f"file_patch write failed: {exc}")
-
-        exec_meta["file_size_after"] = len(patched.encode("utf-8"))
-        exec_meta["patch_operation"] = operation
-
-        # ── Provenance ───────────────────────────────────────────────
-        tagged = await create_tagged_data(
-            content=f"File patched: {path} ({operation})",
-            source=DataSource.TOOL,
-            trust_level=TrustLevel.TRUSTED,
-            originated_from=f"file_patch:{path}",
-        )
-        await record_file_write(path, tagged.id, content=patched)
-
-        logger.info(
-            "file_patch complete",
-            extra={
-                "event": "file_patch_complete",
-                "path": path,
-                "operation": operation,
-                "size_before": exec_meta["file_size_before"],
-                "size_after": exec_meta["file_size_after"],
-                "anchor_length": exec_meta["patch_anchor_length"],
-                "backup": backup_path,
-            },
-        )
-
-        return tagged, exec_meta
-
-    async def _file_read(self, args: dict) -> tuple[TaggedData, dict | None]:
-        path = args.get("path", "")
-
-        result = self._engine.check_file_read(path)
-        if result.status != PolicyResult.ALLOWED:
-            logger.warning(
-                "file_read blocked by policy",
-                extra={"event": "file_read_blocked", "path": path, "reason": result.reason},
-            )
-            raise ToolBlockedError(f"file_read blocked: {result.reason}")
-
-        logger.debug(
-            "file_read policy passed",
-            extra={"event": "file_read_allowed", "path": path},
-        )
-
-        # Cap file size to prevent OOM on large files (module constant)
+        if not path:
+            return None
         try:
             file_size = os.path.getsize(path)
-        except OSError as exc:
-            logger.error(
-                "file_read OS error",
-                extra={"event": "file_read_error", "path": path, "error": str(exc)},
-            )
-            raise ToolError(f"file_read failed: {exc}") from exc
-
-        if file_size > FILE_READ_MAX_BYTES:
-            raise ToolError(
-                f"file_read blocked: file too large ({file_size} bytes, max {FILE_READ_MAX_BYTES})"
-            )
-
-        try:
-            with open(path, encoding="utf-8") as f:
-                content = f.read()
-        except OSError as exc:
-            logger.error(
-                "file_read OS error",
-                extra={"event": "file_read_error", "path": path, "error": str(exc)},
-            )
-            raise ToolError(f"file_read failed: {exc}") from exc
-
-        exec_meta = {
-            "file_size": len(content),
-        }
-
-        # Determine trust level: files without a provenance record or with
-        # mismatched content hash are UNTRUSTED (prevents trust laundering).
-        # Only files with valid provenance AND matching hash inherit TRUSTED.
-        trust_level = TrustLevel.UNTRUSTED  # Fail-closed default
-        parent_ids = []
-        writer_info = await get_file_writer(path)
-        if writer_info is not None:
-            writer_id, recorded_hash = writer_info
-            # Verify content hasn't been tampered with since provenance was recorded
-            current_hash = hashlib.sha256(
-                content.encode() if isinstance(content, str) else content
-            ).hexdigest()
-            if recorded_hash and current_hash == recorded_hash:
-                parent_ids = [writer_id]
-                writer_data = await get_tagged_data(writer_id)
-                if writer_data and writer_data.trust_level == TrustLevel.TRUSTED:
-                    trust_level = TrustLevel.TRUSTED
-                # else: orphaned record or UNTRUSTED writer → stays UNTRUSTED
-            else:
-                # Hash mismatch (file overwritten) or empty hash (legacy record)
-                logger.warning(
-                    "File content hash mismatch — provenance stale",
-                    extra={
-                        "event": "provenance_hash_mismatch",
-                        "path": path,
-                        "recorded_hash": recorded_hash[:16] + "..." if recorded_hash else "<empty>",
-                    },
-                )
-
-        logger.info(
-            "File read",
-            extra={
-                "event": "file_read_success",
-                "path": path,
-                "size": len(content),
-                "trust_level": trust_level.value,
-                "inherited_from": writer_info[0] if writer_info else None,
-            },
-        )
-        self._session_file_reads.add(path)
-        logger.debug(
-            "file_read tracked for file_write enforcement",
-            extra={"event": "file_read_tracked", "path": path},
-        )
-        return await create_tagged_data(
-            content=content,
-            source=DataSource.FILE,
-            trust_level=trust_level,
-            originated_from=f"file_read:{path}",
-            parent_ids=parent_ids,
-        ), exec_meta
-
-    async def _mkdir(self, args: dict) -> tuple[TaggedData, dict | None]:
-        path = args.get("path", "")
-
-        result = self._engine.check_file_write(path)
-        if result.status != PolicyResult.ALLOWED:
-            logger.warning(
-                "mkdir blocked by policy",
-                extra={"event": "mkdir_blocked", "path": path, "reason": result.reason},
-            )
-            raise ToolBlockedError(f"mkdir blocked: {result.reason}")
-
-        try:
-            os.makedirs(path, exist_ok=True)
-        except OSError as exc:
-            logger.error(
-                "mkdir OS error",
-                extra={"event": "mkdir_error", "path": path, "error": str(exc)},
-            )
-            raise ToolError(f"mkdir failed: {exc}") from exc
-
-        logger.info(
-            "Directory created",
-            extra={"event": "mkdir_success", "path": path},
-        )
-
-        return await create_tagged_data(
-            content=f"Directory created: {path}",
-            source=DataSource.TOOL,
-            trust_level=TrustLevel.TRUSTED,
-            originated_from=f"mkdir:{path}",
-        ), None
-
-    async def _shell(self, args: dict) -> tuple[TaggedData, dict | None]:
-        command = args.get("command", "")
-
-        # Sandbox is the security boundary at TL2+ — exempt inline-execution
-        # patterns (python3 -c) that are safe within the sandbox's
-        # network=none / read-only-root / dropped-caps constraints.
-        sandbox_active = self._sandbox is not None
-        result = self._engine.check_command(command, sandbox_context=sandbox_active)
-        if result.status != PolicyResult.ALLOWED:
-            logger.warning(
-                "Shell command blocked by policy",
-                extra={"event": "shell_blocked", "command": command, "reason": result.reason},
-            )
-            raise ToolBlockedError(f"shell blocked: {result.reason}")
-
-        logger.info(
-            "Shell command policy passed",
-            extra={"event": "shell_allowed", "command": command},
-        )
-
-        # E5: Route to sandbox when available (regardless of trust level)
-        if self._sandbox is not None:
-            return await self._execute_in_sandbox(command, args)
-
-        # Fallback: direct shell when sandbox is genuinely unavailable.
-        # Output is UNTRUSTED — this path has network access and full
-        # container FS, unlike the sandbox (no network, read-only root).
-        # E-004: Timeouts — shell from config, podman ops are fixed constants
-        # (container-internal operations: podman_build=300s, podman_run=60s, podman_stop=30s).
-        from sentinel.core.config import settings
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *shlex.split(command),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            try:
-                stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                    proc.communicate(), timeout=settings.shell_timeout,
-                )
-            except asyncio.TimeoutError:
-                proc.kill()
-                await proc.wait()
-                logger.error(
-                    "Shell command timed out",
-                    extra={"event": "shell_timeout", "command": command},
-                )
-                raise ToolError(f"shell command timed out: {command}")
-            stdout = stdout_bytes.decode(errors="replace")
-            stderr = stderr_bytes.decode(errors="replace")
-            exec_meta = {
-                "exit_code": proc.returncode,
-                "stderr": stderr,
+            return {
+                "file_size_before": None,  # sidecar doesn't track pre-write size
+                "file_size_after": file_size,
+                "patch_operation": "write",
+                "sidecar": True,
             }
-            output = stdout
-            if proc.returncode != 0:
-                output += f"\n[exit code: {proc.returncode}]\n{stderr}"
-                logger.warning(
-                    "Shell command non-zero exit",
-                    extra={"event": "shell_nonzero", "command": command, "exit_code": proc.returncode},
-                )
-        except OSError as exc:
-            logger.error(
-                "Shell command OS error",
-                extra={"event": "shell_error", "command": command, "error": str(exc)},
+        except OSError:
+            logger.warning(
+                "_build_sidecar_file_meta: OSError",
+                extra={"event": "executor.build_sidecar_file_meta_oserror"},
+                exc_info=True,
             )
-            raise ToolError(f"shell failed: {exc}") from exc
+            return None
 
-        return await create_tagged_data(
-            content=output,
-            source=DataSource.TOOL,
-            trust_level=TrustLevel.UNTRUSTED,
-            originated_from=f"shell:{command}",
-        ), exec_meta
+    def _build_sidecar_file_read_meta(self, path: str, content: str) -> dict | None:
+        """Build exec_meta for sidecar file_read: manifest + before_hash.
 
-    async def _execute_in_sandbox(self, command: str, args: dict) -> tuple[TaggedData, dict | None]:
-        """Execute a shell command in a disposable Podman sandbox container."""
-        timeout = args.get("timeout")
+        The sidecar bypasses _file_read(), so manifest extraction and hash
+        capture must happen here. Zero extra I/O — content already in memory.
+        """
+        exec_meta: dict = {"file_size": len(content)}
 
-        sandbox_result = await self._sandbox.run(command, timeout=timeout)
+        # Content manifest — structural metadata for replan context
+        try:
+            from sentinel.analysis.content_manifest import extract_content_manifest
 
-        exec_meta = {
-            "exit_code": sandbox_result.exit_code,
-            "stderr": sandbox_result.stderr or "",
-            "timed_out": sandbox_result.timed_out,
-            "oom_killed": sandbox_result.oom_killed,
-        }
+            ext = path.rsplit(".", 1)[-1].lower() if "." in path else ""
+            if ext in _MANIFEST_EXTENSIONS:
+                exec_meta["content_manifest"] = extract_content_manifest(
+                    os.path.basename(path),
+                    content,
+                    "",
+                )
+                logger.debug(
+                    "sidecar file_read: content manifest extracted",
+                    extra={"event": "content.manifest_file_read", "path": path},
+                )
+            else:
+                logger.debug(
+                    "sidecar file_read: manifest skipped (unsupported ext)",
+                    extra={"event": "content.manifest_skip", "path": path, "ext": ext},
+                )
+        except Exception as exc:  # catch-all: manifest extraction best-effort
+            logger.warning(
+                "sidecar file_read: manifest extraction failed: %s",
+                exc,
+                extra={
+                    "event": "content.manifest_error",
+                    "path": path,
+                    "error": str(exc),
+                },
+                exc_info=True,
+            )
 
-        # Format output similar to direct shell, but with sandbox-specific info
-        if sandbox_result.timed_out:
-            output = sandbox_result.stdout
-            output += f"\n[sandbox timed out after {self._sandbox.default_timeout}s]"
-            if sandbox_result.stderr:
-                output += f"\n{sandbox_result.stderr}"
-        elif sandbox_result.oom_killed:
-            output = sandbox_result.stdout
-            output += "\n[sandbox out of memory — container killed]"
-        elif sandbox_result.exit_code != 0:
-            output = sandbox_result.stdout
-            output += f"\n[exit code: {sandbox_result.exit_code}]\n{sandbox_result.stderr}"
-        else:
-            output = sandbox_result.stdout
-
-        logger.info(
-            "Sandbox shell complete",
+        # Before-hash for content_changed assertions — captured at read time
+        # so the assertion evaluator can verify mutations actually occurred.
+        # Use binary disk read to match the verifier's binary read in
+        # _eval_content_changed() (verification.py). Fall back to encoding
+        # the string content if disk read fails (file deleted between sidecar
+        # read and this call).
+        try:
+            with open(path, "rb") as f:
+                content_hash = hashlib.sha256(f.read()).hexdigest()
+        except OSError as exc:
+            logger.debug(
+                "sidecar file_read: hash fallback to content encoding (disk read failed)",
+                extra={
+                    "event": "before.hash_fallback",
+                    "path": path,
+                    "reason": str(exc),
+                },
+            )
+            content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        _ctx = get_current_task_context()
+        if _ctx is not None:
+            _ctx.file_hashes[path] = content_hash
+        logger.debug(
+            "sidecar file_read: before_hash captured",
             extra={
-                "event": "sandbox_shell_complete",
-                "command": command[:200],
-                "exit_code": sandbox_result.exit_code,
-                "container_id": sandbox_result.container_id[:12],
+                "event": "before.hash_captured",
+                "path": path,
+                "hash_prefix": content_hash[:16],
             },
         )
 
-        return await create_tagged_data(
-            content=output,
-            source=DataSource.SANDBOX,
-            trust_level=TrustLevel.UNTRUSTED,
-            originated_from=f"sandbox:{command}",
-        ), exec_meta
+        return exec_meta
 
-    async def _podman_build(self, args: dict) -> tuple[TaggedData, dict | None]:
-        context_path = args.get("context_path", "")
-        tag = args.get("tag", "")
-
-        cmd = ["podman", "build", context_path, "-t", tag]
-        self._check_podman_flags(cmd)
-        result = self._engine.check_command(shlex.join(cmd))
-        if result.status != PolicyResult.ALLOWED:
-            logger.warning(
-                "podman_build blocked by policy",
-                extra={"event": "podman_build_blocked", "tag": tag, "reason": result.reason},
-            )
-            raise ToolBlockedError(f"podman_build blocked: {result.reason}")
-
-        logger.info(
-            "podman_build policy passed",
-            extra={"event": "podman_build_allowed", "tag": tag, "context_path": context_path},
-        )
-
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            try:
-                stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                    proc.communicate(), timeout=PODMAN_BUILD_TIMEOUT,
-                )
-            except asyncio.TimeoutError:
-                proc.kill()
-                await proc.wait()
-                logger.error("podman_build timed out", extra={"event": "podman_build_timeout", "tag": tag})
-                raise ToolError("podman build timed out")
-            stdout = stdout_bytes.decode(errors="replace")
-            stderr = stderr_bytes.decode(errors="replace")
-            output = stdout
-            if proc.returncode != 0:
-                output += f"\n[exit code: {proc.returncode}]\n{stderr}"
-                logger.warning(
-                    "podman_build non-zero exit",
-                    extra={"event": "podman_build_nonzero", "tag": tag, "exit_code": proc.returncode},
-                )
-        except OSError as exc:
-            logger.error("podman_build OS error", extra={"event": "podman_build_error", "tag": tag, "error": str(exc)})
-            raise ToolError(f"podman_build failed: {exc}") from exc
-
-        return await create_tagged_data(
-            content=output,
-            source=DataSource.TOOL,
-            trust_level=TrustLevel.TRUSTED,
-            originated_from=f"podman_build:{tag}",
-        ), None
-
-    async def _podman_run(self, args: dict) -> tuple[TaggedData, dict | None]:
-        image = args.get("image", "")
-        name = args.get("name", "")
-
-        cmd = ["podman", "run", "--name", name, "-d", image]
-        self._check_podman_flags(cmd)
-        result = self._engine.check_command(shlex.join(cmd))
-        if result.status != PolicyResult.ALLOWED:
-            logger.warning(
-                "podman_run blocked by policy",
-                extra={"event": "podman_run_blocked", "image": image, "name": name, "reason": result.reason},
-            )
-            raise ToolBlockedError(f"podman_run blocked: {result.reason}")
-
-        logger.info(
-            "podman_run policy passed",
-            extra={"event": "podman_run_allowed", "image": image, "name": name},
-        )
-
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            try:
-                stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                    proc.communicate(), timeout=PODMAN_RUN_TIMEOUT,
-                )
-            except asyncio.TimeoutError:
-                proc.kill()
-                await proc.wait()
-                logger.error("podman_run timed out", extra={"event": "podman_run_timeout", "name": name})
-                raise ToolError("podman run timed out")
-            stdout = stdout_bytes.decode(errors="replace")
-            stderr = stderr_bytes.decode(errors="replace")
-            output = stdout
-            if proc.returncode != 0:
-                output += f"\n[exit code: {proc.returncode}]\n{stderr}"
-                logger.warning(
-                    "podman_run non-zero exit",
-                    extra={"event": "podman_run_nonzero", "name": name, "exit_code": proc.returncode},
-                )
-        except OSError as exc:
-            logger.error("podman_run OS error", extra={"event": "podman_run_error", "name": name, "error": str(exc)})
-            raise ToolError(f"podman_run failed: {exc}") from exc
-
-        return await create_tagged_data(
-            content=output,
-            source=DataSource.TOOL,
-            trust_level=TrustLevel.TRUSTED,
-            originated_from=f"podman_run:{image}",
-        ), None
-
-    async def _podman_stop(self, args: dict) -> tuple[TaggedData, dict | None]:
-        container_name = args.get("container_name", "")
-
-        cmd = ["podman", "stop", container_name]
-        self._check_podman_flags(cmd)
-        result = self._engine.check_command(shlex.join(cmd))
-        if result.status != PolicyResult.ALLOWED:
-            logger.warning(
-                "podman_stop blocked by policy",
-                extra={"event": "podman_stop_blocked", "container": container_name, "reason": result.reason},
-            )
-            raise ToolBlockedError(f"podman_stop blocked: {result.reason}")
-
-        logger.info(
-            "podman_stop policy passed",
-            extra={"event": "podman_stop_allowed", "container": container_name},
-        )
-
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            try:
-                stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                    proc.communicate(), timeout=PODMAN_STOP_TIMEOUT,
-                )
-            except asyncio.TimeoutError:
-                proc.kill()
-                await proc.wait()
-                logger.error("podman_stop timed out", extra={"event": "podman_stop_timeout", "container": container_name})
-                raise ToolError("podman stop timed out")
-            stdout = stdout_bytes.decode(errors="replace")
-            stderr = stderr_bytes.decode(errors="replace")
-            output = stdout
-            if proc.returncode != 0:
-                output += f"\n[exit code: {proc.returncode}]\n{stderr}"
-                logger.warning(
-                    "podman_stop non-zero exit",
-                    extra={"event": "podman_stop_nonzero", "container": container_name, "exit_code": proc.returncode},
-                )
-        except OSError as exc:
-            logger.error("podman_stop OS error", extra={"event": "podman_stop_error", "container": container_name, "error": str(exc)})
-            raise ToolError(f"podman_stop failed: {exc}") from exc
-
-        return await create_tagged_data(
-            content=output,
-            source=DataSource.TOOL,
-            trust_level=TrustLevel.TRUSTED,
-            originated_from=f"podman_stop:{container_name}",
-        ), None
-
-    # ── website management ──────────────────────────────────────────
-
-    _SITE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
-    _FILENAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,99}$")
-
-    async def _website(self, args: dict) -> tuple[TaggedData, dict | None]:
-        action = args.get("action", "")
-        site_id = args.get("site_id", "")
-        # Per-user workspace: sites live under /workspace/<user_id>/sites/
-        sites_root = str(get_user_workspace() / "sites")
-
-        if action == "list":
-            return await self._website_list(sites_root)
-
-        if action == "create":
-            return await self._website_create(args, site_id, sites_root)
-
-        if action == "remove":
-            return await self._website_remove(site_id, sites_root)
-
-        raise ToolError(f"website: unknown action '{action}'. Use create, remove, or list.")
-
-    async def _website_list(self, sites_root: str) -> tuple[TaggedData, dict | None]:
-        if not os.path.isdir(sites_root):
-            return await create_tagged_data(
-                content="No active sites.",
-                source=DataSource.TOOL,
-                trust_level=TrustLevel.TRUSTED,
-                originated_from="website:list",
-            ), None
-
-        sites = sorted(
-            d for d in os.listdir(sites_root)
-            if os.path.isdir(os.path.join(sites_root, d))
-        )
-        if not sites:
-            return await create_tagged_data(
-                content="No active sites.",
-                source=DataSource.TOOL,
-                trust_level=TrustLevel.TRUSTED,
-                originated_from="website:list",
-            ), None
-
-        listing = "\n".join(
-            f"- {s}: https://localhost:3001/sites/{s}/"
-            for s in sites
-        )
-        return await create_tagged_data(
-            content=f"Active sites:\n{listing}",
-            source=DataSource.TOOL,
-            trust_level=TrustLevel.TRUSTED,
-            originated_from="website:list",
-        ), None
-
-    async def _website_create(self, args: dict, site_id: str, sites_root: str) -> tuple[TaggedData, dict | None]:
-        if not site_id or not self._SITE_ID_RE.match(site_id):
-            raise ToolError(
-                f"Invalid site_id: '{site_id}'. Must be lowercase alphanumeric + hyphens, "
-                "1-63 chars, start with alphanumeric."
-            )
-
-        files = args.get("files", {})
-        if not files or not isinstance(files, dict):
-            raise ToolError("website create requires a non-empty 'files' map.")
-
-        # Validate all filenames before writing anything
-        for filename in files:
-            if not self._FILENAME_RE.match(filename):
-                raise ToolError(
-                    f"Invalid filename: '{filename}'. Must be alphanumeric, dots, hyphens, "
-                    "underscores only. No paths or special characters."
-                )
-
-        site_dir = os.path.join(sites_root, site_id)
-
-        # Policy gate on the site directory
-        result = self._engine.check_file_write(site_dir)
-        if result.status != PolicyResult.ALLOWED:
-            raise ToolBlockedError(f"website create blocked: {result.reason}")
-
-        # Create directory and write files. On any error after partial
-        # writes, clean up to avoid orphaned site directories (BH3-098).
-        # Run code fixer on each file — website tool previously bypassed
-        # _file_write() and its code fixer, Semgrep scan, and tag stripping.
-        try:
-            os.makedirs(site_dir, exist_ok=True)
-            for filename, content in files.items():
-                filepath = os.path.join(site_dir, filename)
-
-                # Code fixer: same logic as _file_write
-                _, ext = os.path.splitext(filename)
-                fixer_names = {"Dockerfile", "Containerfile", "Makefile", "GNUmakefile", "makefile"}
-                if ext.lower() in _CODE_EXTENSIONS or filename in fixer_names:
-                    try:
-                        fix_result = code_fixer_fix(filepath, content)
-                        if fix_result.changed:
-                            content = fix_result.content
-                            logger.info(
-                                "Code fixer applied fixes (website)",
-                                extra={
-                                    "event": "code_fixer_applied",
-                                    "path": filepath,
-                                    "fixes": fix_result.fixes_applied,
-                                },
-                            )
-                    except Exception:
-                        # Fixer crash must never block a write — log and continue
-                        # with original content. Matches _file_write pattern.
-                        logger.warning(
-                            "Code fixer crash in website create — using original content",
-                            extra={
-                                "event": "code_fixer_error_website",
-                                "path": filepath,
-                            },
-                            exc_info=True,
-                        )
-
-                # Anchor allocator — matches _file_write pattern
-                from sentinel.core.config import settings as _aa_ws
-                if _aa_ws.anchor_allocator_enabled:
-                    try:
-                        _ws_user_id = current_user_id.get()
-                        _anchor_result = await allocate_anchors(
-                            path=filepath,
-                            content=content,
-                            episodic_store=getattr(self, '_episodic_store', None),
-                            user_id=_ws_user_id,
-                            tier=_aa_ws.anchor_allocator_tier,
-                        )
-                        if _anchor_result.changed:
-                            content = _anchor_result.content
-                        if _anchor_result.parse_failed:
-                            logger.warning(
-                                "Anchor allocation failed (website create)",
-                                extra={"event": "anchor_allocation_failed_website",
-                                       "path": filepath, "error": _anchor_result.error},
-                            )
-                    except Exception:
-                        logger.warning(
-                            "Anchor allocator crash in website create",
-                            extra={"event": "anchor_allocator_error_website",
-                                   "path": filepath},
-                            exc_info=True,
-                        )
-
-                # D4: Pre-write Semgrep scan at TL3+ — defence-in-depth.
-                # Matches _file_write pattern (lines 1355-1387). Without this,
-                # worker-generated HTML/JS/CSS bypasses pattern detection and
-                # is written to an auth-exempt served directory.
-                if self._trust_level >= 3 and semgrep_scanner.is_loaded():
-                    lang_hint = _detect_language_from_path(filepath)
-                    try:
-                        sg_result = await semgrep_scanner.scan_blocks(
-                            [(content, lang_hint)]
-                        )
-                        if sg_result.found:
-                            match_names = [m.pattern_name for m in sg_result.matches]
-                            logger.warning(
-                                "Website file blocked by pre-write Semgrep scan",
-                                extra={
-                                    "event": "website_semgrep_blocked",
-                                    "path": filepath,
-                                    "matches": match_names,
-                                },
-                            )
-                            # Clean up entire site dir — partial sites are worse
-                            # than no site (broken references, missing assets).
-                            shutil.rmtree(site_dir, ignore_errors=True)
-                            raise ToolBlockedError(
-                                f"Semgrep pre-write scan blocked website file {filename}: "
-                                f"{len(sg_result.matches)} issue(s) detected"
-                            )
-                    except ToolBlockedError:
-                        raise
-                    except Exception as exc:
-                        # Fail-closed: if Semgrep crashes, block the write.
-                        logger.error(
-                            "Pre-write Semgrep scan failed for website — "
-                            "blocking write (fail-closed)",
-                            extra={
-                                "event": "website_semgrep_error",
-                                "path": filepath,
-                                "error": str(exc),
-                            },
-                        )
-                        shutil.rmtree(site_dir, ignore_errors=True)
-                        raise ToolBlockedError(
-                            f"Pre-write scan failed (fail-closed): {exc}"
-                        ) from exc
-
-                with open(filepath, "w", encoding="utf-8") as f:
-                    f.write(content)
-        except (ToolBlockedError, ToolError):
-            raise  # Don't wrap our own errors
-        except OSError as exc:
-            # Clean up partially-written site directory
-            shutil.rmtree(site_dir, ignore_errors=True)
-            raise ToolError(f"website create failed: {exc}") from exc
-
-        title = args.get("title", site_id)
-        file_count = len(files)
-        # TODO(config): derive from application config instead of hardcoding.
-        # Tracked as Finding #32 in audit_executor_20260323.md.
-        url = f"https://localhost:3001/sites/{site_id}/"
-
-        logger.info(
-            "Website created",
-            extra={"event": "website_create", "site_id": site_id, "files": file_count},
-        )
-
-        try:
-            return await create_tagged_data(
-                content=f"Website created: {title}\n{url}\n({file_count} files)",
-                source=DataSource.TOOL,
-                trust_level=TrustLevel.TRUSTED,
-                originated_from=f"website:create:{site_id}",
-            ), {"site_id": site_id, "file_count": file_count, "url": url, "filenames": list(files.keys())}
-        except Exception:
-            # Provenance tagging failed — clean up written files
-            shutil.rmtree(site_dir, ignore_errors=True)
-            raise
-
-    async def _website_remove(self, site_id: str, sites_root: str) -> tuple[TaggedData, dict | None]:
-        if not site_id or not self._SITE_ID_RE.match(site_id):
-            raise ToolError(
-                f"Invalid site_id: '{site_id}'. Must be lowercase alphanumeric + hyphens, "
-                "1-63 chars, start with alphanumeric."
-            )
-
-        site_dir = os.path.join(sites_root, site_id)
-
-        if not os.path.isdir(site_dir):
-            raise ToolError(f"Site '{site_id}' does not exist.")
-
-        # Policy gate
-        result = self._engine.check_file_write(site_dir)
-        if result.status != PolicyResult.ALLOWED:
-            raise ToolBlockedError(f"website remove blocked: {result.reason}")
-
-        try:
-            shutil.rmtree(site_dir)
-        except OSError as exc:
-            raise ToolError(f"website remove failed: {exc}") from exc
-
-        logger.info(
-            "Website removed",
-            extra={"event": "website_remove", "site_id": site_id},
-        )
-
-        return await create_tagged_data(
-            content=f"Removed: {site_id}",
-            source=DataSource.TOOL,
-            trust_level=TrustLevel.TRUSTED,
-            originated_from=f"website:remove:{site_id}",
-        ), {"site_id": site_id}
+    # Handler implementations are in mixin classes under _handlers/:
+    # _file_write → WriteHandlerMixin, _file_patch → PatchHandlerMixin
+    # _file_read, _mkdir, _shell, _execute_in_sandbox → FileOpsHandlerMixin
+    # _website, _website_list, _website_create, _website_remove → WebsiteHandlerMixin
+    # _web_search, _x_search, _crypto_price, _weather → ExternalDataHandlerMixin
+    # _podman_build, _podman_run, _podman_stop, _check_podman_flags → ContainerHandlerMixin
+    # _email_*, _calendar_* → Session 1A mixins
+    # Messaging handlers (signal_send, etc.) → registered dynamically via _make_channel_handler

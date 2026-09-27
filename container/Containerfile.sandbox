@@ -70,8 +70,10 @@ RUN apt-get purge -y gcc g++ libxml2-dev libxslt1-dev \
 # Build tools for G1 scenarios (Makefile-based and Rust tasks).
 # Sandbox runs with NetworkDisabled so cargo can't fetch crates —
 # G1 tasks generate self-contained single-file programs compiled with rustc.
+# Also install Node.js (for JS syntax checks via `node --check`) and jq
+# (common in shell assertions and data processing tasks).
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    make curl \
+    make curl nodejs npm jq \
     && rm -rf /var/lib/apt/lists/*
 
 # Rust toolchain (minimal — rustc + cargo only, no docs/clippy/rustfmt)

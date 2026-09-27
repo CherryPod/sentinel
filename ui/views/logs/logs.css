@@ -1,0 +1,140 @@
+/* ── Logs View ───────────────────────────────────────────────
+   Log stream, filters, entries, level colouring.
+   ──────────────────────────────────────────────────────────── */
+
+.logs-content {
+    max-width: 1100px;
+}
+
+.log-header-actions {
+    display: flex;
+    gap: var(--space-2);
+}
+
+.log-controls {
+    display: flex;
+    align-items: center;
+    gap: var(--space-3);
+    margin-bottom: var(--space-3);
+    flex-wrap: wrap;
+}
+
+.log-filter-group {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+}
+
+.log-filter-group label {
+    font-size: var(--text-sm);
+    font-weight: 600;
+    color: var(--text-secondary);
+    white-space: nowrap;
+}
+
+.log-filter-group select {
+    padding: var(--space-1) var(--space-2);
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    color: var(--text-primary);
+    font-size: var(--text-sm);
+    outline: none;
+}
+
+.log-filter-group select:focus {
+    border-color: var(--accent);
+    box-shadow: var(--shadow-focus);
+}
+
+.log-count {
+    margin-left: auto;
+    font-size: var(--text-sm);
+    color: var(--text-muted);
+}
+
+.log-stream {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: var(--text-sm);
+    line-height: 1.6;
+    background: var(--bg-primary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    overflow-y: auto;
+    max-height: calc(100vh - 220px);
+    padding: var(--space-1) 0;
+}
+
+.log-entry {
+    display: flex;
+    align-items: baseline;
+    gap: var(--space-2);
+    padding: 2px var(--space-3);
+    border-bottom: 1px solid var(--border-subtle);
+}
+
+.log-entry:hover {
+    background: var(--bg-secondary);
+}
+
+.log-ts {
+    color: var(--text-muted);
+    flex-shrink: 0;
+    width: 70px;
+}
+
+.log-level {
+    flex-shrink: 0;
+    width: 60px;
+    font-weight: 600;
+    text-transform: uppercase;
+    font-size: var(--text-2xs);
+    letter-spacing: 0.5px;
+}
+
+.log-info .log-level { color: var(--text-secondary); }
+.log-warning .log-level { color: var(--yellow); }
+.log-error .log-level, .log-critical .log-level { color: var(--red); }
+.log-debug .log-level { color: var(--text-muted); }
+
+.log-task-id {
+    flex-shrink: 0;
+    font-size: var(--text-2xs);
+    font-family: monospace;
+    padding: 1px 5px;
+    border-radius: var(--radius-xs);
+    background: var(--bg-secondary);
+    color: var(--accent);
+    cursor: pointer;
+    user-select: none;
+}
+
+.log-task-id:hover {
+    background: var(--accent);
+    color: #fff;
+}
+
+.log-msg {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--text-primary);
+}
+
+.log-event {
+    flex-shrink: 0;
+    font-size: var(--text-2xs);
+    padding: 1px 5px;
+    border-radius: var(--radius-pill);
+    background: var(--rose-bg);
+    color: var(--rose-text);
+    max-width: 160px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.log-warning { background: var(--yellow-bg); }
+.log-error, .log-critical { background: var(--red-bg); }

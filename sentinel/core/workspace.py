@@ -6,10 +6,13 @@ This is the single place where user_id maps to a filesystem path.
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 from sentinel.core.config import settings
 from sentinel.core.context import current_user_id
+
+logger = logging.getLogger(__name__)
 
 
 def get_user_workspace(
